@@ -9,16 +9,18 @@ use tokio::sync::mpsc::Sender;
 pub enum Tab {
     Search,
     Playlists,
+    Queue,
     Lyrics,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 3] = [Tab::Search, Tab::Playlists, Tab::Lyrics];
+    pub const ALL: [Tab; 4] = [Tab::Search, Tab::Playlists, Tab::Queue, Tab::Lyrics];
 
     pub fn next(self) -> Self {
         match self {
             Tab::Search => Tab::Playlists,
-            Tab::Playlists => Tab::Lyrics,
+            Tab::Playlists => Tab::Queue,
+            Tab::Queue => Tab::Lyrics,
             Tab::Lyrics => Tab::Search,
         }
     }
@@ -27,7 +29,8 @@ impl Tab {
         match self {
             Tab::Search => Tab::Lyrics,
             Tab::Playlists => Tab::Search,
-            Tab::Lyrics => Tab::Playlists,
+            Tab::Queue => Tab::Playlists,
+            Tab::Lyrics => Tab::Queue,
         }
     }
 
@@ -35,6 +38,7 @@ impl Tab {
         match self {
             Tab::Search => "Search",
             Tab::Playlists => "Playlists",
+            Tab::Queue => "Queue",
             Tab::Lyrics => "Lyrics",
         }
     }
@@ -131,6 +135,8 @@ pub struct App {
     pub shuffle: bool,
     /// Playback order as indices into `tracks`; identity when shuffle is off.
     pub play_order: Vec<usize>,
+    /// Selected row on the Queue tab, as a position in `play_order`.
+    pub queue_cursor: usize,
     tx: Sender<Action>,
 }
 
@@ -162,6 +168,7 @@ impl App {
             translation_loading: false,
             shuffle: false,
             play_order: Vec::new(),
+            queue_cursor: 0,
             tx,
         }
     }
@@ -378,30 +385,41 @@ impl App {
 
         match key.code {
             KeyCode::Char('q') => self.running = false,
-            KeyCode::Char('j') | KeyCode::Down => {
-                if self.tab == Tab::Lyrics {
+            KeyCode::Char('j') | KeyCode::Down => match self.tab {
+                Tab::Lyrics => {
                     self.lyrics_auto_scroll = false;
                     self.lyrics_scroll = self.lyrics_scroll.saturating_add(1);
-                } else {
-                    self.move_selection(1);
                 }
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                if self.tab == Tab::Lyrics {
+                Tab::Queue => self.move_queue_cursor(1),
+                _ => self.move_selection(1),
+            },
+            KeyCode::Char('k') | KeyCode::Up => match self.tab {
+                Tab::Lyrics => {
                     self.lyrics_auto_scroll = false;
                     self.lyrics_scroll = self.lyrics_scroll.saturating_sub(1);
-                } else {
-                    self.move_selection(-1);
                 }
-            }
-            KeyCode::Char('g') | KeyCode::Home => self.move_to(0),
-            KeyCode::Char('G') | KeyCode::End => {
-                if !self.tracks.is_empty() {
-                    self.move_to(self.tracks.len() - 1);
-                }
-            }
-            KeyCode::PageDown => self.move_selection(10),
-            KeyCode::PageUp => self.move_selection(-10),
+                Tab::Queue => self.move_queue_cursor(-1),
+                _ => self.move_selection(-1),
+            },
+            KeyCode::Char('g') | KeyCode::Home => match self.tab {
+                Tab::Queue => self.queue_cursor = 0,
+                _ => self.move_to(0),
+            },
+            KeyCode::Char('G') | KeyCode::End => match self.tab {
+                Tab::Queue => self.queue_cursor = self.play_order.len().saturating_sub(1),
+                _ if !self.tracks.is_empty() => self.move_to(self.tracks.len() - 1),
+                _ => {}
+            },
+            KeyCode::PageDown => match self.tab {
+                Tab::Queue => self.move_queue_cursor(10),
+                _ => self.move_selection(10),
+            },
+            KeyCode::PageUp => match self.tab {
+                Tab::Queue => self.move_queue_cursor(-10),
+                _ => self.move_selection(-10),
+            },
+            KeyCode::Char('J') => self.reorder_queue(1),
+            KeyCode::Char('K') => self.reorder_queue(-1),
             KeyCode::Tab | KeyCode::BackTab => {
                 // crossterm reports Shift+Tab as BackTab; some terminals instead
                 // send Tab with the SHIFT modifier, so handle both.
@@ -419,7 +437,13 @@ impl App {
                 self.search_query.clear();
                 self.status = "Search: type query, Enter to submit, Esc to cancel".to_string();
             }
-            KeyCode::Enter => self.select_current(),
+            KeyCode::Enter => {
+                if self.tab == Tab::Queue {
+                    self.play_queue_item();
+                } else {
+                    self.select_current();
+                }
+            }
             KeyCode::Char(' ') => self.toggle_play(),
             KeyCode::Char('n') => self.next_track(),
             KeyCode::Char('p') => self.prev_track(),
@@ -430,6 +454,10 @@ impl App {
             KeyCode::Char('l') => {
                 self.tab = Tab::Lyrics;
                 self.status = "Lyrics".to_string();
+            }
+            KeyCode::Char('Q') => {
+                self.tab = Tab::Queue;
+                self.status = "Queue — J/K to move tracks".to_string();
             }
             KeyCode::Char('s') => self.toggle_shuffle(),
             KeyCode::Char('a') => self.toggle_auto_scroll(),
@@ -460,10 +488,44 @@ impl App {
         }
     }
 
+    fn move_queue_cursor(&mut self, delta: i32) {
+        if self.play_order.is_empty() {
+            return;
+        }
+        self.queue_cursor = (self.queue_cursor as i32 + delta)
+            .clamp(0, self.play_order.len() as i32 - 1) as usize;
+    }
+
+    /// Swap the selected queue entry with its neighbour so it plays earlier or
+    /// later. The cursor follows the moved track.
+    fn reorder_queue(&mut self, delta: i32) {
+        if self.play_order.len() < 2 {
+            return;
+        }
+        let from = self.queue_cursor.min(self.play_order.len() - 1);
+        let to = (from as i32 + delta).clamp(0, self.play_order.len() as i32 - 1) as usize;
+        if from == to {
+            return;
+        }
+        self.play_order.swap(from, to);
+        self.queue_cursor = to;
+        self.status = format!("Queue: moved track to position {}", to + 1);
+    }
+
+    /// Play the track at the queue cursor by pointing the list selection at it.
+    fn play_queue_item(&mut self) {
+        let Some(&track_index) = self.play_order.get(self.queue_cursor) else {
+            return;
+        };
+        self.list_state.select(Some(track_index));
+        self.select_current();
+    }
+
     /// Replace the track list and rebuild the playback order.
     fn set_tracks(&mut self, tracks: Vec<Track>) {
         self.tracks = tracks;
         self.build_play_order();
+        self.queue_cursor = 0;
         self.list_state
             .select(if self.tracks.is_empty() { None } else { Some(0) });
     }
@@ -552,6 +614,8 @@ impl App {
         // A new track starts with lyrics following playback again.
         self.lyrics_auto_scroll = true;
         self.lyrics_scroll = 0;
+        // Keep the queue cursor on whatever is now playing.
+        self.queue_cursor = self.play_position();
 
         if let Some(player) = &self.player {
             match player.play_uri(&track.uri) {
@@ -839,6 +903,58 @@ mod tests {
         assert_eq!(app.list_state.selected(), Some(0));
         app.prev_track();
         assert_eq!(app.list_state.selected(), Some(4));
+    }
+
+    #[test]
+    fn queue_reorder_swaps_tracks_and_follows_cursor() {
+        let mut app = test_app();
+        app.set_tracks(demo_tracks());
+        assert_eq!(app.play_order, vec![0, 1, 2, 3, 4]);
+
+        app.queue_cursor = 3;
+        app.reorder_queue(-1);
+        assert_eq!(app.play_order, vec![0, 1, 3, 2, 4]);
+        assert_eq!(app.queue_cursor, 2);
+
+        app.reorder_queue(1);
+        assert_eq!(app.play_order, vec![0, 1, 2, 3, 4]);
+        assert_eq!(app.queue_cursor, 3);
+
+        app.queue_cursor = 0;
+        app.reorder_queue(-1);
+        assert_eq!(app.play_order, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn playing_a_queue_item_keeps_cursor_on_current_track() {
+        let mut app = test_app();
+        app.set_tracks(demo_tracks());
+        for track in &app.tracks {
+            app.lyrics.insert(
+                track.uri.clone(),
+                crate::lyrics::Lyrics {
+                    lines: Vec::new(),
+                    synced: true,
+                    source: "test".into(),
+                },
+            );
+        }
+        app.play_order.swap(0, 3);
+
+        app.queue_cursor = 2;
+        app.play_queue_item();
+        assert_eq!(
+            app.now_playing.as_ref().unwrap().track.uri,
+            "spotify:track:test2"
+        );
+        assert_eq!(app.queue_cursor, 2);
+
+        app.next_track();
+        assert_eq!(
+            app.now_playing.as_ref().unwrap().track.uri,
+            "spotify:track:test0"
+        );
+        assert_eq!(app.queue_cursor, 3);
     }
 
     #[test]

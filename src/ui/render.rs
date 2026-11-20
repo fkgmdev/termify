@@ -2,7 +2,7 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Tabs, Widget};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs, Widget};
 
 use super::app::{App, Tab, format_duration, lyric_scroll_offset};
 
@@ -40,7 +40,8 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
     let selected = match app.tab {
         Tab::Search => 0,
         Tab::Playlists => 1,
-        Tab::Lyrics => 2,
+        Tab::Queue => 2,
+        Tab::Lyrics => 3,
     };
 
     let block = Block::default()
@@ -69,9 +70,16 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_main(frame: &mut Frame, area: Rect, app: &App) {
-    if app.tab == Tab::Lyrics {
-        render_lyrics_pane(frame, area, app);
-        return;
+    match app.tab {
+        Tab::Lyrics => {
+            render_lyrics_pane(frame, area, app);
+            return;
+        }
+        Tab::Queue => {
+            render_queue_pane(frame, area, app);
+            return;
+        }
+        _ => {}
     }
 
     let main_chunks = Layout::default()
@@ -81,6 +89,73 @@ fn render_main(frame: &mut Frame, area: Rect, app: &App) {
 
     render_list_pane(frame, main_chunks[0], app);
     render_detail_pane(frame, main_chunks[1], app);
+}
+
+fn render_queue_pane(frame: &mut Frame, area: Rect, app: &App) {
+    let mode = if app.shuffle { " (shuffled)" } else { "" };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" Queue — {} tracks{mode} ", app.tracks.len()));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let items: Vec<ListItem> = if app.play_order.is_empty() {
+        vec![ListItem::new(Line::from(Span::styled(
+            " Queue is empty — search for tracks or load a playlist ",
+            Style::default().fg(DARK_GRAY).italic(),
+        )))]
+    } else {
+        app.play_order
+            .iter()
+            .enumerate()
+            .map(|(position, &index)| {
+                let Some(track) = app.tracks.get(index) else {
+                    return ListItem::new(Line::from(" (missing track)"));
+                };
+                let is_current = app
+                    .now_playing
+                    .as_ref()
+                    .is_some_and(|np| np.track.uri == track.uri);
+                let style = if is_current {
+                    Style::default().fg(YELLOW).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(WHITE)
+                };
+                let marker = if is_current { "▶ " } else { "  " };
+                ListItem::new(Line::from(Span::styled(
+                    format!("{:>3}. {marker}{}", position + 1, track.display()),
+                    style,
+                )))
+            })
+            .collect()
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    let mut state = ListState::default();
+    if !app.play_order.is_empty() {
+        state.select(Some(
+            app.queue_cursor.min(app.play_order.len().saturating_sub(1)),
+        ));
+    }
+    let list = List::new(items)
+        .highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(CYAN)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("> ");
+    frame.render_stateful_widget(list, chunks[0], &mut state);
+
+    let hint = Span::styled(
+        " j/k move cursor · J/K move track up/down · Enter play · s shuffle ",
+        Style::default().fg(DARK_GRAY),
+    );
+    frame.render_widget(Paragraph::new(Line::from(hint)), chunks[1]);
 }
 
 fn render_lyrics_pane(frame: &mut Frame, area: Rect, app: &App) {
@@ -196,6 +271,7 @@ fn render_list_pane(frame: &mut Frame, area: Rect, app: &App) {
             }
         }
         Tab::Playlists => " Playlists ".to_string(),
+        Tab::Queue => " Queue ".to_string(),
         Tab::Lyrics => " Lyrics ".to_string(),
     };
 
@@ -389,6 +465,8 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         Span::raw("search"),
         Span::styled(" [l] ", Style::default().fg(YELLOW)),
         Span::raw("lyrics"),
+        Span::styled(" [Q] ", Style::default().fg(YELLOW)),
+        Span::raw("queue"),
         Span::styled(" [s] ", Style::default().fg(YELLOW)),
         Span::raw(if app.shuffle { "shuffle ON" } else { "shuffle" }),
         Span::styled(" [t] ", Style::default().fg(YELLOW)),
@@ -406,7 +484,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_help(frame: &mut Frame, area: Rect) {
     let popup_width = area.width.min(64);
-    let popup_height = area.height.min(24);
+    let popup_height = area.height.min(28);
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
     let popup = Rect::new(x, y, popup_width, popup_height);
@@ -426,6 +504,9 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::from("  ← / →       Seek back / forward 5s"),
         Line::from("  + / -       Volume up / down"),
         Line::from("  l           Lyrics tab"),
+        Line::from("  Q           Queue tab"),
+        Line::from("  J / K       Move queue track down / up"),
+        Line::from("  Enter       Play selected queue track"),
         Line::from("  s           Shuffle on / off"),
         Line::from("  a           Lyrics follow playback on / off"),
         Line::from("  t           Translate lyrics to English (lyrics tab)"),

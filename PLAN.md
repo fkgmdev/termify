@@ -70,7 +70,7 @@ Playback progress is derived from a local clock anchored on a 250 ms tick.
 
 ### M1 — TUI shell (done)
 - [x] Layout: header with tabs, list pane, detail pane, now-playing footer
-- [x] Keybindings: `j/k`, `g/G`, `PgUp/PgDn`, `Enter`, `/`, `Space`, `n/p`, `←/→`, `+/-`, `l`, `L`, `s`, `a`, `t`, `Tab`, `?`, `q`, `Ctrl-C`
+- [x] Keybindings: `j/k`, `g/G`, `PgUp/PgDn`, `Enter`, `/`, `Space`, `n/p`, `←/→`, `+/-`, `l`, `Q`, `J/K`, `L`, `s`, `a`, `t`, `Tab`, `?`, `q`, `Ctrl-C`
       (Tab/Shift+Tab use crossterm's `Tab`/`BackTab` codes)
 - [x] Config loading (client ID, redirect URI, volume, audio backend)
 - [x] Single `mpsc` Action channel with crossterm event stream + 250 ms tick
@@ -116,7 +116,11 @@ Playback progress is derived from a local clock anchored on a 250 ms tick.
 - [x] Playlist shuffling (`s`): Fisher-Yates playback order, current track first,
       applied to `n/p` and end-of-track auto-advance; next/prev wrap and visit
       every track exactly once per cycle (unit tested)
-- [ ] Repeat mode, queue view
+- [x] Queue tab (`Q`): full-pane view of `play_order` with the current track
+      marked; `j/k` move the cursor, `J/K` swap a track with its neighbour,
+      `Enter` plays it, and the cursor follows the current track. Reordering is
+      reset when shuffle is toggled or a new track list is loaded (unit tested)
+- [ ] Repeat mode
 - [ ] Integration tests with a mock HTTP layer
 
 ## Deferred (not in v1)

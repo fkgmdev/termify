@@ -16,6 +16,8 @@ library, play music, and read synced lyrics, all from the terminal.
 - Search tracks, browse playlists, load playlist tracks and liked songs
 - Playback controls: play/pause, next/prev, seek, volume, end-of-track auto-advance
 - Playlist shuffling with a saved playback order (`s`)
+- Queue tab showing the playback order, with track reordering (`J`/`K`) and
+  play-from-queue (`Enter`)
 - Synced lyrics via LRCLIB with active-line highlighting and automatic scrolling
 - Original-language lyrics preferred over translated LRCLIB entries; optional
   English translation (`t`), cached per track
@@ -88,11 +90,11 @@ termify --relogin       # force re-login for both Web API and playback
 
 | Key | Action |
 | --- | --- |
-| `j` / `↓` | Move down (manually scroll lyrics on Lyrics tab, disabling follow mode) |
-| `k` / `↑` | Move up (manually scroll lyrics on Lyrics tab, disabling follow mode) |
+| `j` / `↓` | Move down (manually scroll lyrics on Lyrics tab; move cursor on Queue tab) |
+| `k` / `↑` | Move up (manually scroll lyrics on Lyrics tab; move cursor on Queue tab) |
 | `g` / `G` | First / last item |
 | `PgUp` / `PgDn` | Page up / down |
-| `Enter` | Select track to play; open playlist |
+| `Enter` | Select track to play; open playlist; play selected queue track |
 | `/` | Search tracks |
 | `Tab` / `Shift+Tab` | Next / previous tab |
 | `Space` | Play / pause |
@@ -100,12 +102,19 @@ termify --relogin       # force re-login for both Web API and playback
 | `←` / `→` | Seek −5s / +5s |
 | `+` / `-` | Volume up / down |
 | `l` | Lyrics tab |
+| `Q` | Queue tab |
+| `J` / `K` | Move selected queue track down / up |
 | `L` | Load liked songs |
 | `s` | Shuffle on / off (affects next/prev and auto-advance) |
 | `a` | Lyrics follow playback on / off |
 | `t` | Translate lyrics to English (on the Lyrics tab) |
 | `?` | Help overlay |
 | `q` / `Ctrl-C` | Quit |
+
+The Queue tab shows the order used by `n`/`p` and auto-advance. `J`/`K` swap the
+selected track with its neighbour and the cursor follows it; `Enter` starts that
+track. Toggling shuffle or loading a new track list rebuilds the order, so manual
+reordering is reset in those cases.
 
 ## Architecture
 
@@ -120,7 +129,7 @@ src/
   player.rs   # librespot session, Player, mixer, playback controls
   lyrics.rs   # LRCLIB client, LRC parser, language preference, translation
   ui/
-    app.rs    # App state, Action enum, key handling, shuffle/scroll/translation
+    app.rs    # App state, Action enum, key handling, queue/shuffle/scroll/translation
     event.rs  # crossterm stream + tick -> Action channel
     render.rs # ratatui layout and widgets
 ```
