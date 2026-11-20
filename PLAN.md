@@ -93,12 +93,16 @@ Playback progress is derived from a local clock anchored on a 250 ms tick.
 ### M4 — Lyrics page (done)
 - [x] LRCLIB client with `track_name`/`artist_name`/`album_name`/`duration` lookup
 - [x] LRC parser (mm:ss.xx, mm:ss, multiple stamps, metadata tags)
-- [x] Active-line highlight following playback position, manual scroll (`j/k`)
-- [x] Auto-scroll: active line stays near the middle of the pane; `j/k` switches
-      to manual mode and `a` re-enables follow mode
+- [x] Active-line highlight (`▶`) following playback position
+- [x] Follow mode keeps the active line near the middle of the pane; `j/k`
+      select a line (`»`) and disable following, `a` re-enables it
+- [x] Jump to selected lyric line: `Enter` seeks playback to that line's
+      timestamp and re-enables follow mode; `g/G` and `PgUp/PgDn` also move the
+      selection, and the current playback line stays marked with `▶`
 - [x] Plain-lyrics fallback, "no lyrics" state, in-memory cache by track URI
 - [x] Unit tests for LRC parsing, active-line tracking, scroll offsets, script
-      detection and translation parsing (10 passing)
+      detection, translation parsing, queue reordering and lyric-line seek/key
+      handling (14 passing)
 - [x] Fixed LRCLIB camelCase field mapping (`syncedLyrics`/`plainLyrics`) that
       made every lookup report "no lyrics"; verified with "Knee Socks"
 - [x] Prefer original-language LRCLIB entry when `/api/get` returns a translation

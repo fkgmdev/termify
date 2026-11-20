@@ -185,7 +185,7 @@ fn render_lyrics_pane(frame: &mut Frame, area: Rect, app: &App) {
             flags.push("translated");
         }
         if !app.lyrics_auto_scroll {
-            flags.push("manual scroll");
+            flags.push("line select");
         }
         title = format!(" Lyrics — {track_title} [{}] ", flags.join(", "));
     }
@@ -193,7 +193,11 @@ fn render_lyrics_pane(frame: &mut Frame, area: Rect, app: &App) {
     let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let height = inner.height as usize;
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    let height = chunks[0].height as usize;
 
     let lines: Vec<Line> = if app.lyrics_loading {
         vec![Line::from(Span::styled(
@@ -207,11 +211,12 @@ fn render_lyrics_pane(frame: &mut Frame, area: Rect, app: &App) {
             .map(|np| np.position)
             .unwrap_or_default();
         let active = crate::lyrics::active_line(lyrics, position);
+        let cursor = app.lyric_cursor.min(lyrics.lines.len().saturating_sub(1));
         let offset = lyric_scroll_offset(
             active,
+            Some(cursor),
             lyrics.lines.len(),
             app.lyrics_auto_scroll,
-            app.lyrics_scroll,
             height,
         );
         let translated = if app.translate_lyrics {
@@ -228,14 +233,23 @@ fn render_lyrics_pane(frame: &mut Frame, area: Rect, app: &App) {
             .enumerate()
             .map(|(i, line)| {
                 let absolute = offset + i;
-                let style = if Some(absolute) == active {
+                let is_cursor = Some(absolute) == Some(cursor);
+                let style = if is_cursor {
+                    Style::default().fg(CYAN).add_modifier(Modifier::BOLD)
+                } else if Some(absolute) == active {
                     Style::default().fg(YELLOW).add_modifier(Modifier::BOLD)
                 } else if active.is_some_and(|a| absolute < a) {
                     Style::default().fg(DARK_GRAY)
                 } else {
                     Style::default().fg(WHITE)
                 };
-                let prefix = if Some(absolute) == active { "▶ " } else { "  " };
+                let prefix = if is_cursor {
+                    "» "
+                } else if Some(absolute) == active {
+                    "▶ "
+                } else {
+                    "  "
+                };
                 let text = translated
                     .and_then(|lines| lines.get(absolute))
                     .map(String::as_str)
@@ -256,7 +270,12 @@ fn render_lyrics_pane(frame: &mut Frame, area: Rect, app: &App) {
         ]
     };
 
-    frame.render_widget(Paragraph::new(lines), inner);
+    frame.render_widget(Paragraph::new(lines), chunks[0]);
+    let hint = Span::styled(
+        " j/k select line · Enter jump to line · a follow playback ",
+        Style::default().fg(DARK_GRAY),
+    );
+    frame.render_widget(Paragraph::new(Line::from(hint)), chunks[1]);
 }
 
 fn render_list_pane(frame: &mut Frame, area: Rect, app: &App) {
@@ -473,6 +492,8 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         Span::raw(if app.translate_lyrics { "translate ON" } else { "translate" }),
         Span::styled(" [a] ", Style::default().fg(YELLOW)),
         Span::raw("follow"),
+        Span::styled(" [Enter] ", Style::default().fg(YELLOW)),
+        Span::raw("jump"),
         Span::styled(" [?] ", Style::default().fg(YELLOW)),
         Span::raw("help"),
         Span::styled(" [q] ", Style::default().fg(YELLOW)),
@@ -492,8 +513,8 @@ fn render_help(frame: &mut Frame, area: Rect) {
     let help_text = Text::from(vec![
         Line::from(Span::styled(" termify keybindings ", Style::default().fg(CYAN).bold())),
         Line::from(""),
-        Line::from("  j / ↓       Move down (manual lyrics scroll)"),
-        Line::from("  k / ↑       Move up (manual lyrics scroll)"),
+        Line::from("  j / ↓       Move down (select lyric line on Lyrics tab)"),
+        Line::from("  k / ↑       Move up (select lyric line on Lyrics tab)"),
         Line::from("  g / G       First / last item"),
         Line::from("  PgUp/PgDn   Page up / down"),
         Line::from("  Enter       Select track"),
@@ -506,7 +527,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::from("  l           Lyrics tab"),
         Line::from("  Q           Queue tab"),
         Line::from("  J / K       Move queue track down / up"),
-        Line::from("  Enter       Play selected queue track"),
+        Line::from("  Enter       Play queue track / jump to selected lyric"),
         Line::from("  s           Shuffle on / off"),
         Line::from("  a           Lyrics follow playback on / off"),
         Line::from("  t           Translate lyrics to English (lyrics tab)"),

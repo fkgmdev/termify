@@ -127,7 +127,8 @@ pub struct App {
     pub player: Option<std::sync::Arc<crate::player::LocalPlayer>>,
     pub lyrics: std::collections::HashMap<String, crate::lyrics::Lyrics>,
     pub lyrics_loading: bool,
-    pub lyrics_scroll: usize,
+    /// Selected lyric line on the Lyrics tab; Enter seeks to its timestamp.
+    pub lyric_cursor: usize,
     pub lyrics_auto_scroll: bool,
     pub translations: std::collections::HashMap<String, Vec<String>>,
     pub translate_lyrics: bool,
@@ -161,7 +162,7 @@ impl App {
             player: None,
             lyrics: std::collections::HashMap::new(),
             lyrics_loading: false,
-            lyrics_scroll: 0,
+            lyric_cursor: 0,
             lyrics_auto_scroll: true,
             translations: std::collections::HashMap::new(),
             translate_lyrics: false,
@@ -236,6 +237,7 @@ impl App {
                         }
                     }
                 }
+                self.sync_lyric_cursor();
             }
             Action::Render => {}
             Action::Key(key) => self.handle_key(key)?,
@@ -306,6 +308,7 @@ impl App {
                     Ok(Some(lyrics)) => {
                         self.lyrics.insert(uri.clone(), lyrics);
                         self.status = "Lyrics loaded".to_string();
+                        self.sync_lyric_cursor();
                         if self.translate_lyrics {
                             self.fetch_translation(&uri);
                         }
@@ -386,35 +389,36 @@ impl App {
         match key.code {
             KeyCode::Char('q') => self.running = false,
             KeyCode::Char('j') | KeyCode::Down => match self.tab {
-                Tab::Lyrics => {
-                    self.lyrics_auto_scroll = false;
-                    self.lyrics_scroll = self.lyrics_scroll.saturating_add(1);
-                }
+                Tab::Lyrics => self.move_lyric_cursor(1),
                 Tab::Queue => self.move_queue_cursor(1),
                 _ => self.move_selection(1),
             },
             KeyCode::Char('k') | KeyCode::Up => match self.tab {
-                Tab::Lyrics => {
-                    self.lyrics_auto_scroll = false;
-                    self.lyrics_scroll = self.lyrics_scroll.saturating_sub(1);
-                }
+                Tab::Lyrics => self.move_lyric_cursor(-1),
                 Tab::Queue => self.move_queue_cursor(-1),
                 _ => self.move_selection(-1),
             },
             KeyCode::Char('g') | KeyCode::Home => match self.tab {
+                Tab::Lyrics => self.set_lyric_cursor(0),
                 Tab::Queue => self.queue_cursor = 0,
                 _ => self.move_to(0),
             },
             KeyCode::Char('G') | KeyCode::End => match self.tab {
+                Tab::Lyrics => {
+                    let last = self.current_lyrics().map_or(0, |l| l.lines.len().saturating_sub(1));
+                    self.set_lyric_cursor(last);
+                }
                 Tab::Queue => self.queue_cursor = self.play_order.len().saturating_sub(1),
                 _ if !self.tracks.is_empty() => self.move_to(self.tracks.len() - 1),
                 _ => {}
             },
             KeyCode::PageDown => match self.tab {
+                Tab::Lyrics => self.move_lyric_cursor(10),
                 Tab::Queue => self.move_queue_cursor(10),
                 _ => self.move_selection(10),
             },
             KeyCode::PageUp => match self.tab {
+                Tab::Lyrics => self.move_lyric_cursor(-10),
                 Tab::Queue => self.move_queue_cursor(-10),
                 _ => self.move_selection(-10),
             },
@@ -437,13 +441,11 @@ impl App {
                 self.search_query.clear();
                 self.status = "Search: type query, Enter to submit, Esc to cancel".to_string();
             }
-            KeyCode::Enter => {
-                if self.tab == Tab::Queue {
-                    self.play_queue_item();
-                } else {
-                    self.select_current();
-                }
-            }
+            KeyCode::Enter => match self.tab {
+                Tab::Queue => self.play_queue_item(),
+                Tab::Lyrics => self.jump_to_lyric(),
+                _ => self.select_current(),
+            },
             KeyCode::Char(' ') => self.toggle_play(),
             KeyCode::Char('n') => self.next_track(),
             KeyCode::Char('p') => self.prev_track(),
@@ -486,6 +488,69 @@ impl App {
         if !self.tracks.is_empty() {
             self.list_state.select(Some(index.min(self.tracks.len() - 1)));
         }
+    }
+
+    fn current_lyrics(&self) -> Option<&crate::lyrics::Lyrics> {
+        self.lyrics
+            .get(self.now_playing.as_ref()?.track.uri.as_str())
+    }
+
+    fn move_lyric_cursor(&mut self, delta: i32) {
+        let line_count = self.current_lyrics().map_or(0, |lyrics| lyrics.lines.len());
+        if line_count == 0 {
+            return;
+        }
+        self.lyrics_auto_scroll = false;
+        self.lyric_cursor = (self.lyric_cursor as i32 + delta)
+            .clamp(0, line_count as i32 - 1) as usize;
+    }
+
+    fn set_lyric_cursor(&mut self, index: usize) {
+        let line_count = self.current_lyrics().map_or(0, |lyrics| lyrics.lines.len());
+        if line_count == 0 {
+            return;
+        }
+        self.lyrics_auto_scroll = false;
+        self.lyric_cursor = index.min(line_count - 1);
+    }
+
+    /// In follow mode the cursor tracks the line currently being played.
+    fn sync_lyric_cursor(&mut self) {
+        if !self.lyrics_auto_scroll {
+            return;
+        }
+        let Some(lyrics) = self.current_lyrics() else {
+            return;
+        };
+        let position = self
+            .now_playing
+            .as_ref()
+            .map_or(Duration::ZERO, |np| np.position);
+        self.lyric_cursor = crate::lyrics::active_line(lyrics, position).unwrap_or(0);
+    }
+
+    /// Seek playback to the timestamp of the selected lyric line.
+    fn jump_to_lyric(&mut self) {
+        let (time, text) = {
+            let Some(lyrics) = self.current_lyrics() else {
+                self.status = "No lyrics for this track".to_string();
+                return;
+            };
+            let Some(line) = lyrics.lines.get(self.lyric_cursor) else {
+                return;
+            };
+            (line.time, line.text.clone())
+        };
+        let Some(np) = &mut self.now_playing else {
+            return;
+        };
+        let target = time.min(np.track.duration);
+        np.position = target;
+        if let Some(player) = &self.player {
+            player.seek(target.as_millis().min(u128::from(u32::MAX)) as u32);
+        }
+        self.lyrics_auto_scroll = true;
+        self.status = format!("Jumped to {} — {}", format_duration(target), text);
     }
 
     fn move_queue_cursor(&mut self, delta: i32) {
@@ -562,10 +627,13 @@ impl App {
 
     fn toggle_auto_scroll(&mut self) {
         self.lyrics_auto_scroll = !self.lyrics_auto_scroll;
+        if self.lyrics_auto_scroll {
+            self.sync_lyric_cursor();
+        }
         self.status = if self.lyrics_auto_scroll {
             "Lyrics follow playback".to_string()
         } else {
-            "Lyrics scroll manually (j/k)".to_string()
+            "Lyrics: select a line with j/k, Enter to jump there".to_string()
         };
     }
 
@@ -613,7 +681,8 @@ impl App {
         });
         // A new track starts with lyrics following playback again.
         self.lyrics_auto_scroll = true;
-        self.lyrics_scroll = 0;
+        self.lyric_cursor = 0;
+        self.sync_lyric_cursor();
         // Keep the queue cursor on whatever is now playing.
         self.queue_cursor = self.play_position();
 
@@ -773,7 +842,7 @@ impl App {
             return;
         }
         self.lyrics_loading = true;
-        self.lyrics_scroll = 0;
+        self.lyric_cursor = 0;
         let tx = self.tx.clone();
         let uri = track.uri.clone();
         let track = track.clone();
@@ -820,20 +889,17 @@ pub fn format_duration(duration: Duration) -> String {
 /// near the middle; in manual mode the stored scroll offset is used.
 pub fn lyric_scroll_offset(
     active: Option<usize>,
+    cursor: Option<usize>,
     line_count: usize,
     auto_scroll: bool,
-    manual_scroll: usize,
     height: usize,
 ) -> usize {
     let max_offset = line_count.saturating_sub(height);
-    if auto_scroll {
-        active
-            .unwrap_or(0)
-            .saturating_sub(height / 2)
-            .min(max_offset)
-    } else {
-        manual_scroll.min(max_offset)
-    }
+    let focus = if auto_scroll { active } else { cursor.or(active) };
+    focus
+        .unwrap_or(0)
+        .saturating_sub(height / 2)
+        .min(max_offset)
 }
 
 #[cfg(test)]
@@ -958,9 +1024,92 @@ mod tests {
     }
 
     #[test]
-    fn lyric_scroll_follows_active_line_and_clamps_manual_offset() {
-        assert_eq!(lyric_scroll_offset(Some(15), 20, true, 0, 10), 10);
-        assert_eq!(lyric_scroll_offset(Some(3), 20, true, 0, 10), 0);
-        assert_eq!(lyric_scroll_offset(Some(15), 20, false, 18, 10), 10);
+    fn lyric_scroll_follows_active_line_or_selected_cursor() {
+        assert_eq!(lyric_scroll_offset(Some(15), Some(15), 20, true, 10), 10);
+        assert_eq!(lyric_scroll_offset(Some(3), Some(3), 20, true, 10), 0);
+        assert_eq!(lyric_scroll_offset(Some(15), Some(18), 20, false, 10), 10);
+    }
+
+    #[tokio::test]
+    async fn lyric_keys_select_and_jump() {
+        let mut app = test_app();
+        app.tab = Tab::Lyrics;
+        app.now_playing = Some(NowPlaying {
+            track: demo_tracks()[0].clone(),
+            position: Duration::from_secs(1),
+            playing: false,
+            volume: 60,
+        });
+        app.lyrics.insert(
+            "spotify:track:test0".to_string(),
+            crate::lyrics::Lyrics {
+                lines: vec![
+                    crate::lyrics::LyricLine {
+                        time: Duration::from_secs(0),
+                        text: "intro".into(),
+                    },
+                    crate::lyrics::LyricLine {
+                        time: Duration::from_secs(30),
+                        text: "verse".into(),
+                    },
+                    crate::lyrics::LyricLine {
+                        time: Duration::from_secs(60),
+                        text: "chorus".into(),
+                    },
+                ],
+                synced: true,
+                source: "test".into(),
+            },
+        );
+        app.sync_lyric_cursor();
+        assert_eq!(app.lyric_cursor, 0);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.lyric_cursor, 1);
+        assert!(!app.lyrics_auto_scroll);
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(
+            app.now_playing.as_ref().unwrap().position,
+            Duration::from_secs(30)
+        );
+        assert!(app.lyrics_auto_scroll);
+    }
+
+    #[tokio::test]
+    async fn jump_to_lyric_seeks_to_selected_line() {
+        let mut app = test_app();
+        app.now_playing = Some(NowPlaying {
+            track: demo_tracks()[0].clone(),
+            position: Duration::from_secs(5),
+            playing: true,
+            volume: 60,
+        });
+        app.lyrics.insert(
+            "spotify:track:test0".to_string(),
+            crate::lyrics::Lyrics {
+                lines: vec![
+                    crate::lyrics::LyricLine {
+                        time: Duration::from_secs(2),
+                        text: "first".into(),
+                    },
+                    crate::lyrics::LyricLine {
+                        time: Duration::from_secs(37),
+                        text: "chorus".into(),
+                    },
+                ],
+                synced: true,
+                source: "test".into(),
+            },
+        );
+
+        app.lyric_cursor = 1;
+        app.lyrics_auto_scroll = false;
+        app.jump_to_lyric();
+        assert_eq!(app.now_playing.as_ref().unwrap().position, Duration::from_secs(37));
+        assert!(app.lyrics_auto_scroll);
+        assert!(app.status.contains("Jumped to 00:37"));
     }
 }

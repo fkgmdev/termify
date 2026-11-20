@@ -19,6 +19,8 @@ library, play music, and read synced lyrics, all from the terminal.
 - Queue tab showing the playback order, with track reordering (`J`/`K`) and
   play-from-queue (`Enter`)
 - Synced lyrics via LRCLIB with active-line highlighting and automatic scrolling
+- Lyric line selection (`j`/`k`) and jump-to-line seeking (`Enter`), with `a` to
+  resume following playback
 - Original-language lyrics preferred over translated LRCLIB entries; optional
   English translation (`t`), cached per track
 - Ratatui TUI with a single async action loop and `--demo` mode
@@ -90,11 +92,11 @@ termify --relogin       # force re-login for both Web API and playback
 
 | Key | Action |
 | --- | --- |
-| `j` / `↓` | Move down (manually scroll lyrics on Lyrics tab; move cursor on Queue tab) |
-| `k` / `↑` | Move up (manually scroll lyrics on Lyrics tab; move cursor on Queue tab) |
-| `g` / `G` | First / last item |
+| `j` / `↓` | Move down (select lyric line on Lyrics tab; move cursor on Queue tab) |
+| `k` / `↑` | Move up (select lyric line on Lyrics tab; move cursor on Queue tab) |
+| `g` / `G` | First / last item (first/last lyric line on Lyrics tab) |
 | `PgUp` / `PgDn` | Page up / down |
-| `Enter` | Select track to play; open playlist; play selected queue track |
+| `Enter` | Select track to play; open playlist; play queue track; jump to selected lyric line |
 | `/` | Search tracks |
 | `Tab` / `Shift+Tab` | Next / previous tab |
 | `Space` | Play / pause |
@@ -106,7 +108,7 @@ termify --relogin       # force re-login for both Web API and playback
 | `J` / `K` | Move selected queue track down / up |
 | `L` | Load liked songs |
 | `s` | Shuffle on / off (affects next/prev and auto-advance) |
-| `a` | Lyrics follow playback on / off |
+| `a` | Lyrics follow playback on / off (re-syncs the selected line when re-enabled) |
 | `t` | Translate lyrics to English (on the Lyrics tab) |
 | `?` | Help overlay |
 | `q` / `Ctrl-C` | Quit |
@@ -115,6 +117,11 @@ The Queue tab shows the order used by `n`/`p` and auto-advance. `J`/`K` swap the
 selected track with its neighbour and the cursor follows it; `Enter` starts that
 track. Toggling shuffle or loading a new track list rebuilds the order, so manual
 reordering is reset in those cases.
+
+On the Lyrics tab, `j`/`k` (and `g`/`G`, `PgUp`/`PgDn`) select a line with `»`,
+which disables follow mode. `Enter` seeks playback to that line's timestamp and
+re-enables following; `a` manually re-syncs the selection to the line currently
+playing. The active playback line stays marked with `▶`.
 
 ## Architecture
 
@@ -129,7 +136,7 @@ src/
   player.rs   # librespot session, Player, mixer, playback controls
   lyrics.rs   # LRCLIB client, LRC parser, language preference, translation
   ui/
-    app.rs    # App state, Action enum, key handling, queue/shuffle/scroll/translation
+    app.rs    # App state, Action enum, key handling, queue/shuffle/lyric-seek/translation
     event.rs  # crossterm stream + tick -> Action channel
     render.rs # ratatui layout and widgets
 ```
