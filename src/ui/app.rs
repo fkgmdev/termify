@@ -99,6 +99,10 @@ pub enum Action {
         uri: String,
         result: Result<Option<crate::lyrics::Lyrics>, String>,
     },
+    TranslationsLoaded {
+        uri: String,
+        result: Result<Vec<String>, String>,
+    },
     Error(String),
 }
 
@@ -120,6 +124,13 @@ pub struct App {
     pub lyrics: std::collections::HashMap<String, crate::lyrics::Lyrics>,
     pub lyrics_loading: bool,
     pub lyrics_scroll: usize,
+    pub lyrics_auto_scroll: bool,
+    pub translations: std::collections::HashMap<String, Vec<String>>,
+    pub translate_lyrics: bool,
+    pub translation_loading: bool,
+    pub shuffle: bool,
+    /// Playback order as indices into `tracks`; identity when shuffle is off.
+    pub play_order: Vec<usize>,
     tx: Sender<Action>,
 }
 
@@ -145,6 +156,12 @@ impl App {
             lyrics: std::collections::HashMap::new(),
             lyrics_loading: false,
             lyrics_scroll: 0,
+            lyrics_auto_scroll: true,
+            translations: std::collections::HashMap::new(),
+            translate_lyrics: false,
+            translation_loading: false,
+            shuffle: false,
+            play_order: Vec::new(),
             tx,
         }
     }
@@ -189,6 +206,7 @@ impl App {
                 uri: "spotify:track:demo5".into(),
             },
         ];
+        self.build_play_order();
         self.now_playing = Some(NowPlaying {
             track: self.tracks[0].clone(),
             position: Duration::from_secs(42),
@@ -222,8 +240,7 @@ impl App {
                 self.loading = false;
                 match result {
                     Ok(tracks) => {
-                        self.tracks = tracks;
-                        self.list_state.select(if self.tracks.is_empty() { None } else { Some(0) });
+                        self.set_tracks(tracks);
                         self.status = format!("Found {} tracks", self.tracks.len());
                     }
                     Err(err) => self.set_error(err),
@@ -243,8 +260,7 @@ impl App {
                 self.loading = false;
                 match result {
                     Ok(tracks) => {
-                        self.tracks = tracks;
-                        self.list_state.select(if self.tracks.is_empty() { None } else { Some(0) });
+                        self.set_tracks(tracks);
                         self.tab = Tab::Search;
                         self.status = format!("Loaded {} playlist tracks", self.tracks.len());
                     }
@@ -255,8 +271,7 @@ impl App {
                 self.loading = false;
                 match result {
                     Ok(tracks) => {
-                        self.tracks = tracks;
-                        self.list_state.select(if self.tracks.is_empty() { None } else { Some(0) });
+                        self.set_tracks(tracks);
                         self.tab = Tab::Search;
                         self.status = format!("Loaded {} liked songs", self.tracks.len());
                     }
@@ -282,11 +297,27 @@ impl App {
                 self.lyrics_loading = false;
                 match result {
                     Ok(Some(lyrics)) => {
-                        self.lyrics.insert(uri, lyrics);
+                        self.lyrics.insert(uri.clone(), lyrics);
                         self.status = "Lyrics loaded".to_string();
+                        if self.translate_lyrics {
+                            self.fetch_translation(&uri);
+                        }
                     }
                     Ok(None) => self.status = "No lyrics found for this track".to_string(),
                     Err(err) => self.status = format!("Lyrics unavailable: {err}"),
+                }
+            }
+            Action::TranslationsLoaded { uri, result } => {
+                self.translation_loading = false;
+                match result {
+                    Ok(lines) => {
+                        self.translations.insert(uri, lines);
+                        self.status = "Translation on".to_string();
+                    }
+                    Err(err) => {
+                        self.translate_lyrics = false;
+                        self.set_error(format!("Translation failed: {err}"));
+                    }
                 }
             }
             Action::Error(message) => self.set_error(message),
@@ -349,6 +380,7 @@ impl App {
             KeyCode::Char('q') => self.running = false,
             KeyCode::Char('j') | KeyCode::Down => {
                 if self.tab == Tab::Lyrics {
+                    self.lyrics_auto_scroll = false;
                     self.lyrics_scroll = self.lyrics_scroll.saturating_add(1);
                 } else {
                     self.move_selection(1);
@@ -356,6 +388,7 @@ impl App {
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 if self.tab == Tab::Lyrics {
+                    self.lyrics_auto_scroll = false;
                     self.lyrics_scroll = self.lyrics_scroll.saturating_sub(1);
                 } else {
                     self.move_selection(-1);
@@ -398,6 +431,9 @@ impl App {
                 self.tab = Tab::Lyrics;
                 self.status = "Lyrics".to_string();
             }
+            KeyCode::Char('s') => self.toggle_shuffle(),
+            KeyCode::Char('a') => self.toggle_auto_scroll(),
+            KeyCode::Char('t') => self.toggle_translation(),
             KeyCode::Char('L') => {
                 self.status = "Loading liked songs...".to_string();
                 self.loading = true;
@@ -424,6 +460,75 @@ impl App {
         }
     }
 
+    /// Replace the track list and rebuild the playback order.
+    fn set_tracks(&mut self, tracks: Vec<Track>) {
+        self.tracks = tracks;
+        self.build_play_order();
+        self.list_state
+            .select(if self.tracks.is_empty() { None } else { Some(0) });
+    }
+
+    /// Build the order used by next/prev. With shuffle on, the current track is
+    /// kept first so playback continues from where it was.
+    fn build_play_order(&mut self) {
+        let mut order: Vec<usize> = (0..self.tracks.len()).collect();
+        if self.shuffle {
+            use rand::seq::SliceRandom;
+            order.shuffle(&mut rand::thread_rng());
+            let current_uri = self.now_playing.as_ref().map(|np| np.track.uri.clone());
+            if let Some(uri) = current_uri {
+                if let Some(index) = self.tracks.iter().position(|track| track.uri == uri) {
+                    if let Some(position) = order.iter().position(|&i| i == index) {
+                        let first = order.remove(position);
+                        order.insert(0, first);
+                    }
+                }
+            }
+        }
+        self.play_order = order;
+    }
+
+    fn toggle_shuffle(&mut self) {
+        self.shuffle = !self.shuffle;
+        self.build_play_order();
+        self.status = if self.shuffle {
+            format!("Shuffle on ({} tracks)", self.tracks.len())
+        } else {
+            "Shuffle off".to_string()
+        };
+    }
+
+    fn toggle_auto_scroll(&mut self) {
+        self.lyrics_auto_scroll = !self.lyrics_auto_scroll;
+        self.status = if self.lyrics_auto_scroll {
+            "Lyrics follow playback".to_string()
+        } else {
+            "Lyrics scroll manually (j/k)".to_string()
+        };
+    }
+
+    fn toggle_translation(&mut self) {
+        if self.tab != Tab::Lyrics {
+            self.status = "Open the Lyrics tab with l first".to_string();
+            return;
+        }
+        let Some(np) = &self.now_playing else {
+            self.status = "No track selected".to_string();
+            return;
+        };
+        let uri = np.track.uri.clone();
+        self.translate_lyrics = !self.translate_lyrics;
+        if self.translate_lyrics {
+            if self.translations.contains_key(&uri) {
+                self.status = "Translation on".to_string();
+            } else {
+                self.fetch_translation(&uri);
+            }
+        } else {
+            self.status = "Showing original lyrics".to_string();
+        }
+    }
+
     fn select_current(&mut self) {
         let index = self.list_state.selected();
 
@@ -444,6 +549,9 @@ impl App {
             playing: false,
             volume,
         });
+        // A new track starts with lyrics following playback again.
+        self.lyrics_auto_scroll = true;
+        self.lyrics_scroll = 0;
 
         if let Some(player) = &self.player {
             match player.play_uri(&track.uri) {
@@ -471,13 +579,25 @@ impl App {
         self.status = if playing { "Playing" } else { "Paused" }.to_string();
     }
 
+    /// Position of the selected track in the current playback order.
+    fn play_position(&self) -> usize {
+        let selected = self.list_state.selected().unwrap_or(0);
+        self.play_order
+            .iter()
+            .position(|&index| index == selected)
+            .unwrap_or(0)
+    }
+
     fn next_track(&mut self) {
         if self.tracks.is_empty() {
             return;
         }
-        let current = self.list_state.selected().unwrap_or(0);
-        let next = (current + 1) % self.tracks.len();
-        self.list_state.select(Some(next));
+        if self.play_order.len() != self.tracks.len() {
+            self.build_play_order();
+        }
+        let next = (self.play_position() + 1) % self.play_order.len();
+        let track_index = self.play_order[next];
+        self.list_state.select(Some(track_index));
         self.select_current();
     }
 
@@ -485,13 +605,17 @@ impl App {
         if self.tracks.is_empty() {
             return;
         }
-        let current = self.list_state.selected().unwrap_or(0);
-        let prev = if current == 0 {
-            self.tracks.len() - 1
+        if self.play_order.len() != self.tracks.len() {
+            self.build_play_order();
+        }
+        let position = self.play_position();
+        let prev = if position == 0 {
+            self.play_order.len() - 1
         } else {
-            current - 1
+            position - 1
         };
-        self.list_state.select(Some(prev));
+        let track_index = self.play_order[prev];
+        self.list_state.select(Some(track_index));
         self.select_current();
     }
 
@@ -579,6 +703,9 @@ impl App {
 
     pub fn fetch_lyrics(&mut self, track: &Track) {
         if self.lyrics.contains_key(&track.uri) {
+            if self.translate_lyrics && !self.translations.contains_key(&track.uri) {
+                self.fetch_translation(&track.uri);
+            }
             return;
         }
         self.lyrics_loading = true;
@@ -595,6 +722,26 @@ impl App {
         });
     }
 
+    /// Translate the current track's lyrics to English in the background.
+    pub fn fetch_translation(&mut self, uri: &str) {
+        let Some(lyrics) = self.lyrics.get(uri).cloned() else {
+            self.translate_lyrics = false;
+            self.status = "Lyrics are not loaded yet".to_string();
+            return;
+        };
+        self.translation_loading = true;
+        self.status = "Translating lyrics...".to_string();
+        let tx = self.tx.clone();
+        let uri = uri.to_string();
+        tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            let result = crate::lyrics::translate_lines(&client, &lyrics.lines, "en")
+                .await
+                .map_err(|err| format!("{err:#}"));
+            let _ = tx.send(Action::TranslationsLoaded { uri, result }).await;
+        });
+    }
+
     pub fn send(&self, action: Action) {
         let _ = self.tx.try_send(action);
     }
@@ -603,4 +750,101 @@ impl App {
 pub fn format_duration(duration: Duration) -> String {
     let total = duration.as_secs();
     format!("{:02}:{:02}", total / 60, total % 60)
+}
+
+/// Line where the lyrics view starts. In follow mode the active line is kept
+/// near the middle; in manual mode the stored scroll offset is used.
+pub fn lyric_scroll_offset(
+    active: Option<usize>,
+    line_count: usize,
+    auto_scroll: bool,
+    manual_scroll: usize,
+    height: usize,
+) -> usize {
+    let max_offset = line_count.saturating_sub(height);
+    if auto_scroll {
+        active
+            .unwrap_or(0)
+            .saturating_sub(height / 2)
+            .min(max_offset)
+    } else {
+        manual_scroll.min(max_offset)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_app() -> App {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        App::new(tx)
+    }
+
+    fn demo_tracks() -> Vec<Track> {
+        (0..5)
+            .map(|i| Track {
+                title: format!("Track {i}"),
+                artist: "Artist".into(),
+                album: "Album".into(),
+                duration: Duration::from_secs(120),
+                uri: format!("spotify:track:test{i}"),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn shuffle_visits_every_track_and_starts_from_current() {
+        let mut app = test_app();
+        app.set_tracks(demo_tracks());
+        for track in &app.tracks {
+            app.lyrics.insert(
+                track.uri.clone(),
+                crate::lyrics::Lyrics {
+                    lines: Vec::new(),
+                    synced: true,
+                    source: "test".into(),
+                },
+            );
+        }
+        app.list_state.select(Some(2));
+        app.now_playing = Some(NowPlaying {
+            track: app.tracks[2].clone(),
+            position: Duration::ZERO,
+            playing: false,
+            volume: 60,
+        });
+
+        app.toggle_shuffle();
+        assert!(app.shuffle);
+        assert_eq!(app.play_order.len(), app.tracks.len());
+        assert_eq!(app.play_order[0], 2);
+
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..app.tracks.len() {
+            seen.insert(app.list_state.selected().unwrap());
+            app.next_track();
+        }
+        assert_eq!(seen.len(), app.tracks.len());
+        assert_eq!(app.list_state.selected().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn normal_order_wraps_in_both_directions() {
+        let mut app = test_app();
+        app.set_tracks(demo_tracks());
+        app.next_track();
+        assert_eq!(app.list_state.selected(), Some(1));
+        app.prev_track();
+        assert_eq!(app.list_state.selected(), Some(0));
+        app.prev_track();
+        assert_eq!(app.list_state.selected(), Some(4));
+    }
+
+    #[test]
+    fn lyric_scroll_follows_active_line_and_clamps_manual_offset() {
+        assert_eq!(lyric_scroll_offset(Some(15), 20, true, 0, 10), 10);
+        assert_eq!(lyric_scroll_offset(Some(3), 20, true, 0, 10), 0);
+        assert_eq!(lyric_scroll_offset(Some(15), 20, false, 18, 10), 10);
+    }
 }

@@ -16,12 +16,14 @@ or decisions change.
 | UI | `ratatui` 0.30 + `crossterm` 0.29 |
 | Runtime | `tokio` (multi-thread), single `mpsc` Action channel into `App` |
 | Audio backend | librespot-playback with rodio/ALSA (`SoftMixer` for volume) |
-| Lyrics | LRCLIB (line-synced, no key) primary; cached in-memory by track URI. Genius unsynced fallback deferred to polish |
+| Lyrics | LRCLIB (line-synced, no key) primary, original-language entry preferred; English translation via Google's public endpoint on demand. Cached in-memory by track URI. Genius unsynced fallback deferred to polish |
 | Config/cache | `~/.config/termify/config.toml`, `~/.cache/termify/` (`token.json` for Web API, `playback_token.json` for playback, audio cache) |
 | Redirect URI | `http://127.0.0.1:8989/callback` for PKCE; device pairing uses `https://spotify.com/pair` |
 
 Lyrics note: Spotify's Web API has **no** lyrics endpoint. The internal `color-lyrics`
 endpoint is deliberately out of scope for v1 (unofficial, needs an account cookie).
+English translation uses Google's public translate endpoint (also unofficial, no
+key) and is best-effort; failures keep the original lyrics visible.
 
 ## Architecture
 
@@ -32,7 +34,7 @@ src/
   auth.rs            # PKCE + device-pairing flows, token caches + refresh
   api.rs             # rspotify wrapper (search, playlists, liked songs)
   player.rs          # librespot Session + Player, playback controls, events
-  lyrics.rs          # LRCLIB client, LRC parser, active-line tracking
+  lyrics.rs          # LRCLIB client, LRC parser, language preference, translation
   ui/
     mod.rs
     app.rs           # App state, Action enum, key handling, async helpers
@@ -68,7 +70,7 @@ Playback progress is derived from a local clock anchored on a 250 ms tick.
 
 ### M1 — TUI shell (done)
 - [x] Layout: header with tabs, list pane, detail pane, now-playing footer
-- [x] Keybindings: `j/k`, `g/G`, `PgUp/PgDn`, `Enter`, `/`, `Space`, `n/p`, `←/→`, `+/-`, `l`, `L`, `Tab`, `?`, `q`, `Ctrl-C`
+- [x] Keybindings: `j/k`, `g/G`, `PgUp/PgDn`, `Enter`, `/`, `Space`, `n/p`, `←/→`, `+/-`, `l`, `L`, `s`, `a`, `t`, `Tab`, `?`, `q`, `Ctrl-C`
       (Tab/Shift+Tab use crossterm's `Tab`/`BackTab` codes)
 - [x] Config loading (client ID, redirect URI, volume, audio backend)
 - [x] Single `mpsc` Action channel with crossterm event stream + 250 ms tick
@@ -92,17 +94,29 @@ Playback progress is derived from a local clock anchored on a 250 ms tick.
 - [x] LRCLIB client with `track_name`/`artist_name`/`album_name`/`duration` lookup
 - [x] LRC parser (mm:ss.xx, mm:ss, multiple stamps, metadata tags)
 - [x] Active-line highlight following playback position, manual scroll (`j/k`)
+- [x] Auto-scroll: active line stays near the middle of the pane; `j/k` switches
+      to manual mode and `a` re-enables follow mode
 - [x] Plain-lyrics fallback, "no lyrics" state, in-memory cache by track URI
-- [x] Unit tests for LRC parsing and active-line tracking (5 passing)
+- [x] Unit tests for LRC parsing, active-line tracking, scroll offsets, script
+      detection and translation parsing (10 passing)
 - [x] Fixed LRCLIB camelCase field mapping (`syncedLyrics`/`plainLyrics`) that
       made every lookup report "no lyrics"; verified with "Knee Socks"
+- [x] Prefer original-language LRCLIB entry when `/api/get` returns a translation
+      for a non-Latin title; verified with DECO*27's モニタリング (Japanese first
+      line instead of English)
+- [x] Optional English translation (`t`) via Google's public translate endpoint,
+      batched per 10 lines, cached per track; original remains available by
+      toggling back
 
-### M5 — Polish (not started)
+### M5 — Polish (in progress)
 - [ ] Genius unsynced fallback (needs optional free API token)
 - [ ] Disk-persisted lyrics cache
 - [x] Token refresh persistence verified in practice (expired cache refreshed,
       playback succeeded, new token cached with `0600`)
-- [ ] Shuffle/repeat, queue view
+- [x] Playlist shuffling (`s`): Fisher-Yates playback order, current track first,
+      applied to `n/p` and end-of-track auto-advance; next/prev wrap and visit
+      every track exactly once per cycle (unit tested)
+- [ ] Repeat mode, queue view
 - [ ] Integration tests with a mock HTTP layer
 
 ## Deferred (not in v1)

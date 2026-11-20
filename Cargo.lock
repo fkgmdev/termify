@@ -3827,6 +3827,7 @@ dependencies = [
  "futures",
  "librespot-core",
  "librespot-playback",
+ "rand 0.8.8",
  "ratatui",
  "reqwest",
  "rspotify",

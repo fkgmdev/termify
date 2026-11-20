@@ -15,10 +15,14 @@ library, play music, and read synced lyrics, all from the terminal.
 - Two separate cached tokens so Web API rate limits do not affect playback
 - Search tracks, browse playlists, load playlist tracks and liked songs
 - Playback controls: play/pause, next/prev, seek, volume, end-of-track auto-advance
-- Synced lyrics via LRCLIB with active-line highlighting, cached per session
+- Playlist shuffling with a saved playback order (`s`)
+- Synced lyrics via LRCLIB with active-line highlighting and automatic scrolling
+- Original-language lyrics preferred over translated LRCLIB entries; optional
+  English translation (`t`), cached per track
 - Ratatui TUI with a single async action loop and `--demo` mode
 
-Not in v1: Spotify Connect, cover art, daemon mode, media keys, audio visualization.
+Not in v1: Spotify Connect, cover art, daemon mode, media keys, repeat mode,
+audio visualization.
 
 ## Requirements
 
@@ -84,8 +88,8 @@ termify --relogin       # force re-login for both Web API and playback
 
 | Key | Action |
 | --- | --- |
-| `j` / `↓` | Move down (scroll lyrics on Lyrics tab) |
-| `k` / `↑` | Move up (scroll lyrics on Lyrics tab) |
+| `j` / `↓` | Move down (manually scroll lyrics on Lyrics tab, disabling follow mode) |
+| `k` / `↑` | Move up (manually scroll lyrics on Lyrics tab, disabling follow mode) |
 | `g` / `G` | First / last item |
 | `PgUp` / `PgDn` | Page up / down |
 | `Enter` | Select track to play; open playlist |
@@ -97,6 +101,9 @@ termify --relogin       # force re-login for both Web API and playback
 | `+` / `-` | Volume up / down |
 | `l` | Lyrics tab |
 | `L` | Load liked songs |
+| `s` | Shuffle on / off (affects next/prev and auto-advance) |
+| `a` | Lyrics follow playback on / off |
+| `t` | Translate lyrics to English (on the Lyrics tab) |
 | `?` | Help overlay |
 | `q` / `Ctrl-C` | Quit |
 
@@ -111,9 +118,9 @@ src/
   auth.rs     # PKCE + device-pairing flows, token caches + refresh
   api.rs      # rspotify wrapper (search, playlists, liked songs)
   player.rs   # librespot session, Player, mixer, playback controls
-  lyrics.rs   # LRCLIB client, LRC parser, active-line tracking
+  lyrics.rs   # LRCLIB client, LRC parser, language preference, translation
   ui/
-    app.rs    # App state, Action enum, key handling, async helpers
+    app.rs    # App state, Action enum, key handling, shuffle/scroll/translation
     event.rs  # crossterm stream + tick -> Action channel
     render.rs # ratatui layout and widgets
 ```
@@ -140,6 +147,12 @@ Playback progress is derived from a local clock anchored on a 250 ms tick.
 - **vergen pin**: `librespot-core 0.8.0` depends on `vergen-gitcl 1.0.8`, which
   resolves to an incompatible `vergen 9.1.0`. `Cargo.lock` pins `vergen 9.0.6`.
   Do not delete `Cargo.lock` without re-applying `cargo update -p vergen --precise 9.0.6`.
-- **Token file permissions**: the token cache is written with mode `0600`.
+- **Token file permissions**: both token caches are written with mode `0600`.
 - **Lyrics**: LRCLIB is a free third-party service with no API key; availability
-  may vary. Genius fallback is planned but not implemented yet.
+  may vary. If its exact-match lookup returns a translated entry for a non-Latin
+  track, termify searches LRCLIB for the original-language entry (verified with
+  DECO*27's モニタリング). Genius fallback is planned but not implemented yet.
+- **Translation**: English translation uses Google's public translate endpoint
+  (unofficial, no API key) and is cached per track for the session. If the
+  service is unavailable the status bar shows the error and original lyrics stay
+  visible.

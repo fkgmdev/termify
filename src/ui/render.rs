@@ -4,7 +4,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Tabs, Widget};
 
-use super::app::{App, Tab, format_duration};
+use super::app::{App, Tab, format_duration, lyric_scroll_offset};
 
 const CYAN: Color = Color::Cyan;
 const YELLOW: Color = Color::Yellow;
@@ -86,7 +86,12 @@ fn render_main(frame: &mut Frame, area: Rect, app: &App) {
 fn render_lyrics_pane(frame: &mut Frame, area: Rect, app: &App) {
     let uri = app.now_playing.as_ref().map(|np| np.track.uri.as_str());
     let lyrics = uri.and_then(|uri| app.lyrics.get(uri));
-    let title = match (&app.now_playing, lyrics) {
+    let track_title = app
+        .now_playing
+        .as_ref()
+        .map(|np| np.track.title.clone())
+        .unwrap_or_default();
+    let mut title = match (&app.now_playing, lyrics) {
         (Some(np), Some(lyrics)) => format!(
             " Lyrics — {} ({}{}) ",
             np.track.title,
@@ -96,9 +101,24 @@ fn render_lyrics_pane(frame: &mut Frame, area: Rect, app: &App) {
         (Some(np), None) => format!(" Lyrics — {} ", np.track.title),
         _ => " Lyrics ".to_string(),
     };
+    if app.translation_loading || app.translate_lyrics || !app.lyrics_auto_scroll {
+        let mut flags = Vec::new();
+        if app.translation_loading {
+            flags.push("translating...");
+        }
+        if app.translate_lyrics {
+            flags.push("translated");
+        }
+        if !app.lyrics_auto_scroll {
+            flags.push("manual scroll");
+        }
+        title = format!(" Lyrics — {track_title} [{}] ", flags.join(", "));
+    }
+
     let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    let height = inner.height as usize;
 
     let lines: Vec<Line> = if app.lyrics_loading {
         vec![Line::from(Span::styled(
@@ -112,15 +132,24 @@ fn render_lyrics_pane(frame: &mut Frame, area: Rect, app: &App) {
             .map(|np| np.position)
             .unwrap_or_default();
         let active = crate::lyrics::active_line(lyrics, position);
-        let mut offset = app.lyrics_scroll;
-        let max_offset = lyrics.lines.len().saturating_sub(inner.height as usize / 2);
-        offset = offset.min(max_offset);
+        let offset = lyric_scroll_offset(
+            active,
+            lyrics.lines.len(),
+            app.lyrics_auto_scroll,
+            app.lyrics_scroll,
+            height,
+        );
+        let translated = if app.translate_lyrics {
+            uri.and_then(|uri| app.translations.get(uri))
+        } else {
+            None
+        };
 
         lyrics
             .lines
             .iter()
             .skip(offset)
-            .take(inner.height as usize)
+            .take(height)
             .enumerate()
             .map(|(i, line)| {
                 let absolute = offset + i;
@@ -132,10 +161,11 @@ fn render_lyrics_pane(frame: &mut Frame, area: Rect, app: &App) {
                     Style::default().fg(WHITE)
                 };
                 let prefix = if Some(absolute) == active { "▶ " } else { "  " };
-                Line::from(Span::styled(
-                    format!("{prefix}{}", line.text),
-                    style,
-                ))
+                let text = translated
+                    .and_then(|lines| lines.get(absolute))
+                    .map(String::as_str)
+                    .unwrap_or(line.text.as_str());
+                Line::from(Span::styled(format!("{prefix}{text}"), style))
             })
             .collect()
     } else {
@@ -359,6 +389,12 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         Span::raw("search"),
         Span::styled(" [l] ", Style::default().fg(YELLOW)),
         Span::raw("lyrics"),
+        Span::styled(" [s] ", Style::default().fg(YELLOW)),
+        Span::raw(if app.shuffle { "shuffle ON" } else { "shuffle" }),
+        Span::styled(" [t] ", Style::default().fg(YELLOW)),
+        Span::raw(if app.translate_lyrics { "translate ON" } else { "translate" }),
+        Span::styled(" [a] ", Style::default().fg(YELLOW)),
+        Span::raw("follow"),
         Span::styled(" [?] ", Style::default().fg(YELLOW)),
         Span::raw("help"),
         Span::styled(" [q] ", Style::default().fg(YELLOW)),
@@ -369,8 +405,8 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_help(frame: &mut Frame, area: Rect) {
-    let popup_width = area.width.min(60);
-    let popup_height = area.height.min(18);
+    let popup_width = area.width.min(64);
+    let popup_height = area.height.min(24);
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
     let popup = Rect::new(x, y, popup_width, popup_height);
@@ -378,8 +414,8 @@ fn render_help(frame: &mut Frame, area: Rect) {
     let help_text = Text::from(vec![
         Line::from(Span::styled(" termify keybindings ", Style::default().fg(CYAN).bold())),
         Line::from(""),
-        Line::from("  j / ↓       Move down"),
-        Line::from("  k / ↑       Move up"),
+        Line::from("  j / ↓       Move down (manual lyrics scroll)"),
+        Line::from("  k / ↑       Move up (manual lyrics scroll)"),
         Line::from("  g / G       First / last item"),
         Line::from("  PgUp/PgDn   Page up / down"),
         Line::from("  Enter       Select track"),
@@ -390,6 +426,9 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::from("  ← / →       Seek back / forward 5s"),
         Line::from("  + / -       Volume up / down"),
         Line::from("  l           Lyrics tab"),
+        Line::from("  s           Shuffle on / off"),
+        Line::from("  a           Lyrics follow playback on / off"),
+        Line::from("  t           Translate lyrics to English (lyrics tab)"),
         Line::from("  ?           Toggle this help"),
         Line::from("  q / Ctrl-C  Quit"),
         Line::from(""),
