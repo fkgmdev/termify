@@ -1,0 +1,117 @@
+use std::path::PathBuf;
+
+use anyhow::{Context, Result, bail};
+use directories::ProjectDirs;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Config {
+    /// Client ID of the user's Spotify developer app (Web API OAuth only).
+    #[serde(default)]
+    pub client_id: String,
+
+    /// Redirect URI registered for that app; exact match required.
+    #[serde(default = "default_redirect_uri")]
+    pub redirect_uri: String,
+
+    /// Initial local playback volume (0-100 here; librespot uses 0-65535).
+    #[serde(default = "default_volume")]
+    pub volume: u16,
+
+    /// Audio backend passed to librespot (rodio, pulseaudio, alsa, ...).
+    #[serde(default = "default_backend")]
+    pub audio_backend: String,
+}
+
+fn default_redirect_uri() -> String {
+    "http://127.0.0.1:8989/callback".to_string()
+}
+
+fn default_volume() -> u16 {
+    60
+}
+
+fn default_backend() -> String {
+    "rodio".to_string()
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            client_id: String::new(),
+            redirect_uri: default_redirect_uri(),
+            volume: default_volume(),
+            audio_backend: default_backend(),
+        }
+    }
+}
+
+pub struct Paths {
+    pub config_dir: PathBuf,
+    pub cache_dir: PathBuf,
+    pub config_file: PathBuf,
+    pub token_file: PathBuf,
+    pub playback_token_file: PathBuf,
+}
+
+impl Paths {
+    pub fn discover() -> Result<Self> {
+        let dirs = ProjectDirs::from("", "", "termify")
+            .context("could not determine config/cache directories")?;
+        let config_dir = dirs.config_dir().to_path_buf();
+        let cache_dir = dirs.cache_dir().to_path_buf();
+        Ok(Self {
+            config_file: config_dir.join("config.toml"),
+            token_file: cache_dir.join("token.json"),
+            playback_token_file: cache_dir.join("playback_token.json"),
+            config_dir,
+            cache_dir,
+        })
+    }
+
+    pub fn ensure_dirs(&self) -> Result<()> {
+        std::fs::create_dir_all(&self.config_dir)?;
+        std::fs::create_dir_all(&self.cache_dir)?;
+        Ok(())
+    }
+}
+
+pub fn load(paths: &Paths) -> Result<Config> {
+    paths.ensure_dirs()?;
+
+    let mut config = if paths.config_file.exists() {
+        let contents = std::fs::read_to_string(&paths.config_file)
+            .with_context(|| format!("reading {}", paths.config_file.display()))?;
+        toml::from_str::<Config>(&contents)
+            .with_context(|| format!("parsing {}", paths.config_file.display()))?
+    } else {
+        let config = Config::default();
+        let contents = toml::to_string_pretty(&config)?;
+        std::fs::write(&paths.config_file, contents)
+            .with_context(|| format!("writing {}", paths.config_file.display()))?;
+        config
+    };
+
+    if let Ok(id) = std::env::var("SPOTIFY_CLIENT_ID") {
+        if !id.trim().is_empty() {
+            config.client_id = id.trim().to_string();
+        }
+    }
+
+    if config.client_id.trim().is_empty() {
+        bail!(
+            "No Spotify client ID configured for Web API access.\n\
+             1. Create an app at https://developer.spotify.com/dashboard\n\
+             2. Add redirect URI: {}\n\
+             3. Set SPOTIFY_CLIENT_ID or edit {}",
+            config.redirect_uri,
+            paths.config_file.display()
+        );
+    }
+
+    if config.volume > 100 {
+        bail!("config.volume must be between 0 and 100");
+    }
+
+    Ok(config)
+}
