@@ -138,6 +138,7 @@ fn playlist_from_simplified(playlist: &SimplifiedPlaylist, me_id: Option<&str>) 
         collaborative: playlist.collaborative,
         is_public: playlist.public,
         contributors: Vec::new(), // filled in when the playlist is opened
+        art_url: pick_art_url(&playlist.images),
         snapshot_id: playlist.snapshot_id.clone(),
     }
 }
@@ -156,6 +157,7 @@ fn playlist_from_full(
         collaborative: playlist.collaborative,
         is_public: playlist.public,
         contributors,
+        art_url: pick_art_url(&playlist.images),
         snapshot_id: playlist.snapshot_id.clone(),
     }
 }

@@ -134,6 +134,8 @@ pub struct Playlist {
     pub is_public: Option<bool>,
     /// Distinct users who added items to the playlist (from item attribution).
     pub contributors: Vec<String>,
+    /// Playlist cover image from Spotify, shown on the Playlists tab.
+    pub art_url: Option<String>,
     /// Kept for future optimistic-concurrency checks; batch saves use positions.
     #[allow(dead_code)]
     pub snapshot_id: String,
@@ -192,6 +194,14 @@ impl PromptKind {
     }
 }
 
+/// What a decoded cover image belongs to. Stale responses are ignored so a
+/// slow track fetch cannot replace a playlist cover (or vice versa).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoverArtTarget {
+    Track { uri: String },
+    Playlist { id: String },
+}
+
 /// Locally staged edits for one playlist. Nothing is sent to Spotify until
 /// `S` is pressed, so repeated reorders cost one batched save instead of one
 /// request per keystroke.
@@ -234,7 +244,43 @@ pub struct PlaylistDownload {
     pub total: usize,
     pub completed: usize,
     pub failed: usize,
+    /// URIs still being downloaded, used for progress and duplicate avoidance.
     pub uris: HashSet<String>,
+    /// Every unique URI in the playlist, including tracks already on disk.
+    pub members: Vec<String>,
+}
+
+/// A row in the Offline tab. Playlists and the "all tracks" row are queues
+/// that can be played without a network connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OfflineItem {
+    Playlist {
+        id: String,
+        name: String,
+        count: usize,
+    },
+    AllTracks,
+    Track {
+        uri: String,
+    },
+}
+
+/// Which offline queue was last loaded for playback. This is deliberately
+/// separate from `current_playlist_id`: offline playlists are local groupings
+/// and must never be edited or renamed through the Web API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OfflineQueue {
+    All,
+    Playlist { id: String, name: String },
+}
+
+impl OfflineQueue {
+    pub fn name(&self) -> String {
+        match self {
+            Self::All => "All downloaded tracks".to_string(),
+            Self::Playlist { name, .. } => name.clone(),
+        }
+    }
 }
 
 /// Playlist selection overlay shown when adding a track.
@@ -297,12 +343,14 @@ pub enum Action {
         uri: String,
         result: Result<DownloadEntry, String>,
     },
-    /// Playlist tracks were fetched and queued for offline download.
+    /// Playlist tracks were fetched and queued for offline download. `members`
+    /// is the full playlist so already-saved tracks can join the offline queue.
     PlaylistDownloadStarted {
         id: String,
         name: String,
         total: usize,
         uris: Vec<String>,
+        members: Vec<String>,
     },
     /// All tracks for a playlist download finished, or fetching it failed.
     PlaylistDownloadFinished {
@@ -310,6 +358,7 @@ pub enum Action {
         name: String,
         total: usize,
         failed: usize,
+        members: Vec<String>,
         error: Option<String>,
     },
     PlayerEndOfTrack,
@@ -323,9 +372,10 @@ pub enum Action {
         uri: String,
         result: Result<Vec<String>, String>,
     },
-    /// Cover art downloaded and decoded off the UI thread. `url` keeps stale
-    /// responses from replacing the image for a different track.
+    /// Cover art downloaded and decoded off the UI thread. `target` and `url`
+    /// keep stale responses from replacing the image for a different item.
     CoverArtLoaded {
+        target: CoverArtTarget,
         url: String,
         result: Result<image::DynamicImage, String>,
     },
@@ -381,6 +431,12 @@ pub struct App {
     pub downloading: HashSet<String>,
     /// Whole-playlist downloads currently in progress, keyed by playlist ID.
     pub playlist_downloads: HashMap<String, PlaylistDownload>,
+    /// Rows rendered on the Offline tab (playlists, all tracks, then tracks).
+    pub offline_items: Vec<OfflineItem>,
+    /// Queue selected on the Offline tab, used by next/prev and repeat-all.
+    pub offline_queue: Option<OfflineQueue>,
+    /// Selected track inside `tracks` while viewing the Offline tab.
+    pub offline_track_index: usize,
     /// Lazily created when an offline track is first played.
     offline_player: Option<OfflinePlayer>,
     pub playback_mode: PlaybackMode,
@@ -477,6 +533,9 @@ impl App {
             downloads: options.downloads.unwrap_or_else(DownloadStore::disabled),
             downloading: HashSet::new(),
             playlist_downloads: HashMap::new(),
+            offline_items: Vec::new(),
+            offline_queue: None,
+            offline_track_index: 0,
             offline_player: None,
             playback_mode: PlaybackMode::Online,
             offline_end_handled: false,
@@ -594,13 +653,50 @@ impl App {
     /// Enter/j/k/n/p work exactly as they do for search results or playlists.
     pub fn load_downloaded_tracks(&mut self) {
         let tracks = self.downloads.tracks();
+        let mut items: Vec<OfflineItem> = self
+            .downloads
+            .playlists()
+            .into_iter()
+            .filter_map(|playlist| {
+                let count = self.downloads.playlist_tracks(&playlist.id).len();
+                (count > 0).then_some(OfflineItem::Playlist {
+                    id: playlist.id,
+                    name: playlist.name,
+                    count,
+                })
+            })
+            .collect();
+        if !tracks.is_empty() {
+            items.push(OfflineItem::AllTracks);
+            items.extend(tracks.iter().map(|track| OfflineItem::Track {
+                uri: track.uri.clone(),
+            }));
+        }
+        self.offline_items = items;
+        let playlists = self
+            .offline_items
+            .iter()
+            .filter(|item| matches!(item, OfflineItem::Playlist { .. }))
+            .count();
         self.tab = Tab::Downloads;
         self.current_playlist_id = None;
+        self.offline_track_index = 0;
+        if self
+            .offline_queue
+            .as_ref()
+            .is_some_and(|queue| !matches!(queue, OfflineQueue::All) && tracks.is_empty())
+        {
+            self.offline_queue = None;
+        }
         self.set_tracks(tracks.clone());
         self.status = if tracks.is_empty() {
             "No downloads yet — select a track and press d".to_string()
         } else {
-            format!("Offline library — {} tracks", tracks.len())
+            format!(
+                "Offline library — {} tracks, {} playlists",
+                tracks.len(),
+                playlists
+            )
         };
     }
 
@@ -611,6 +707,7 @@ impl App {
     /// Launch in offline mode: only downloaded tracks are available.
     pub fn set_offline_mode(&mut self) {
         self.playback_mode = PlaybackMode::Offline;
+        self.offline_queue = None;
         self.load_downloaded_tracks();
         self.status = if self.downloads.is_empty() {
             "Offline mode — no downloads found".to_string()
@@ -620,9 +717,70 @@ impl App {
     }
 
     fn play_downloaded_track(&mut self) {
-        // Downloads tab uses `tracks` as its queue, so the shared selection
-        // logic handles playback, lyrics, artwork and queue position for us.
-        self.select_current();
+        let Some(index) = self.list_state.selected() else {
+            self.status = "Select an offline playlist, all tracks, or a track".to_string();
+            return;
+        };
+        let Some(item) = self.offline_items.get(index).cloned() else {
+            self.status = "Select an offline playlist, all tracks, or a track".to_string();
+            return;
+        };
+        match item {
+            OfflineItem::Playlist { id, name, .. } => {
+                let tracks = self.downloads.playlist_tracks(&id);
+                if tracks.is_empty() {
+                    self.status = format!("Offline playlist '{name}' has no saved tracks");
+                    return;
+                }
+                let count = tracks.len();
+                self.set_tracks(tracks);
+                self.offline_queue = Some(OfflineQueue::Playlist { id, name: name.clone() });
+                self.offline_track_index = 0;
+                self.list_state.select(Some(index));
+                self.status = format!("Playing offline playlist '{name}' — {count} tracks");
+                self.select_current();
+                self.status = format!("Playing offline playlist '{name}' — {count} tracks");
+            }
+            OfflineItem::AllTracks => {
+                let tracks = self.downloads.tracks();
+                if tracks.is_empty() {
+                    self.status = "No downloaded tracks to play".to_string();
+                    return;
+                }
+                let count = tracks.len();
+                self.set_tracks(tracks);
+                self.offline_queue = Some(OfflineQueue::All);
+                self.offline_track_index = 0;
+                self.list_state.select(Some(index));
+                self.status = format!("Playing all {count} downloaded tracks");
+                self.select_current();
+                self.status = format!("Playing all {count} downloaded tracks");
+            }
+            OfflineItem::Track { uri } => {
+                if self.offline_queue.is_none() {
+                    self.offline_queue = Some(OfflineQueue::All);
+                }
+                let Some(track_index) = self.tracks.iter().position(|track| track.uri == uri)
+                else {
+                    self.status = "That track is no longer in the offline library".to_string();
+                    return;
+                };
+                self.offline_track_index = track_index;
+                self.select_current();
+            }
+        }
+    }
+
+    /// Keep the Downloads list selection on the row representing `uri` while
+    /// still tracking the track inside the playback queue separately.
+    fn select_downloads_row_for_uri(&mut self, uri: &str) {
+        if let Some(row) = self
+            .offline_items
+            .iter()
+            .position(|item| matches!(item, OfflineItem::Track { uri: item_uri } if item_uri == uri))
+        {
+            self.list_state.select(Some(row));
+        }
     }
 
     fn download_selected(&mut self) {
@@ -724,6 +882,7 @@ impl App {
                             name,
                             total: 0,
                             failed: 0,
+                            members: Vec::new(),
                             error: Some(message),
                         })
                         .await;
@@ -732,10 +891,17 @@ impl App {
             };
 
             let mut seen = HashSet::new();
-            let pending: Vec<crate::ui::Track> = tracks
-                .into_iter()
-                .filter(|track| !skip.contains(&track.uri) && seen.insert(track.uri.clone()))
-                .collect();
+            let mut members = Vec::new();
+            let mut pending = Vec::new();
+            for track in tracks {
+                if !seen.insert(track.uri.clone()) {
+                    continue;
+                }
+                members.push(track.uri.clone());
+                if !skip.contains(&track.uri) {
+                    pending.push(track);
+                }
+            }
             let total = pending.len();
             let uris: Vec<String> = pending.iter().map(|track| track.uri.clone()).collect();
             let _ = tx
@@ -744,11 +910,17 @@ impl App {
                     name: name.clone(),
                     total,
                     uris,
+                    members: members.clone(),
                 })
                 .await;
 
             let mut failed = 0;
-            for track in pending {
+            for (index, track) in pending.into_iter().enumerate() {
+                // Give Spotify's audio-key service room between tracks. The
+                // download itself also retries key requests with backoff.
+                if index > 0 {
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                }
                 let result = offline::download_track(&player.session, &track, &dir)
                     .await
                     .map_err(|err| format!("{err:#}"));
@@ -768,6 +940,7 @@ impl App {
                     name,
                     total,
                     failed,
+                    members,
                     error: None,
                 })
                 .await;
@@ -775,14 +948,48 @@ impl App {
     }
 
     fn delete_selected_download(&mut self) {
-        let Some(track) = self
+        let selected = self
             .list_state
             .selected()
-            .and_then(|index| self.tracks.get(index))
-            .cloned()
-        else {
-            return;
-        };
+            .and_then(|index| self.offline_items.get(index))
+            .cloned();
+        match selected {
+            Some(OfflineItem::Playlist { id, name, .. }) => {
+                if let Err(err) = self.downloads.remove_playlist(&id) {
+                    self.set_error(format!("Could not remove offline playlist: {err:#}"));
+                    return;
+                }
+                if self.offline_queue.as_ref().is_some_and(|queue| {
+                    matches!(queue, OfflineQueue::Playlist { id: queue_id, .. } if queue_id == &id)
+                }) {
+                    self.offline_queue = None;
+                }
+                self.load_downloaded_tracks();
+                self.status = format!("Forgot offline playlist '{name}' — audio files kept");
+                return;
+            }
+            Some(OfflineItem::AllTracks) => {
+                self.status = "Select a track row to delete its offline copy".to_string();
+                return;
+            }
+            Some(OfflineItem::Track { uri }) => {
+                let Some(track) = self
+                    .downloads
+                    .get(&uri)
+                    .map(|entry| entry.track.clone())
+                    .or_else(|| self.tracks.iter().find(|track| track.uri == uri).cloned())
+                else {
+                    return;
+                };
+                self.delete_downloaded_track(track);
+            }
+            None => {
+                self.status = "Select a track row to delete its offline copy".to_string();
+            }
+        }
+    }
+
+    fn delete_downloaded_track(&mut self, track: crate::ui::Track) {
         let current_is_offline = self.playback_mode == PlaybackMode::Offline
             && self
                 .now_playing
@@ -957,6 +1164,7 @@ impl App {
                             })
                             .collect();
                         self.status = format!("Loaded {} playlists", self.playlists.len());
+                        self.load_selected_playlist_cover();
                     }
                     Err(err) => self.set_error(err),
                 }
@@ -1127,6 +1335,7 @@ impl App {
                 name,
                 total,
                 uris,
+                members,
             } => {
                 let progress = self
                     .playlist_downloads
@@ -1138,6 +1347,7 @@ impl App {
                 progress.name = name.clone();
                 progress.total = total;
                 progress.uris = uris.into_iter().collect();
+                progress.members = members;
                 for uri in &progress.uris {
                     self.downloading.insert(uri.clone());
                 }
@@ -1152,6 +1362,7 @@ impl App {
                 name,
                 total,
                 failed,
+                members,
                 error,
             } => {
                 self.playlist_downloads.remove(&id);
@@ -1159,8 +1370,15 @@ impl App {
                     self.set_error(message);
                     return Ok(());
                 }
+                if let Err(err) = self.downloads.insert_playlist(&id, &name, &members) {
+                    self.set_error(format!("Could not save offline playlist: {err:#}"));
+                    return Ok(());
+                }
+                if self.tab == Tab::Downloads {
+                    self.load_downloaded_tracks();
+                }
                 self.status = if total == 0 {
-                    format!("All tracks in '{name}' are already offline")
+                    format!("All tracks in '{name}' are offline — press Enter to play")
                 } else if failed > 0 {
                     format!(
                         "Downloaded {}/{} tracks from '{name}' ({} failed)",
@@ -1223,16 +1441,28 @@ impl App {
                     }
                 }
             }
-            Action::CoverArtLoaded { url, result } => {
+            Action::CoverArtLoaded {
+                target,
+                url,
+                result,
+            } => {
                 if !self.art_enabled {
                     return Ok(());
                 }
-                let current = self
-                    .now_playing
-                    .as_ref()
-                    .and_then(|np| np.track.art_url.as_deref());
+                let current = match &target {
+                    CoverArtTarget::Track { uri } => self
+                        .now_playing
+                        .as_ref()
+                        .filter(|np| &np.track.uri == uri)
+                        .and_then(|np| np.track.art_url.as_deref()),
+                    CoverArtTarget::Playlist { id } => self
+                        .playlists
+                        .iter()
+                        .find(|playlist| &playlist.id == id)
+                        .and_then(|playlist| playlist.art_url.as_deref()),
+                };
                 if current != Some(url.as_str()) {
-                    return Ok(()); // stale response for a previous track
+                    return Ok(()); // stale response for a previous item
                 }
                 let size = self.art_size();
                 self.art = match result {
@@ -1477,6 +1707,9 @@ impl App {
                 };
                 if self.tab == Tab::Downloads {
                     self.load_downloaded_tracks();
+                } else if self.tab == Tab::Playlists {
+                    self.load_selected_playlist_cover();
+                    self.status = format!("Tab: {}", self.tab.title());
                 } else {
                     self.status = format!("Tab: {}", self.tab.title());
                 }
@@ -1915,10 +2148,10 @@ impl App {
 
     /// Length of the list currently rendered on the left side.
     fn list_len(&self) -> usize {
-        if self.tab == Tab::Playlists {
-            self.playlists.len()
-        } else {
-            self.tracks.len()
+        match self.tab {
+            Tab::Playlists => self.playlists.len(),
+            Tab::Downloads => self.offline_items.len(),
+            _ => self.tracks.len(),
         }
     }
 
@@ -1930,12 +2163,18 @@ impl App {
         let current = self.list_state.selected().unwrap_or(0) as i32;
         let next = (current + delta).clamp(0, len as i32 - 1) as usize;
         self.list_state.select(Some(next));
+        if self.tab == Tab::Playlists {
+            self.load_selected_playlist_cover();
+        }
     }
 
     fn move_to(&mut self, index: usize) {
         let len = self.list_len();
         if len > 0 {
             self.list_state.select(Some(index.min(len - 1)));
+            if self.tab == Tab::Playlists {
+                self.load_selected_playlist_cover();
+            }
         }
     }
 
@@ -2102,8 +2341,9 @@ impl App {
             return;
         }
         let was_playing = self.now_playing.as_ref().is_some_and(|np| np.playing);
-        let repeating_playlist =
-            at_last && self.repeat == RepeatMode::All && self.current_playlist_id.is_some();
+        let repeating_playlist = at_last
+            && self.repeat == RepeatMode::All
+            && (self.current_playlist_id.is_some() || self.offline_queue.is_some());
         if repeating_playlist {
             self.restart_playlist();
         } else {
@@ -2130,12 +2370,15 @@ impl App {
         let Some(&first) = self.play_order.first() else {
             return;
         };
-        self.list_state.select(Some(first));
+        self.set_queue_track_index(first);
         self.queue_cursor = 0;
         self.select_current();
     }
 
     fn current_playlist_label(&self) -> String {
+        if let Some(queue) = &self.offline_queue {
+            return queue.name();
+        }
         let Some(id) = &self.current_playlist_id else {
             return "playlist".to_string();
         };
@@ -2207,7 +2450,9 @@ impl App {
         self.art_enabled = !self.art_enabled;
         if self.art_enabled {
             self.status = "Cover art on".to_string();
-            if let Some(track) = self.now_playing.as_ref().map(|np| np.track.clone()) {
+            if self.tab == Tab::Playlists {
+                self.load_selected_playlist_cover();
+            } else if let Some(track) = self.now_playing.as_ref().map(|np| np.track.clone()) {
                 self.load_cover_art(&track);
             } else {
                 self.art = CoverArt::no_art();
@@ -2222,10 +2467,41 @@ impl App {
     /// selections of the same track do not restart a load or replace a ready
     /// image.
     fn load_cover_art(&mut self, track: &Track) {
+        self.load_cover_art_url(
+            CoverArtTarget::Track {
+                uri: track.uri.clone(),
+            },
+            track.art_url.clone(),
+        );
+    }
+
+    /// Show the selected playlist's own cover image in the Details pane.
+    fn load_selected_playlist_cover(&mut self) {
+        if self.tab != Tab::Playlists {
+            return;
+        }
+        let selected = self
+            .list_state
+            .selected()
+            .and_then(|index| self.playlists.get(index))
+            .cloned();
+        let Some(playlist) = selected else {
+            self.art = CoverArt::no_art();
+            return;
+        };
+        self.load_cover_art_url(
+            CoverArtTarget::Playlist {
+                id: playlist.id.clone(),
+            },
+            playlist.art_url.clone(),
+        );
+    }
+
+    fn load_cover_art_url(&mut self, target: CoverArtTarget, url: Option<String>) {
         if !self.art_enabled {
             return;
         }
-        let Some(url) = track.art_url.clone() else {
+        let Some(url) = url else {
             self.art = CoverArt::no_art();
             return;
         };
@@ -2244,7 +2520,12 @@ impl App {
             let result = art::fetch_image(&client, &fetch_url)
                 .await
                 .map_err(|err| format!("{err:#}"));
-            let _ = tx.send(Action::CoverArtLoaded { url, result }).await;
+            let _ = tx.send(Action::CoverArtLoaded {
+                target,
+                url,
+                result,
+            })
+            .await;
         });
     }
 
@@ -2258,7 +2539,24 @@ impl App {
             return;
         }
 
-        let track = index.and_then(|i| self.tracks.get(i)).cloned();
+        let track = if self.tab == Tab::Downloads {
+            // The left list contains offline playlists and group rows before the
+            // individual tracks, so map the selected row back to a queue index.
+            match index.and_then(|i| self.offline_items.get(i)).cloned() {
+                Some(OfflineItem::Track { uri }) => {
+                    let track_index = self.tracks.iter().position(|track| track.uri == uri);
+                    self.offline_track_index = track_index.unwrap_or(self.offline_track_index);
+                    self.tracks.get(self.offline_track_index).cloned()
+                }
+                Some(OfflineItem::Playlist { .. } | OfflineItem::AllTracks) => {
+                    self.offline_track_index = 0;
+                    self.tracks.first().cloned()
+                }
+                None => None,
+            }
+        } else {
+            index.and_then(|i| self.tracks.get(i)).cloned()
+        };
         let Some(track) = track else { return };
 
         let volume = self.now_playing.as_ref().map_or(60, |np| np.volume);
@@ -2355,11 +2653,29 @@ impl App {
 
     /// Position of the selected track in the current playback order.
     fn play_position(&self) -> usize {
-        let selected = self.list_state.selected().unwrap_or(0);
+        let selected = if self.tab == Tab::Downloads {
+            Some(self.offline_track_index)
+        } else {
+            self.list_state.selected()
+        };
         self.play_order
             .iter()
-            .position(|&index| index == selected)
+            .position(|&index| Some(index) == selected)
             .unwrap_or(0)
+    }
+
+    /// Point playback at a track index without confusing the Offline tab's
+    /// group rows with tracks.
+    fn set_queue_track_index(&mut self, track_index: usize) {
+        if self.tab == Tab::Downloads {
+            self.offline_track_index = track_index;
+            if let Some(track) = self.tracks.get(track_index) {
+                let uri = track.uri.clone();
+                self.select_downloads_row_for_uri(&uri);
+            }
+        } else {
+            self.list_state.select(Some(track_index));
+        }
     }
 
     fn next_track(&mut self) {
@@ -2371,7 +2687,7 @@ impl App {
         }
         let next = (self.play_position() + 1) % self.play_order.len();
         let track_index = self.play_order[next];
-        self.list_state.select(Some(track_index));
+        self.set_queue_track_index(track_index);
         self.select_current();
     }
 
@@ -2389,7 +2705,7 @@ impl App {
             position - 1
         };
         let track_index = self.play_order[prev];
-        self.list_state.select(Some(track_index));
+        self.set_queue_track_index(track_index);
         self.select_current();
     }
 
@@ -2652,6 +2968,7 @@ mod tests {
             collaborative: true,
             is_public: Some(false),
             contributors: vec!["Alice".into(), "Bob".into()],
+            art_url: None,
             snapshot_id: "snapshot-1".to_string(),
         }
     }
@@ -3028,6 +3345,9 @@ mod tests {
         });
 
         app.handle_action(Action::CoverArtLoaded {
+            target: CoverArtTarget::Track {
+                uri: demo_tracks()[0].uri.clone(),
+            },
             url: "https://example.com/cover.jpg".to_string(),
             result: Result::<image::DynamicImage, String>::Err("offline".to_string()),
         })
@@ -3236,6 +3556,9 @@ mod tests {
         });
         let image: image::DynamicImage = image::RgbImage::new(256, 256).into();
         app.handle_action(Action::CoverArtLoaded {
+            target: CoverArtTarget::Track {
+                uri: demo_tracks()[0].uri.clone(),
+            },
             url: "https://example.com/cover.jpg".to_string(),
             result: Ok(image),
         })
@@ -3263,6 +3586,9 @@ mod tests {
         });
         let image: image::DynamicImage = image::RgbImage::new(256, 256).into();
         app.handle_action(Action::CoverArtLoaded {
+            target: CoverArtTarget::Track {
+                uri: demo_tracks()[0].uri.clone(),
+            },
             url: "https://example.com/cover.jpg".to_string(),
             result: Ok(image),
         })
@@ -3417,9 +3743,13 @@ mod tests {
             })
             .unwrap();
         }
-        app.set_tracks(vec![first.clone(), second.clone()]);
-        app.tab = Tab::Downloads;
-        app.list_state.select(Some(0));
+        app.load_downloaded_tracks();
+        let row = app
+            .offline_items
+            .iter()
+            .position(|item| matches!(item, OfflineItem::Track { uri } if uri == &first.uri))
+            .expect("first track row");
+        app.list_state.select(Some(row));
 
         app.handle_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::NONE))
             .unwrap();
@@ -3457,6 +3787,22 @@ mod tests {
         assert_eq!(app.list_state.selected(), Some(2));
     }
 
+    #[tokio::test]
+    async fn playlist_navigation_loads_the_selected_playlist_cover() {
+        let mut app = test_app();
+        app.art_enabled = true;
+        app.tab = Tab::Playlists;
+        let first = demo_playlist("id-1", "Road Trip");
+        let mut second = demo_playlist("id-2", "Workout");
+        second.art_url = Some("https://example.com/workout.jpg".to_string());
+        app.playlists = vec![first, second];
+        app.list_state.select(Some(0));
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.art.url(), Some("https://example.com/workout.jpg"));
+    }
+
     #[test]
     fn download_key_on_playlist_tab_requires_sign_in() {
         let (mut app, dir) = offline_test_app("playlist-no-player");
@@ -3483,6 +3829,7 @@ mod tests {
             name: "Road Trip".to_string(),
             total: 3,
             uris: uris.clone(),
+            members: uris.clone(),
         })
         .unwrap();
         assert!(uris.iter().all(|uri| app.downloading.contains(uri)));
@@ -3517,11 +3864,63 @@ mod tests {
             name: "Road Trip".to_string(),
             total: 3,
             failed: 1,
+            members: uris.clone(),
             error: None,
         })
         .unwrap();
         assert!(app.playlist_downloads.is_empty());
         assert!(app.status.contains("Downloaded 2/3 tracks"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn offline_playlist_row_loads_saved_tracks_as_a_playable_queue() {
+        let (mut app, dir) = offline_test_app("playlist-playback");
+        let tracks = demo_tracks();
+        let uris: Vec<String> = tracks.iter().take(3).map(|track| track.uri.clone()).collect();
+        for (index, track) in tracks.iter().take(3).enumerate() {
+            let file = format!("000000000000000{index}.ogg");
+            std::fs::write(dir.join(&file), b"OggS").expect("write audio");
+            app.handle_action(Action::DownloadFinished {
+                uri: track.uri.clone(),
+                result: Ok(stored_entry(track, &file)),
+            })
+            .unwrap();
+        }
+        app.downloads
+            .insert_playlist("offline-1", "Road Trip", &uris)
+            .unwrap();
+        app.load_downloaded_tracks();
+        let row = app
+            .offline_items
+            .iter()
+            .position(|item| matches!(item, OfflineItem::Playlist { id, .. } if id == "offline-1"))
+            .expect("playlist row");
+        app.list_state.select(Some(row));
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.tracks.len(), 3);
+        assert_eq!(app.tracks[0].uri, uris[0]);
+        assert_eq!(
+            app.offline_queue,
+            Some(OfflineQueue::Playlist {
+                id: "offline-1".to_string(),
+                name: "Road Trip".to_string(),
+            })
+        );
+        assert_eq!(
+            app.now_playing.as_ref().map(|np| np.track.uri.clone()),
+            Some(uris[0].clone())
+        );
+        assert!(app.status.contains("Playing offline playlist 'Road Trip'"));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(
+            app.now_playing.as_ref().map(|np| np.track.uri.clone()),
+            Some(uris[1].clone())
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

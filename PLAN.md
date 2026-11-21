@@ -17,12 +17,12 @@ or decisions change.
 | UI | `ratatui` 0.30 + `crossterm` 0.29 |
 | Runtime | `tokio` (multi-thread), single `mpsc` Action channel into `App` |
 | Audio backend | librespot-playback with rodio/ALSA (`SoftMixer` for volume) |
-| Offline | Download through the authenticated librespot session (`librespot-audio`/`librespot-metadata`), store decrypted Ogg Vorbis/MP3 in `cache/downloads`, index in `downloads.json`; `d` saves one track or a whole playlist from the Playlists tab; play saved files with rodio, prefer them when online, and support `--offline` with no login/network |
+| Offline | Download through the authenticated librespot session (`librespot-audio`/`librespot-metadata`), store decrypted Ogg Vorbis/MP3 in `cache/downloads`, index in v2 `downloads.json` with playlist memberships; `d` saves one track or a whole playlist from the Playlists tab; Offline tab can replay a whole saved playlist, single tracks play with rodio, saved copies are preferred online, and `--offline` works with no login/network. Audio keys are retried with backoff, never assumed missing, and files are header-checked before indexing |
 | Lyrics | LRCLIB (line-synced, no key) primary, original-language entry preferred; English translation via Google's public endpoint on demand. Cached in-memory by track URI and persisted to `lyrics.json` (including "no lyrics" results). Genius unsynced fallback deferred to polish |
-| Cover art | Album images from the Web API, rendered with `ratatui-image` 11.1.0 (Kitty/iTerm2/Sixel with halfblocks fallback); cover scales with the terminal up to 44x22 cells while reserving metadata rows, and rebuilds its protocol on resize without refetching; fetch/decode failures degrade to text placeholders; `TERMIFY_NO_ART`/`TERM=dumb` disable art. URL also published as MPRIS `mpris:artUrl` |
+| Cover art | Album and playlist images from the Web API, rendered with `ratatui-image` 11.1.0 (Kitty/iTerm2/Sixel with halfblocks fallback); cover scales with the terminal up to 44x22 cells while reserving metadata rows, and rebuilds its protocol on resize without refetching; fetch/decode failures degrade to text placeholders; `TERMIFY_NO_ART`/`TERM=dumb` disable art. Playlist-tab selection loads the playlist's own image; current album URL is published as MPRIS `mpris:artUrl` |
 | Config/cache | Platform-specific `#[cfg]` blocks: Linux XDG (`~/.config/termify`, `~/.cache/termify`), macOS (`~/Library/Application Support/termify`, `~/Library/Caches/termify`), Windows (`%APPDATA%\termify`, `%LOCALAPPDATA%\termify\cache`) |
 | Redirect URI | `http://127.0.0.1:8989/callback` for PKCE; device pairing uses `https://spotify.com/pair` |
-| Desktop integration | MPRIS via `mpris-server` 0.11 (`Player` builder); media keys are routed by the DE, not grabbed directly. Shuffle and repeat (`Loop_Status`) are published and controllable from the DE; repeat-all restarts the playlist in the current shuffle order |
+| Desktop integration | `os_media.rs` dispatches to `mpris-server` 0.11 on Linux/BSD and `souvlaki` 0.9.3 on macOS/Windows (Now Playing / SMTC). Media keys are routed by the OS, not grabbed directly. Shuffle and repeat (`Loop_Status`) are published/controllable on supported platforms; repeat-all restarts the playlist in the current shuffle order. Windows uses a hidden Win32 message window because SMTC requires an HWND |
 
 Lyrics note: Spotify's Web API has **no** lyrics endpoint. The internal `color-lyrics`
 endpoint is deliberately out of scope for v1 (unofficial, needs an account cookie).
@@ -41,7 +41,8 @@ src/
   player.rs          # librespot Session + Player, playback controls, events
   offline.rs         # download/decrypt audio, downloads.json index, rodio offline playback
   lyrics.rs          # LRCLIB client, LRC parser, language preference, translation, disk cache
-  mpris.rs           # MPRIS D-Bus server: state snapshots + media-key Action callbacks
+  mpris.rs           # MPRIS D-Bus server + shared media-state/types
+  os_media.rs        # native media-control dispatcher (MPRIS/Now Playing/SMTC)
   ui/
     mod.rs
     app.rs           # App state, Action enum, key handling, async helpers
@@ -49,10 +50,12 @@ src/
     render.rs        # ratatui layout + widgets
 ```
 
-Key events, MPRIS controls and background tasks (API calls, player events, lyrics
-and cover-art fetches) all push `Action`s into one channel. The main loop owns `App`, applies
-actions, publishes an MPRIS state snapshot and redraws. The MPRIS `Player` is
-`!Send`, so it runs on a dedicated thread with a current-thread runtime.
+Key events, native media controls and background tasks (API calls, player events,
+lyrics and cover-art fetches) all push `Action`s into one channel. The main loop owns `App`, applies
+actions, publishes a media state snapshot and redraws. The MPRIS `Player` is
+`!Send`, so it runs on a dedicated thread with a current-thread runtime; the
+macOS/Windows `souvlaki` controls also run on their own thread (with a hidden
+message window on Windows).
 Playback progress is derived from a local clock anchored on a 250 ms tick for
 streaming tracks and from the rodio sink for downloaded files.
 
@@ -114,8 +117,9 @@ streaming tracks and from the rodio sink for downloaded files.
       detection, translation parsing, cache round-trips, queue reordering,
       lyric-line seek/key handling, MPRIS state/action handling, playlist edit
       prompts/picker and arrow-fragment normalization, offline index/key tests,
-      playlist download progress, shuffled playlist repeat and Playlists-tab
-      navigation (61 passing)
+      playlist download progress, shuffled playlist repeat, Playlists-tab
+      navigation, offline playlist playback and playlist cover selection
+      (66 passing)
 - [x] Fixed LRCLIB camelCase field mapping (`syncedLyrics`/`plainLyrics`) that
       made every lookup report "no lyrics"; verified with "Knee Socks"
 - [x] Prefer original-language LRCLIB entry when `/api/get` returns a translation
@@ -179,6 +183,14 @@ streaming tracks and from the rodio sink for downloaded files.
 - [x] Larger adaptive cover art: scales with terminal size while reserving seven
       metadata rows, uses `Resize::Scale` so the 300px source does not cap the
       drawn size, and re-encodes on `Action::Resize`
+- [x] Playlist cover art: `Playlist.art_url` comes from Spotify `images`; the
+      Playlists tab loads and renders the selected playlist's own image through
+      the existing `CoverArtLoaded` path, with stale responses ignored by target
+- [x] Native media controls on macOS/Windows via `souvlaki` 0.9.3: Now Playing /
+      MPRemoteCommandCenter and SMTC. Events map to the shared `Action` channel;
+      Windows creates a hidden message window for SMTC's required HWND. Cross-
+      checked with `cargo check --target x86_64-apple-darwin` and
+      `cargo check --target x86_64-pc-windows-gnu`
 - [ ] Integration tests with a mock HTTP layer
 
 ### M6 — Offline listening (implemented, live check pending)
@@ -188,20 +200,30 @@ streaming tracks and from the rodio sink for downloaded files.
 - [x] Downloads are written to a `.part` file and renamed only after a complete,
       non-empty copy; failures clean up the partial file and report through the
       normal `Action` channel
-- [x] `downloads.json` records track metadata, file name, size and timestamp with
-      atomic replacement; on load, corrupt/outdated indexes, missing files and
-      unsafe names are ignored without deleting audio
-- [x] Offline tab (`o`) lists saved tracks; `d` downloads the selected track,
-      `D` deletes it, and downloaded copies are preferred automatically from any
-      tab with a `↓` marker in other lists
+- [x] v2 `downloads.json` records track metadata, file name, size, timestamp and
+      playlist memberships with atomic replacement; v1 indexes are readable and
+      upgraded on save. On load, corrupt/outdated indexes, missing files, invalid
+      audio headers and unsafe names are ignored without deleting audio
+- [x] Offline tab (`o`) lists downloaded playlists, an all-tracks row and saved
+      tracks; `Enter` plays a whole offline playlist or the full library with
+      correct `n`/`p`, shuffle and repeat queue handling; `D` deletes a selected
+      track's copy or forgets a playlist grouping (audio files kept). Downloaded
+      copies are preferred automatically from any tab with a `↓` marker
 - [x] On the Playlists tab, `d` fetches the selected playlist's saved tracks and
       downloads all of them sequentially, skipping saved/in-flight tracks and
-      duplicates; the list shows progress and a final saved/failed summary
+      duplicates; a 400 ms inter-track delay reduces key-service bursts, and the
+      list shows progress and a final saved/failed summary
+- [x] Audio-key hardening: no "assume unencrypted" fallback, 250 ms spacing plus
+      four attempts with exponential backoff for transient key failures, and a
+      container-header check before a file is indexed; bad `.part` files are
+      removed
 - [x] `--offline` starts with no config/login/network and plays saved files with
       a dedicated rodio sink; pause/seek/volume/repeat/end-of-track and MPRIS
       controls route to that backend
-- [x] Unit tests cover filename safety, index persistence/pruning, version
-      rejection, download progress/errors, tab loading, offline mode and deletion
+- [x] Unit tests cover filename safety, v1/v2 index persistence/pruning, version
+      rejection, header validation, audio-key retry setup, download
+      progress/errors, tab loading, offline mode, deletion, offline playlist
+      playback and playlist cover selection (66 passing)
 - [ ] Verify one real Premium download and `--offline` playback with user credentials
 
 ## Deferred (not in v1)

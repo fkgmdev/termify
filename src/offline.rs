@@ -4,7 +4,7 @@
 //! cache directory. `downloads.json` maps Spotify URIs to those files so
 //! playback can continue with `--offline` and no network session at all.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -12,17 +12,26 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use librespot_audio::{AudioDecrypt, AudioFetchParams, AudioFile};
+use librespot_core::audio_key::AudioKey;
 use librespot_core::{Session, SpotifyId, SpotifyUri};
 use librespot_metadata::audio::{AudioFileFormat, AudioFiles, AudioItem};
 use rodio::{Decoder, OutputStream, OutputStreamBuilder, Sink};
 use serde::{Deserialize, Serialize};
+use tokio::time::sleep;
 
 use crate::ui::Track;
 
-const INDEX_VERSION: u8 = 1;
+/// Version 2 adds downloaded-playlist memberships. Version 1 indexes are still
+/// readable and are upgraded on the next successful save.
+const INDEX_VERSION: u8 = 2;
+const LEGACY_INDEX_VERSION: u8 = 1;
 const INDEX_FILE: &str = "downloads.json";
 /// Spotify puts a 167-byte normalisation header before Ogg Vorbis audio.
 const SPOTIFY_OGG_HEADER_END: u64 = 0xa7;
+/// Audio-key requests can fail transiently during bulk downloads. Space them
+/// out and retry with backoff instead of writing a file that cannot be decoded.
+const KEY_REQUEST_DELAY: Duration = Duration::from_millis(250);
+const KEY_REQUEST_ATTEMPTS: u32 = 4;
 
 /// A track stored on disk, with just enough metadata for the Downloads view.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,15 +49,29 @@ struct IndexFile {
     version: u8,
     #[serde(default)]
     tracks: BTreeMap<String, DownloadEntry>,
+    #[serde(default)]
+    playlists: BTreeMap<String, DownloadedPlaylist>,
 }
 
-/// Persistent index of downloaded tracks. Missing files are dropped when the
-/// index is loaded so the UI never offers a download that cannot be played.
+/// A playlist whose tracks are available offline. Membership is stored by URI
+/// so a track can belong to several playlists without duplicating audio files.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadedPlaylist {
+    pub id: String,
+    pub name: String,
+    pub track_uris: Vec<String>,
+    pub downloaded_at: u64,
+}
+
+/// Persistent index of downloaded tracks and playlists. Missing or corrupt
+/// files are dropped when the index is loaded so the UI never offers a download
+/// that cannot be played.
 #[derive(Debug, Clone)]
 pub struct DownloadStore {
     dir: PathBuf,
     index_file: PathBuf,
     entries: BTreeMap<String, DownloadEntry>,
+    playlists: BTreeMap<String, DownloadedPlaylist>,
 }
 
 impl DownloadStore {
@@ -62,6 +85,7 @@ impl DownloadStore {
             dir,
             index_file,
             entries: BTreeMap::new(),
+            playlists: BTreeMap::new(),
         };
         store.load()?;
         Ok(store)
@@ -73,6 +97,7 @@ impl DownloadStore {
             dir: PathBuf::new(),
             index_file: PathBuf::new(),
             entries: BTreeMap::new(),
+            playlists: BTreeMap::new(),
         }
     }
 
@@ -108,6 +133,60 @@ impl DownloadStore {
             .into_iter()
             .map(|entry| entry.track.clone())
             .collect()
+    }
+
+    /// Downloaded playlists, most recently saved first.
+    pub fn playlists(&self) -> Vec<DownloadedPlaylist> {
+        let mut playlists: Vec<&DownloadedPlaylist> = self.playlists.values().collect();
+        playlists.sort_by_key(|playlist| std::cmp::Reverse(playlist.downloaded_at));
+        playlists.into_iter().cloned().collect()
+    }
+
+    /// Saved tracks of a downloaded playlist, in playlist order. Tracks that
+    /// were later deleted are left out rather than breaking the queue.
+    pub fn playlist_tracks(&self, id: &str) -> Vec<Track> {
+        let Some(playlist) = self.playlists.get(id) else {
+            return Vec::new();
+        };
+        let mut seen = HashSet::new();
+        playlist
+            .track_uris
+            .iter()
+            .filter_map(|uri| self.entries.get(uri))
+            .filter(|entry| seen.insert(&entry.track.uri))
+            .map(|entry| entry.track.clone())
+            .collect()
+    }
+
+    /// Record that a playlist is available offline. Only URIs with a saved file
+    /// are stored, so deleting a track automatically shrinks the playlist.
+    pub fn insert_playlist(&mut self, id: &str, name: &str, uris: &[String]) -> Result<()> {
+        let track_uris: Vec<String> = uris
+            .iter()
+            .filter(|uri| self.entries.contains_key(uri.as_str()))
+            .cloned()
+            .collect();
+        if track_uris.is_empty() {
+            return Ok(());
+        }
+        self.playlists.insert(
+            id.to_string(),
+            DownloadedPlaylist {
+                id: id.to_string(),
+                name: name.to_string(),
+                track_uris,
+                downloaded_at: now_timestamp(),
+            },
+        );
+        self.save()
+    }
+
+    /// Forget an offline playlist grouping without deleting its audio files.
+    pub fn remove_playlist(&mut self, id: &str) -> Result<()> {
+        if self.playlists.remove(id).is_some() {
+            self.save()?;
+        }
+        Ok(())
     }
 
     /// Full path of a stored audio file.
@@ -162,7 +241,7 @@ impl DownloadStore {
                 return Ok(());
             }
         };
-        if file.version != INDEX_VERSION {
+        if !matches!(file.version, INDEX_VERSION | LEGACY_INDEX_VERSION) {
             tracing::warn!(
                 "Ignoring download index {} with unsupported version {}",
                 self.index_file.display(),
@@ -174,8 +253,21 @@ impl DownloadStore {
             .tracks
             .into_iter()
             .filter(|(_, entry)| {
-                safe_file_name(&entry.file) && self.dir.join(&entry.file).is_file()
+                safe_file_name(&entry.file) && audio_file_header_valid(&self.dir.join(&entry.file))
             })
+            .collect();
+        // Playlists can only contain tracks that survived the check above.
+        self.playlists = file
+            .playlists
+            .into_iter()
+            .filter(|(_, playlist)| !playlist.track_uris.is_empty())
+            .map(|(id, mut playlist)| {
+                playlist
+                    .track_uris
+                    .retain(|uri| self.entries.contains_key(uri));
+                (id, playlist)
+            })
+            .filter(|(_, playlist)| !playlist.track_uris.is_empty())
             .collect();
         Ok(())
     }
@@ -187,6 +279,7 @@ impl DownloadStore {
         let file = IndexFile {
             version: INDEX_VERSION,
             tracks: self.entries.clone(),
+            playlists: self.playlists.clone(),
         };
         let json = serde_json::to_string_pretty(&file).context("encoding download index")?;
         std::fs::create_dir_all(&self.dir)
@@ -224,6 +317,24 @@ fn safe_file_name(name: &str) -> bool {
             path.extension().and_then(|ext| ext.to_str()),
             Some("ogg" | "mp3")
         )
+}
+
+/// Check the first bytes of a stored file before offering it for playback.
+/// A download decrypted with the wrong (or no) key starts with random bytes,
+/// which decoders report as a long stream of "skipping junk" warnings.
+fn audio_file_header_valid(path: &Path) -> bool {
+    let Ok(mut file) = File::open(path) else {
+        return false;
+    };
+    let mut header = [0u8; 4];
+    if file.read_exact(&mut header).is_err() {
+        return false;
+    }
+    if path.extension().and_then(|ext| ext.to_str()) == Some("ogg") {
+        return header == *b"OggS";
+    }
+    // MP3 files either carry an ID3 tag or start with an MPEG frame sync.
+    header[0..3] == [b'I', b'D', b'3'][..] || (header[0] == 0xff && header[1] & 0xe0 == 0xe0)
 }
 
 /// Playback backend for downloaded files. The output stream is kept alive for
@@ -314,6 +425,40 @@ fn bytes_per_second(format: AudioFileFormat) -> usize {
     }
 }
 
+/// Request an audio key with spacing and exponential backoff. Spotify's key
+/// service can answer `AesKeyError`/`Service unavailable` when a playlist
+/// download fires many requests back-to-back; retrying avoids corrupt files.
+async fn request_audio_key(
+    session: &Session,
+    track_id: SpotifyId,
+    file_id: librespot_core::FileId,
+    uri: &str,
+) -> Result<AudioKey> {
+    sleep(KEY_REQUEST_DELAY).await;
+    let mut last_error = None;
+    for attempt in 1..=KEY_REQUEST_ATTEMPTS {
+        match session.audio_key().request(track_id, file_id).await {
+            Ok(key) => return Ok(key),
+            Err(err) => {
+                last_error = Some(err.to_string());
+                if attempt == KEY_REQUEST_ATTEMPTS {
+                    break;
+                }
+                let backoff = KEY_REQUEST_DELAY.saturating_mul(attempt);
+                tracing::warn!(
+                    "Audio key request for {uri} failed (attempt {attempt}/{KEY_REQUEST_ATTEMPTS}): {err}; retrying in {:?}",
+                    backoff
+                );
+                sleep(backoff).await;
+            }
+        }
+    }
+    Err(anyhow!(
+        "could not get audio key for {uri} after {KEY_REQUEST_ATTEMPTS} attempts: {}",
+        last_error.unwrap_or_else(|| "unknown error".to_string())
+    ))
+}
+
 /// Download a track through the authenticated librespot session and write a
 /// plain (decrypted) audio file into `dir`. Ogg files have Spotify's extra
 /// normalisation header removed so generic decoders can read them.
@@ -348,19 +493,12 @@ pub async fn download_track(session: &Session, track: &Track, dir: &Path) -> Res
         .map_err(|err| anyhow!("could not start audio download: {err}"))?;
     controller.set_random_access_mode();
 
-    // Tracks are not always encrypted. librespot falls back to no key in that
-    // case, so do the same instead of failing the whole download.
-    let key = match session.audio_key().request(track_id, file_id).await {
-        Ok(key) => Some(key),
-        Err(err) => {
-            tracing::warn!(
-                "No audio key for {}; assuming unencrypted file: {err}",
-                track.uri
-            );
-            None
-        }
-    };
-    let mut decrypted = AudioDecrypt::new(key, encrypted);
+    // A missing key means the bytes we would write are still encrypted. The
+    // old fallback treated them as unencrypted audio, which produced files full
+    // of junk that decoders could not play. Retry transient key-service failures
+    // instead and never index an unverifiable file.
+    let key = request_audio_key(session, track_id, file_id, &track.uri).await?;
+    let mut decrypted = AudioDecrypt::new(Some(key), encrypted);
     if AudioFiles::is_ogg_vorbis(format) {
         decrypted.seek(SeekFrom::Start(SPOTIFY_OGG_HEADER_END))?;
     }
@@ -409,6 +547,14 @@ pub async fn download_track(session: &Session, track: &Track, dir: &Path) -> Res
     if written == 0 {
         let _ = std::fs::remove_file(&tmp_path);
         return Err(anyhow!("downloaded audio was empty"));
+    }
+    // A wrong key produces bytes that look like audio to the file system but
+    // not to a decoder. Verify the container magic before indexing the file.
+    if !audio_file_header_valid(&tmp_path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(anyhow!(
+            "downloaded audio failed integrity check; audio key may be unavailable"
+        ));
     }
     if let Err(err) = std::fs::rename(&tmp_path, &final_path) {
         let _ = std::fs::remove_file(&tmp_path);
@@ -487,7 +633,7 @@ mod tests {
         let mut store = DownloadStore::open(&dir).expect("open store");
         let present = entry("spotify:track:present", "ogg");
         let missing = entry("spotify:track:missing", "ogg");
-        std::fs::write(dir.join(&present.file), b"audio").expect("write audio");
+        std::fs::write(dir.join(&present.file), b"OggS").expect("write audio");
         store.insert(present.clone()).expect("insert present");
         store.insert(missing).expect("insert missing");
         assert_eq!(store.len(), 2);
@@ -526,6 +672,93 @@ mod tests {
         std::fs::write(DownloadStore::index_file(&dir), b"not json").expect("write index");
         let store = DownloadStore::open(&dir).expect("open store");
         assert!(store.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn store_persists_playlists_and_omits_deleted_tracks() {
+        let dir = temp_dir("playlists");
+        let mut store = DownloadStore::open(&dir).expect("open store");
+        let first = entry("spotify:track:first", "ogg");
+        let second = entry("spotify:track:second", "mp3");
+        std::fs::write(dir.join(&first.file), b"OggS").expect("write first");
+        std::fs::write(dir.join(&second.file), b"ID3\x04").expect("write second");
+        store.insert(first.clone()).expect("insert first");
+        store.insert(second.clone()).expect("insert second");
+        store
+            .insert_playlist(
+                "playlist-1",
+                "Road Trip",
+                &[
+                    first.track.uri.clone(),
+                    second.track.uri.clone(),
+                    "spotify:track:missing".to_string(),
+                ],
+            )
+            .expect("insert playlist");
+
+        let playlists = DownloadStore::open(&dir)
+            .expect("reopen store")
+            .playlists();
+        assert_eq!(playlists.len(), 1);
+        assert_eq!(playlists[0].name, "Road Trip");
+        assert_eq!(playlists[0].track_uris.len(), 2);
+
+        store.remove(&first.track.uri).expect("remove first");
+        let reopened = DownloadStore::open(&dir).expect("reopen after delete");
+        let tracks = reopened.playlist_tracks("playlist-1");
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].uri, second.track.uri);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn header_check_rejects_files_decrypted_without_a_key() {
+        let dir = temp_dir("header");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let ogg = dir.join("good.ogg");
+        let bad = dir.join("bad.mp3");
+        let id3 = dir.join("good.mp3");
+        let frame = dir.join("frame.mp3");
+        std::fs::write(&ogg, b"OggS data").expect("write ogg");
+        std::fs::write(&bad, b"random bytes").expect("write bad mp3");
+        std::fs::write(&id3, b"ID3\x04 data").expect("write id3");
+        std::fs::write(&frame, [0xff, 0xfb, 0x90, 0x00]).expect("write frame");
+        assert!(audio_file_header_valid(&ogg));
+        assert!(!audio_file_header_valid(&bad));
+        assert!(audio_file_header_valid(&id3));
+        assert!(audio_file_header_valid(&frame));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_index_without_playlists_is_upgraded() {
+        let dir = temp_dir("legacy");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let track = entry("spotify:track:legacy", "ogg");
+        std::fs::write(dir.join(&track.file), b"OggS").expect("write audio");
+        let mut tracks = serde_json::Map::new();
+        tracks.insert(
+            track.track.uri.clone(),
+            serde_json::to_value(&track).expect("encode track"),
+        );
+        let index = serde_json::json!({
+            "version": 1,
+            "tracks": tracks,
+        });
+        std::fs::write(
+            DownloadStore::index_file(&dir),
+            serde_json::to_string(&index).expect("encode index"),
+        )
+        .expect("write index");
+        let mut store = DownloadStore::open(&dir).expect("open store");
+        assert!(store.contains(&track.track.uri));
+        assert!(store.playlists().is_empty());
+        store
+            .insert_playlist("playlist-1", "Legacy", &[track.track.uri.clone()])
+            .expect("insert playlist");
+        let contents = std::fs::read_to_string(DownloadStore::index_file(&dir)).expect("read index");
+        assert!(contents.contains("\"version\": 2"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

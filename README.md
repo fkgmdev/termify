@@ -22,15 +22,17 @@ library, play music, and read synced lyrics, all from the terminal.
 - Playback controls: play/pause, next/prev, seek, volume, end-of-track auto-advance
 - Repeat modes (`r`): off, playlist and one. Playlist repeat restarts the whole
   playlist when its last track ends, using the current shuffle order, and is
-  exposed as MPRIS `Loop_Status`
+  exposed as MPRIS `Loop_Status` on Linux
 - Offline downloads: save tracks through the librespot session, list them on the
-  Offline tab, play them with rodio, and launch with `--offline` without a login
+  Offline tab, play single tracks or a whole downloaded playlist with rodio, and
+  launch with `--offline` without a login
 - Press `d` on the Playlists tab to download every track of a playlist; already
   saved and in-flight tracks are skipped, with progress shown in the list
 - Downloaded copies are preferred automatically, so selecting a saved track from
   search or a playlist also plays from disk; delete copies with `D`
-- Persistent `downloads.json` index with hashed filenames, atomic writes and
-  stale-entry cleanup
+- Persistent v2 `downloads.json` index with hashed filenames, playlist
+  memberships, atomic writes and stale-entry cleanup; audio-key failures are
+  retried with backoff and bad files are never indexed
 - Playlist shuffling with a saved playback order (`s`)
 - Queue tab showing the playback order, with track reordering (`J`/`K`) and
   play-from-queue (`Enter`)
@@ -42,13 +44,15 @@ library, play music, and read synced lyrics, all from the terminal.
 - Lyrics cached in memory and in `lyrics.json`, including known misses, so a
   restart does not repeat LRCLIB requests
 - Ratatui TUI with a single async action loop and `--demo` mode
-- Large, adaptive album cover art in the Details pane (up to 44x22 cells) using
+- Large, adaptive cover art in the Details pane (up to 44x22 cells) using
   Kitty/iTerm2/Sixel when available, with Unicode halfblocks and text
-  placeholders as fallbacks; resizing rebuilds the image without a refetch, and
-  the same URL is published as MPRIS `mpris:artUrl` for desktop players
-- MPRIS integration: the current track appears in the desktop media player, and
-  global XF86 audio keys (play/pause, next, previous, volume, seek) work
-  anywhere on the desktop through the window manager's MPRIS media-key routing
+  placeholders as fallbacks; resizing rebuilds the image without a refetch.
+  Album covers are also published as MPRIS `mpris:artUrl`, and the Playlists tab
+  shows each playlist's own cover as you move through the list
+- Native desktop media controls: MPRIS on Linux/BSD, Now Playing and remote
+  commands on macOS, and System Media Transport Controls on Windows. Play/pause,
+  next/previous, seek and volume events route into the same action loop as the
+  keyboard
 
 Not in v1: Spotify Connect, daemon mode, audio visualization.
 
@@ -127,7 +131,7 @@ termify --relogin       # force re-login for both Web API and playback
 | `k` / `↑` | Move up (select playlist on Playlists tab; lyric line on Lyrics tab; cursor on Queue tab) |
 | `g` / `G` | First / last item (first/last lyric line on Lyrics tab) |
 | `PgUp` / `PgDn` | Page up / down |
-| `Enter` | Select track to play (offline copy when saved); open playlist; play queue/offline track; jump to selected lyric line |
+| `Enter` | Select track to play (offline copy when saved); open playlist; play a whole offline playlist/all saved tracks; play queue item; jump to selected lyric line |
 | `/` | Search tracks |
 | `Tab` / `Shift+Tab` | Next / previous tab |
 | `Space` | Play / pause |
@@ -138,7 +142,7 @@ termify --relogin       # force re-login for both Web API and playback
 | `Q` | Queue tab |
 | `o` | Offline / downloads tab |
 | `d` | Download the selected track; download all tracks on the Playlists tab |
-| `D` | Delete the offline copy (Offline tab); discard staged playlist changes elsewhere |
+| `D` | On the Offline tab: delete the selected track's copy, or forget the selected offline playlist (files kept); elsewhere: discard staged playlist changes |
 | `J` / `K` | Move selected queue track down / up (Queue tab only) |
 | `L` | Load liked songs |
 | `N` | Create a new private playlist (Playlists tab) |
@@ -168,7 +172,7 @@ the whole shuffled cycle repeats; other track lists simply wrap from the last
 track to the first. Repeat-one reloads the current track from the beginning, and
 with repeat off the player stops at the end of the queue. Manual `n`/`p` still
 wrap regardless of the repeat mode. The current mode also appears in the footer
-and is the MPRIS `Loop_Status` property.
+and is the MPRIS `Loop_Status` property on Linux.
 
 On the Lyrics tab, `j`/`k` (and `g`/`G`, `PgUp`/`PgDn`) select a line with `»`,
 which disables follow mode. `Enter` seeks playback to that line's timestamp and
@@ -183,26 +187,69 @@ service can change its output.
 
 ## Offline listening
 
+### Where downloads are saved
+
+Downloads live in the `downloads/` folder under the cache directory from the
+Setup table:
+
+- Linux: `$XDG_CACHE_HOME/termify/downloads` (default `~/.cache/termify/downloads`)
+- macOS: `~/Library/Caches/termify/downloads`
+- Windows: `%LOCALAPPDATA%\termify\cache\downloads`
+
+The v2 index is `downloads.json` in the parent cache directory
+(`~/.cache/termify/downloads.json`, for example). It maps Spotify URIs to hashed
+`.ogg`/`.mp3` filenames and records which playlists each track belongs to. Writes
+are atomic, names are validated when the index is read, and stale entries
+(missing files or invalid audio headers) disappear on the next launch without
+touching your other audio files.
+
+### What quality they are
+
+Online streaming uses librespot's default premium bitrate: **Ogg Vorbis at
+160 kbps**, decoded to 16-bit PCM for the audio device. Downloads request the
+best file Spotify offers for each track, in this order:
+`OGG_VORBIS_320` → `MP3_320` → `OGG_VORBIS_160` → `MP3_160` →
+`OGG_VORBIS_96` → `MP3_96`. They are stored as-is after decryption (Spotify's
+extra 167-byte Ogg header is stripped); termify does not transcode or lower the
+quality. A track only gets 320 kbps if Spotify has that format for it.
+
+### Is it safe to delete them?
+
+Yes. Downloaded files are **not DRM-encrypted** — they are ordinary Ogg Vorbis
+or MP3 audio files. Use `D` on the Offline tab to remove the selected track's
+file and index entry together; on a downloaded-playlist row, `D` only forgets the
+playlist grouping and keeps the audio files. You can also delete files manually:
+the next launch drops index entries whose files are gone or whose headers are
+invalid. No tokens or credentials are stored in `downloads/`; token caches stay
+in the parent cache directory with `0600` permissions, so protect the whole
+cache directory as you would any media library.
+
+### Downloading and playing offline
+
 When local playback is connected, select any track and press `d`. termify fetches
 the audio through the authenticated librespot session, decrypts it and writes a
-plain Ogg Vorbis or MP3 file into `downloads/` under the cache directory listed
-under Setup. The URI-to-file mapping is recorded in `downloads.json` atomically,
-with filenames derived from a hash of the URI, so stale entries disappear from
-the view on the next launch and no path traversal is possible from a tampered
-index.
+`.part` file that is renamed only after a complete copy. Audio-key requests are
+spaced out and retried with backoff on transient failures such as
+`Service unavailable` / rate limits; termify never assumes a failed key means
+the file is unencrypted. Files whose container header is invalid are deleted
+instead of being indexed, which prevents the old "skipping junk" / corrupt audio
+playback.
 
 On the Playlists tab, `d` fetches the selected playlist's saved tracks and
-downloads all of them sequentially. Tracks already on disk or queued by a
-separate download are skipped, duplicates within the playlist are collapsed, and
-the list shows `offline n/total` progress while it runs. The final status reports
-how many tracks were saved and how many failed; a failed track does not stop the
-rest of the playlist.
+downloads all of them sequentially, with a 400 ms pause between tracks to avoid
+key-service bursts. Tracks already on disk or in flight are skipped, duplicates
+within the playlist are collapsed, and the list shows `offline n/total` progress
+while it runs. The final status reports how many tracks were saved and how many
+failed; a failed track does not stop the rest of the playlist.
 
-Press `o` (or `Tab`) to open the Offline tab. It lists saved tracks with a `↓`
-marker in other lists; `Enter` plays the selected copy and `D` deletes it. Once a
-track has been downloaded it is preferred automatically even when you select it
-from search results or a playlist, so you do not need to switch tabs to use the
-offline copy. Downloads require a working local-playback session (the same
+Press `o` (or `Tab`) to open the Offline tab. Downloaded playlists appear first,
+then an **All downloaded tracks** row, then individual tracks. `Enter` on a
+playlist plays its saved tracks in playlist order; `Enter` on **All downloaded
+tracks** plays the whole library; `Enter` on a track plays that copy. `n`/`p`,
+shuffle and repeat work on the loaded offline queue, so playlist repeat keeps
+cycling after the last track. Saved tracks have a `↓` marker in other lists and
+are preferred automatically, even when selected from search results or a
+playlist. Downloads require a working local-playback session (the same
 device-pairing token used for streaming); browsing without one still works, but
 cannot fetch new audio.
 
@@ -210,11 +257,8 @@ cannot fetch new audio.
 session, then starts directly in the Offline tab. It uses rodio to play only
 saved files, so it needs an audio device but no network connection. Lyrics,
 cover art and API browsing are unavailable in this mode because they need
-Spotify/Web API access; MPRIS controls continue to work with the local player.
-
-Downloaded files are **not DRM-encrypted** — they are ordinary audio files in
-your cache directory. Protect that directory as you would any other media
-library; no tokens or credentials are stored there.
+Spotify/Web API access; desktop media controls continue to work with the local
+player.
 
 ## Playlists and collaborators
 
@@ -254,9 +298,11 @@ reopens the browser login (refresh tokens cannot add scopes). Run
 
 ## Cover art
 
-When a track has album art, termify downloads the 300px Spotify image in the
-background and draws it above the track metadata in the Details pane. The cover
-grows with the terminal up to 44x22 cells (about 88x22 pixels at the usual 1:2
+When a track has album art — or when the selected row on the Playlists tab has a
+playlist image — termify downloads the 300px Spotify image in the background and
+draws it above the Details pane metadata. Moving through the playlist list loads
+each playlist's own cover; opening a playlist switches to its tracks, where
+track art works as before. The cover grows with the terminal up to 44x22 cells (about 88x22 pixels at the usual 1:2
 cell ratio) while always leaving seven rows for metadata and hints; on a 24-row
 terminal it stays compact instead of squeezing the details away. Resizing the
 terminal re-encodes the already-downloaded image at the new size. It uses the
@@ -271,28 +317,38 @@ also published to the desktop through MPRIS.
 
 ## Desktop media player / global media keys
 
-termify exports the standard [MPRIS](https://specifications.freedesktop.org/mpris-spec/latest/)
-D-Bus interfaces (`org.mpris.MediaPlayer2` and `.Player`) under a per-process
-bus name such as `org.mpris.MediaPlayer2.termify.instance1234`. As soon as a
-track is selected, your desktop's media widget and OSD show its title, artist,
-album, duration and playback position/state.
+termify publishes the current track and accepts media-control events on every
+supported desktop:
 
-Media-key handling is delegated to the desktop environment: GNOME, KDE Plasma,
-XFCE and friends already bind `XF86AudioPlay`, `XF86AudioNext`,
-`XF86AudioPrev`, `XF86AudioRaiseVolume` and friends to the active MPRIS player.
-No global key grab is needed, so termify does not fight your window manager.
-Players like `playerctl` work too:
+- **Linux/BSD:** the standard [MPRIS](https://specifications.freedesktop.org/mpris-spec/latest/)
+  D-Bus interfaces (`org.mpris.MediaPlayer2` and `.Player`) under a per-process
+  name such as `org.mpris.MediaPlayer2.termify.instance1234`. GNOME, KDE Plasma,
+  XFCE and friends route `XF86AudioPlay`, `XF86AudioNext`, `XF86AudioPrev` and
+  friends to the active MPRIS player; no global key grab is needed. `playerctl`
+  works too:
 
-```
-playerctl metadata
-playerctl play-pause
-playerctl next
-playerctl position 30
-playerctl volume 0.5
-```
+  ```
+  playerctl metadata
+  playerctl play-pause
+  playerctl next
+  playerctl position 30
+  playerctl volume 0.5
+  ```
 
-MPRIS is silently disabled when `DBUS_SESSION_BUS_ADDRESS` is unset (for
-example over a plain SSH session); the TUI keeps working normally.
+  MPRIS is silently disabled when `DBUS_SESSION_BUS_ADDRESS` is unset (for
+  example over a plain SSH session); the TUI keeps working normally.
+- **macOS:** track metadata, artwork and playback state go to Now Playing, and
+  Control Center / Touch Bar / keyboard media keys are handled through
+  `MPRemoteCommandCenter`.
+- **Windows:** title, artist, album, artwork and progress go to System Media
+  Transport Controls, so the volume mixer and keyboard media keys see termify
+  like any other media app. SMTC needs a window handle, so termify creates a
+  tiny hidden Win32 message window on the media thread; nothing is displayed.
+
+In all three cases, play/pause, next/previous, seek/set-position, volume and
+open-URI events are translated into the same `Action`s used by the keyboard, so
+they also work with downloaded tracks in `--offline` mode. Shuffle is
+publishable/controllable on macOS and exposed as MPRIS `Loop_Status` on Linux.
 
 ## Architecture
 
@@ -306,21 +362,24 @@ src/
   auth.rs     # PKCE + device-pairing flows, token caches + refresh
   api.rs      # rspotify wrapper (search, playlists, liked songs)
   player.rs   # librespot session, Player, mixer, playback controls
-  offline.rs  # download/decrypt audio, disk index, rodio playback for saved tracks
+  offline.rs  # download/decrypt audio, v2 disk index, rodio playback for saved tracks
   lyrics.rs   # LRCLIB client, LRC parser, language preference, translation, disk cache
-  mpris.rs    # MPRIS D-Bus player: publishes state, forwards media-key controls
+  mpris.rs    # MPRIS D-Bus player and shared media-state/types
+  os_media.rs # platform dispatcher: MPRIS on Linux, Now Playing/SMTC on macOS/Windows
   ui/
     app.rs    # App state, Action enum, keys, queue/shuffle/repeat/lyrics/cover/downloads
     event.rs  # crossterm stream + tick -> Action channel
     render.rs # ratatui layout and widgets
 ```
 
-Events from the keyboard, MPRIS and background tasks (API calls, player events,
-downloads, lyrics, cover art) all flow into one `mpsc` channel. `App` owns all state, applies actions
-and redraws. After each action it publishes a state snapshot to the MPRIS thread,
-which runs on its own current-thread Tokio runtime because `mpris-server`'s
-`Player` is `Rc`-based and not `Send`. Online progress is derived from a local
-clock anchored on a 250 ms tick; offline progress comes from the rodio sink.
+Events from the keyboard, native media controls and background tasks (API calls,
+player events, downloads, lyrics, cover art) all flow into one `mpsc` channel.
+`App` owns all state, applies actions and redraws. After each action it publishes
+a state snapshot to the active media thread: MPRIS runs on its own current-thread
+Tokio runtime because `mpris-server`'s `Player` is `Rc`-based and not `Send`,
+while macOS/Windows use `souvlaki` on a dedicated thread (with a hidden Win32
+message window on Windows). Online progress is derived from a local clock anchored
+on a 250 ms tick; offline progress comes from the rodio sink.
 
 ## Notes / troubleshooting
 
@@ -333,19 +392,24 @@ clock anchored on a 250 ms tick; offline progress comes from the rodio sink.
 - **`429 API rate limit exceeded`**: the Web API uses your own Client ID to avoid
   sharing Spotify's heavily rate-limited desktop client. If it still happens,
   wait for `Retry-After` and retry; the TUI status bar now shows this clearly.
-- **Audio key error 0 1**: some newer Spotify accounts are rejected for audio key
-  delivery. This has been validated as working for the development account with
-  the device-pairing flow; `termify play spotify:track:<id>` remains the quick
-  check for other accounts.
+- **Audio key errors (`0 1`, `0 2`, `Service unavailable`, `no audio key`)**: a
+  missing key means the downloaded bytes are still encrypted, so termify no
+  longer writes them. Key requests are now spaced out, retried up to four times
+  with exponential backoff, and verified by container header before indexing.
+  If a bulk download still hits Spotify's key-service rate limit, wait a minute
+  and retry; `termify play spotify:track:<id>` is the quick check for account/key
+  delivery problems. Existing files with invalid headers are dropped from the
+  Offline tab on the next launch.
 - **vergen pin**: `librespot-core 0.8.0` depends on `vergen-gitcl 1.0.8`, which
   resolves to an incompatible `vergen 9.1.0`. `Cargo.lock` pins `vergen 9.0.6`.
   Do not delete `Cargo.lock` without re-applying `cargo update -p vergen --precise 9.0.6`.
 - **Token file permissions**: both token caches are written with mode `0600`.
 - **Offline downloads**: saved audio is plain, unencrypted Ogg/MP3 in the cache
-  directory's `downloads/` folder. A failed download leaves no `.part` file, and
-  an unreadable or outdated `downloads.json` is ignored rather than deleting
-  audio. If `termify --offline` reports no tracks, check that folder; deleting
-  its files also removes the corresponding entries on the next launch.
+  directory's `downloads/` folder (see "Where downloads are saved" above). A
+  failed download leaves no `.part` file, and an unreadable or outdated
+  `downloads.json` is ignored rather than deleting audio. If `termify --offline`
+  reports no tracks, check that folder; deleting its files also removes the
+  corresponding entries on the next launch.
 - **Arrow keys in Kitty / Windows Terminal**: the cover-art probe signals
   completion before its background thread has restored the terminal, so termify
   waits for raw mode to be disabled before re-entering it. It also reassembles

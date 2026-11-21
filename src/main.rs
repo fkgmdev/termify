@@ -5,6 +5,7 @@ mod config;
 mod lyrics;
 mod mpris;
 mod offline;
+mod os_media;
 mod player;
 mod ui;
 
@@ -235,16 +236,17 @@ async fn run_tui(
 
     let event_task = tokio::spawn(ui::event::run(tx.clone()));
 
-    // Publish state to the desktop (MPRIS) and route global media keys back
-    // into the same action channel. Absent D-Bus simply disables this.
-    let mpris = match mpris::spawn(tx.clone()) {
+    // Publish state to the desktop media controls and route global media keys
+    // back into the same action channel: MPRIS on Linux/BSD, Now Playing on
+    // macOS, SMTC on Windows. An unavailable backend simply disables this.
+    let media_controls: Option<os_media::MediaControlsHandle> = match os_media::spawn(tx.clone()) {
         Ok(handle) => handle,
         Err(err) => {
-            tracing::warn!("Could not start MPRIS server: {err:#}");
+            tracing::warn!("Could not start native media controls: {err:#}");
             None
         }
     };
-    if let Some(handle) = &mpris {
+    if let Some(handle) = &media_controls {
         handle.publish(app.mpris_state());
     }
 
@@ -254,7 +256,7 @@ async fn run_tui(
         while app.running {
             if let Some(action) = rx.recv().await {
                 app.handle_action(action)?;
-                if let Some(handle) = &mpris {
+                if let Some(handle) = &media_controls {
                     handle.publish(app.mpris_state());
                 }
                 terminal.draw(|frame| ui::render::render(frame, &app))?;
