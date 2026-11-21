@@ -14,7 +14,8 @@ use ratatui_image::{Resize, picker::Picker, protocol::Protocol};
 
 /// Shared layout constants so the art sizing and the renderer agree.
 pub const HEADER_ROWS: u16 = 3;
-pub const FOOTER_ROWS: u16 = 5;
+/// Four inner rows: three for the now-playing text and one 8x4 cover thumbnail.
+pub const FOOTER_ROWS: u16 = 6;
 
 /// Largest cover we draw. Terminal cells are roughly twice as tall as they are
 /// wide, so 44x22 cells still looks like a square album cover.
@@ -25,6 +26,11 @@ pub const ART_ROWS: u16 = 22;
 const MIN_DETAIL_ROWS: u16 = 7;
 /// Breathing room between the cover and the pane border.
 const ART_MARGIN_COLS: u16 = 2;
+
+/// Small now-playing thumbnail shown in the footer on every tab. Cell rows are
+/// about twice as tall as columns, so 8x4 cells render as a square image.
+pub const THUMB_COLS: u16 = 8;
+pub const THUMB_ROWS: u16 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArtStatus {
@@ -43,15 +49,18 @@ pub enum CoverArt {
     Loading {
         url: String,
     },
-    /// Image downloaded but the terminal is too small to encode it yet.
+    /// Image downloaded but the terminal is too small to encode the full cover
+    /// yet. The footer thumbnail is still encoded when there is room for it.
     Deferred {
         url: String,
         image: DynamicImage,
+        thumbnail: Option<Protocol>,
     },
     Ready {
         url: String,
         image: DynamicImage,
         protocol: Protocol,
+        thumbnail: Option<Protocol>,
     },
     Failed {
         url: String,
@@ -74,18 +83,29 @@ impl CoverArt {
         Self::Loading { url: url.into() }
     }
 
-    pub fn deferred(url: impl Into<String>, image: DynamicImage) -> Self {
+    pub fn deferred(
+        url: impl Into<String>,
+        image: DynamicImage,
+        thumbnail: Option<Protocol>,
+    ) -> Self {
         Self::Deferred {
             url: url.into(),
             image,
+            thumbnail,
         }
     }
 
-    pub fn ready(url: impl Into<String>, image: DynamicImage, protocol: Protocol) -> Self {
+    pub fn ready(
+        url: impl Into<String>,
+        image: DynamicImage,
+        protocol: Protocol,
+        thumbnail: Option<Protocol>,
+    ) -> Self {
         Self::Ready {
             url: url.into(),
             image,
             protocol,
+            thumbnail,
         }
     }
 
@@ -123,6 +143,15 @@ impl CoverArt {
         }
     }
 
+    /// Small footer rendering of the same image, independent of the full-size
+    /// cover protocol.
+    pub fn thumbnail(&self) -> Option<&Protocol> {
+        match self {
+            Self::Ready { thumbnail, .. } | Self::Deferred { thumbnail, .. } => thumbnail.as_ref(),
+            _ => None,
+        }
+    }
+
     /// Text shown in place of an image when there is nothing to draw. Graphic
     /// terminals still get this state while loading and on failures, so the
     /// Details pane never ends up blank or in an inconsistent state.
@@ -138,6 +167,18 @@ impl CoverArt {
                 vec!["Cover art unavailable".to_string(), message.clone()]
             }
             Self::Ready { .. } => Vec::new(),
+        }
+    }
+
+    /// Short labels for the 8x4 footer thumbnail, where the full placeholder
+    /// sentences would be clipped.
+    pub fn compact_placeholder(&self) -> &'static str {
+        match self {
+            Self::Disabled { .. } => "art off",
+            Self::NoArt => "no art",
+            Self::Loading { .. } | Self::Deferred { .. } => "loading",
+            Self::Failed { .. } => "art error",
+            Self::Ready { .. } => "",
         }
     }
 }
@@ -222,6 +263,23 @@ pub fn build_protocol(picker: &Picker, image: DynamicImage, size: Size) -> Resul
         .context("preparing cover art for terminal")
 }
 
+/// Encode the small now-playing thumbnail. Failures are non-fatal: the footer
+/// falls back to a compact text placeholder.
+pub fn build_thumbnail(picker: &Picker, image: &DynamicImage) -> Option<Protocol> {
+    build_protocol(picker, image.clone(), Size::new(THUMB_COLS, THUMB_ROWS)).ok()
+}
+
+/// Full-size cover plus its always-visible footer thumbnail.
+pub fn build_protocols(
+    picker: &Picker,
+    image: DynamicImage,
+    size: Size,
+) -> Result<(Protocol, Option<Protocol>)> {
+    let thumbnail = build_thumbnail(picker, &image);
+    let protocol = build_protocol(picker, image, size)?;
+    Ok((protocol, thumbnail))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,5 +325,15 @@ mod tests {
         let size = Size::new(40, 20);
         let protocol = build_protocol(&picker, image, size).expect("halfblocks protocol");
         assert_eq!(protocol.size(), size);
+    }
+
+    #[test]
+    fn footer_thumbnail_is_encoded_with_the_full_cover() {
+        let picker = Picker::halfblocks();
+        let image: DynamicImage = image::RgbImage::new(300, 300).into();
+        let (cover, thumbnail) =
+            build_protocols(&picker, image, Size::new(20, 10)).expect("protocols");
+        assert_eq!(cover.size(), Size::new(20, 10));
+        assert_eq!(thumbnail.expect("thumbnail").size(), Size::new(8, 4));
     }
 }

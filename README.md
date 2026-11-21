@@ -44,11 +44,13 @@ library, play music, and read synced lyrics, all from the terminal.
 - Lyrics cached in memory and in `lyrics.json`, including known misses, so a
   restart does not repeat LRCLIB requests
 - Ratatui TUI with a single async action loop and `--demo` mode
-- Large, adaptive cover art in the Details pane (up to 44x22 cells) using
-  Kitty/iTerm2/Sixel when available, with Unicode halfblocks and text
-  placeholders as fallbacks; resizing rebuilds the image without a refetch.
-  Album covers are also published as MPRIS `mpris:artUrl`, and the Playlists tab
-  shows each playlist's own cover as you move through the list
+- Current-song cover art that follows you everywhere: an 8x4 thumbnail in the
+  Now Playing footer on every tab, plus a large adaptive cover in the Lyrics,
+  Queue and Details panes (up to 44x22 cells). Kitty/iTerm2/Sixel are used when
+  available, with Unicode halfblocks and text placeholders as fallbacks;
+  resizing rebuilds the image without a refetch. Album covers are also published
+  as MPRIS `mpris:artUrl`, and the Playlists tab keeps its own selected-playlist
+  cover in the Details pane
 - Native desktop media controls: MPRIS on Linux/BSD, Now Playing and remote
   commands on macOS, and System Media Transport Controls on Windows. Play/pause,
   next/previous, seek and volume events route into the same action loop as the
@@ -298,22 +300,32 @@ reopens the browser login (refresh tokens cannot add scopes). Run
 
 ## Cover art
 
-When a track has album art — or when the selected row on the Playlists tab has a
-playlist image — termify downloads the 300px Spotify image in the background and
-draws it above the Details pane metadata. Moving through the playlist list loads
-each playlist's own cover; opening a playlist switches to its tracks, where
-track art works as before. The cover grows with the terminal up to 44x22 cells (about 88x22 pixels at the usual 1:2
-cell ratio) while always leaving seven rows for metadata and hints; on a 24-row
-terminal it stays compact instead of squeezing the details away. Resizing the
-terminal re-encodes the already-downloaded image at the new size. It uses the
-best terminal graphics protocol available (Kitty, iTerm2 or Sixel) and falls
-back to Unicode halfblocks when the terminal has no graphics protocol. Fetch,
-decode and protocol errors never interrupt playback: the pane simply shows a
-text placeholder such as `Loading cover art...` or `Cover art unavailable`.
+Termify keeps the current track's album art visible wherever you are. A small
+8x4-cell thumbnail sits in the Now Playing footer on every tab, so the cover is
+never lost while browsing playlists or downloads. The full-size cover appears in
+the Details pane, and the Lyrics and Queue tabs give it a dedicated area beside
+the text (or above it on narrow terminals). Press `l` for lyrics: the same album
+cover stays on screen next to the synced lines.
 
-Set `TERMIFY_NO_ART=1` (or use `TERM=dumb`) to disable art entirely and reclaim
-the space for metadata. `c` toggles art at runtime; the same album-art URL is
-also published to the desktop through MPRIS.
+The image is the 300px Spotify art, fetched in the background. The large cover
+grows with the terminal up to 44x22 cells (about 88x22 pixels at the usual 1:2
+cell ratio) while always leaving enough rows for the surrounding text; on small
+terminals it stays compact or steps aside entirely. Resizing re-encodes the
+already-downloaded image at the new size, including the footer thumbnail. It
+uses the best terminal graphics protocol available (Kitty, iTerm2 or Sixel) and
+falls back to Unicode halfblocks when the terminal has no graphics protocol.
+Fetch, decode and protocol errors never interrupt playback: the art area simply
+shows a text placeholder such as `Loading cover art...` or `Cover art
+unavailable`.
+
+The Playlists tab still shows the selected playlist's own image in the Details
+pane. That cover is kept separate from the current song's art, so moving through
+playlist rows never replaces the thumbnail in the footer or the cover on the
+Lyrics tab. Opening a playlist switches to its tracks as before.
+
+Set `TERMIFY_NO_ART=1` (or use `TERM=dumb`) to disable all art areas and reclaim
+the space for text. `c` toggles art at runtime; the same album-art URL is also
+published to the desktop through MPRIS.
 
 ## Desktop media player / global media keys
 

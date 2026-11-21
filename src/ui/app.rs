@@ -459,8 +459,12 @@ pub struct App {
     /// repeating failed LRCLIB lookups after a restart.
     pub no_lyrics: HashSet<String>,
     lyrics_cache_file: Option<PathBuf>,
-    /// Current cover-art state (image protocol or text placeholder).
+    /// Current track's cover-art state, shown in the footer on every tab and in
+    /// the full-size panes except Playlists (which has its own selection art).
     pub art: CoverArt,
+    /// Cover for the playlist highlighted on the Playlists tab. Kept separate so
+    /// browsing playlists never replaces the current song's artwork.
+    pub playlist_art: CoverArt,
     /// User-facing art toggle. Forced off when the terminal cannot show images.
     pub art_enabled: bool,
     /// Terminal size used to choose the cover dimensions and rebuild its protocol.
@@ -509,6 +513,10 @@ impl App {
             Some(reason) => CoverArt::disabled(reason.clone()),
             None => CoverArt::no_art(),
         };
+        let playlist_art = match &art_blocked_reason {
+            Some(reason) => CoverArt::disabled(reason.clone()),
+            None => CoverArt::no_art(),
+        };
         let art_enabled = art_blocked_reason.is_none();
         let mut app = Self {
             running: true,
@@ -553,6 +561,7 @@ impl App {
             play_order: Vec::new(),
             queue_cursor: 0,
             art,
+            playlist_art,
             art_enabled,
             terminal_area: Rect::new(0, 0, 100, 30),
             art_blocked_reason,
@@ -577,30 +586,52 @@ impl App {
 
     fn refresh_cover_protocol(&mut self) {
         let size = self.art_size();
-        let previous = std::mem::replace(&mut self.art, CoverArt::NoArt);
+        let picker = &self.picker;
+        self.art = Self::refresh_one_cover(
+            std::mem::replace(&mut self.art, CoverArt::NoArt),
+            size,
+            picker,
+        );
+        self.playlist_art = Self::refresh_one_cover(
+            std::mem::replace(&mut self.playlist_art, CoverArt::NoArt),
+            size,
+            picker,
+        );
+    }
+
+    fn refresh_one_cover(previous: CoverArt, size: Size, picker: &Picker) -> CoverArt {
         if size.width == 0 || size.height == 0 {
             // Keep the decoded image so it can be encoded once the terminal is
-            // large enough again, without refetching from Spotify.
-            self.art = match previous {
-                CoverArt::Ready { url, image, .. } | CoverArt::Deferred { url, image } => {
-                    CoverArt::deferred(url, image)
+            // large enough again, without refetching from Spotify. The footer
+            // thumbnail is small enough to survive even a tiny terminal.
+            return match previous {
+                CoverArt::Ready {
+                    url,
+                    image,
+                    thumbnail,
+                    ..
                 }
+                | CoverArt::Deferred {
+                    url,
+                    image,
+                    thumbnail,
+                } => CoverArt::deferred(url, image, thumbnail),
                 CoverArt::Failed { url, message } => CoverArt::failed(url, message),
                 CoverArt::Disabled { reason } => CoverArt::disabled(reason),
                 CoverArt::Loading { url } => CoverArt::loading(url),
                 CoverArt::NoArt => CoverArt::NoArt,
             };
-            return;
         }
-        self.art = match previous {
+        match previous {
             CoverArt::Ready {
                 url,
                 image,
                 protocol,
-            } if protocol.size() == size => CoverArt::ready(url, image, protocol),
-            CoverArt::Ready { url, image, .. } | CoverArt::Deferred { url, image } => {
-                match art::build_protocol(&self.picker, image.clone(), size) {
-                    Ok(protocol) => CoverArt::ready(url, image, protocol),
+                thumbnail,
+            } if protocol.size() == size => CoverArt::ready(url, image, protocol, thumbnail),
+            CoverArt::Ready { url, image, .. } | CoverArt::Deferred { url, image, .. } => {
+                match art::build_protocols(picker, image.clone(), size) {
+                    Ok((protocol, thumbnail)) => CoverArt::ready(url, image, protocol, thumbnail),
                     Err(err) => CoverArt::failed(url, format!("{err:#}")),
                 }
             }
@@ -608,7 +639,7 @@ impl App {
             CoverArt::Failed { url, message } => CoverArt::failed(url, message),
             CoverArt::Disabled { reason } => CoverArt::disabled(reason),
             CoverArt::NoArt => CoverArt::NoArt,
-        };
+        }
     }
 
     fn load_lyrics_cache(&mut self) {
@@ -689,6 +720,7 @@ impl App {
             self.offline_queue = None;
         }
         self.set_tracks(tracks.clone());
+        self.sync_current_art();
         self.status = if tracks.is_empty() {
             "No downloads yet — select a track and press d".to_string()
         } else {
@@ -1086,6 +1118,7 @@ impl App {
             playing: false,
             volume: 60,
         });
+        self.sync_current_art();
         self.status = "Demo mode — press ? for help".to_string();
     }
 
@@ -1465,16 +1498,26 @@ impl App {
                     return Ok(()); // stale response for a previous item
                 }
                 let size = self.art_size();
-                self.art = match result {
-                    Ok(image) if size.width == 0 || size.height == 0 => {
-                        CoverArt::deferred(url, image)
+                let state = {
+                    let picker = &self.picker;
+                    match result {
+                        Ok(image) if size.width == 0 || size.height == 0 => {
+                            let thumbnail = art::build_thumbnail(picker, &image);
+                            CoverArt::deferred(url, image, thumbnail)
+                        }
+                        Ok(image) => match art::build_protocols(picker, image.clone(), size) {
+                            Ok((protocol, thumbnail)) => {
+                                CoverArt::ready(url, image, protocol, thumbnail)
+                            }
+                            Err(err) => CoverArt::failed(url, format!("{err:#}")),
+                        },
+                        Err(err) => CoverArt::failed(url, err),
                     }
-                    Ok(image) => match art::build_protocol(&self.picker, image.clone(), size) {
-                        Ok(protocol) => CoverArt::ready(url, image, protocol),
-                        Err(err) => CoverArt::failed(url, format!("{err:#}")),
-                    },
-                    Err(err) => CoverArt::failed(url, err),
                 };
+                match target {
+                    CoverArtTarget::Track { .. } => self.art = state,
+                    CoverArtTarget::Playlist { .. } => self.playlist_art = state,
+                }
             }
             Action::MprisPlayPause => self.toggle_play(),
             Action::MprisPlay => self.set_playing(true),
@@ -1713,6 +1756,7 @@ impl App {
                 } else {
                     self.status = format!("Tab: {}", self.tab.title());
                 }
+                self.sync_current_art();
             }
             KeyCode::Char('/') => {
                 self.search_active = true;
@@ -1734,10 +1778,12 @@ impl App {
             KeyCode::Char('-') => self.adjust_volume(-5),
             KeyCode::Char('l') => {
                 self.tab = Tab::Lyrics;
+                self.sync_current_art();
                 self.status = "Lyrics".to_string();
             }
             KeyCode::Char('Q') => {
                 self.tab = Tab::Queue;
+                self.sync_current_art();
                 self.status = "Queue — J/K to move tracks".to_string();
             }
             KeyCode::Char('o') => self.show_downloads(),
@@ -2450,15 +2496,17 @@ impl App {
         self.art_enabled = !self.art_enabled;
         if self.art_enabled {
             self.status = "Cover art on".to_string();
-            if self.tab == Tab::Playlists {
-                self.load_selected_playlist_cover();
-            } else if let Some(track) = self.now_playing.as_ref().map(|np| np.track.clone()) {
+            if let Some(track) = self.now_playing.as_ref().map(|np| np.track.clone()) {
                 self.load_cover_art(&track);
             } else {
                 self.art = CoverArt::no_art();
             }
+            if self.tab == Tab::Playlists {
+                self.load_selected_playlist_cover();
+            }
         } else {
             self.art = CoverArt::disabled("press c to show");
+            self.playlist_art = CoverArt::disabled("press c to show");
             self.status = "Cover art hidden".to_string();
         }
     }
@@ -2486,7 +2534,7 @@ impl App {
             .and_then(|index| self.playlists.get(index))
             .cloned();
         let Some(playlist) = selected else {
-            self.art = CoverArt::no_art();
+            self.playlist_art = CoverArt::no_art();
             return;
         };
         self.load_cover_art_url(
@@ -2497,22 +2545,39 @@ impl App {
         );
     }
 
+    fn cover_slot(&self, target: &CoverArtTarget) -> &CoverArt {
+        match target {
+            CoverArtTarget::Track { .. } => &self.art,
+            CoverArtTarget::Playlist { .. } => &self.playlist_art,
+        }
+    }
+
+    fn cover_slot_mut(&mut self, target: &CoverArtTarget) -> &mut CoverArt {
+        match target {
+            CoverArtTarget::Track { .. } => &mut self.art,
+            CoverArtTarget::Playlist { .. } => &mut self.playlist_art,
+        }
+    }
+
     fn load_cover_art_url(&mut self, target: CoverArtTarget, url: Option<String>) {
         if !self.art_enabled {
             return;
         }
         let Some(url) = url else {
-            self.art = CoverArt::no_art();
+            *self.cover_slot_mut(&target) = CoverArt::no_art();
             return;
         };
-        if self.art.url() == Some(url.as_str())
-            && (matches!(self.art.status(), ArtStatus::Ready | ArtStatus::Loading)
-                || matches!(self.art, CoverArt::Deferred { .. }))
-        {
+        let already_loaded = {
+            let slot = self.cover_slot(&target);
+            slot.url() == Some(url.as_str())
+                && (matches!(slot.status(), ArtStatus::Ready | ArtStatus::Loading)
+                    || matches!(slot, CoverArt::Deferred { .. }))
+        };
+        if already_loaded {
             return;
         }
 
-        self.art = CoverArt::loading(url.clone());
+        *self.cover_slot_mut(&target) = CoverArt::loading(url.clone());
         let tx = self.tx.clone();
         let client = self.http_client.clone();
         let fetch_url = url.clone();
@@ -2527,6 +2592,28 @@ impl App {
             })
             .await;
         });
+    }
+
+    /// Make sure the persistent now-playing art matches the current track.
+    /// Tab switches call this so a playlist cover can never leak into the
+    /// Lyrics or Queue panes.
+    fn sync_current_art(&mut self) {
+        if !self.art_enabled {
+            return;
+        }
+        let Some(np) = self.now_playing.as_ref() else {
+            return;
+        };
+        let expected = np.track.art_url.as_deref();
+        let matches = match (expected, self.art.url()) {
+            (Some(want), Some(have)) => want == have,
+            (None, None) => matches!(self.art.status(), ArtStatus::NoArt),
+            _ => false,
+        };
+        if !matches {
+            let track = np.track.clone();
+            self.load_cover_art(&track);
+        }
     }
 
     fn select_current(&mut self) {
@@ -3358,6 +3445,50 @@ mod tests {
         assert!(app.error.is_none());
     }
 
+    #[tokio::test]
+    async fn playlist_cover_never_replaces_current_track_art() {
+        let mut app = test_app();
+        let mut track = demo_tracks()[0].clone();
+        track.art_url = Some("https://example.com/track.jpg".to_string());
+        app.now_playing = Some(NowPlaying {
+            track,
+            position: Duration::ZERO,
+            playing: false,
+            volume: 60,
+        });
+        app.art = CoverArt::loading("https://example.com/track.jpg");
+
+        let mut playlist = demo_playlist("id-1", "Road Trip");
+        playlist.art_url = Some("https://example.com/playlist.jpg".to_string());
+        app.tab = Tab::Playlists;
+        app.playlists = vec![playlist];
+        app.list_state.select(Some(0));
+        app.load_selected_playlist_cover();
+        assert_eq!(
+            app.playlist_art.url(),
+            Some("https://example.com/playlist.jpg")
+        );
+
+        // Switching to Lyrics keeps the current song's image even though the
+        // Playlists pane was showing a different cover a moment earlier.
+        let lyrics = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE);
+        app.handle_key(lyrics).unwrap();
+        assert_eq!(app.tab, Tab::Lyrics);
+        assert_eq!(app.art.url(), Some("https://example.com/track.jpg"));
+
+        app.handle_action(Action::CoverArtLoaded {
+            target: CoverArtTarget::Playlist {
+                id: "id-1".to_string(),
+            },
+            url: "https://example.com/playlist.jpg".to_string(),
+            result: Result::<image::DynamicImage, String>::Err("boom".to_string()),
+        })
+        .unwrap();
+        assert_eq!(app.playlist_art.status(), ArtStatus::Failed);
+        assert_eq!(app.art.url(), Some("https://example.com/track.jpg"));
+        assert_eq!(app.art.status(), ArtStatus::Loading);
+    }
+
     #[test]
     fn playlist_name_prompt_edits_and_cancels() {
         let mut app = test_app();
@@ -3800,7 +3931,10 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
             .unwrap();
-        assert_eq!(app.art.url(), Some("https://example.com/workout.jpg"));
+        assert_eq!(
+            app.playlist_art.url(),
+            Some("https://example.com/workout.jpg")
+        );
     }
 
     #[test]

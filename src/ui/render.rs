@@ -3,9 +3,10 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs, Widget};
+use ratatui_image::protocol::Protocol;
 
 use super::app::{App, RepeatMode, Tab, format_duration, lyric_scroll_offset};
-use crate::art;
+use crate::art::{self, CoverArt};
 
 const CYAN: Color = Color::Cyan;
 const YELLOW: Color = Color::Yellow;
@@ -104,6 +105,12 @@ fn render_queue_pane(frame: &mut Frame, area: Rect, app: &App) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    // Keep the current song's cover visible while browsing the queue too.
+    let (art_area, text_area) = current_art_layout(frame, inner, app, 28, 4);
+    if let Some(art_area) = art_area {
+        render_cover(frame, art_area, &app.art, app.art_enabled);
+    }
+
     let items: Vec<ListItem> = if app.play_order.is_empty() {
         vec![ListItem::new(Line::from(Span::styled(
             " Queue is empty — search for tracks or load a playlist ",
@@ -138,7 +145,7 @@ fn render_queue_pane(frame: &mut Frame, area: Rect, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(inner);
+        .split(text_area);
 
     let mut state = ListState::default();
     if !app.play_order.is_empty() {
@@ -198,10 +205,17 @@ fn render_lyrics_pane(frame: &mut Frame, area: Rect, app: &App) {
     let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
+
+    // Lyrics get their own large current-track cover, beside the text when the
+    // terminal is wide enough and above it on narrower screens.
+    let (art_area, text_area) = current_art_layout(frame, inner, app, 24, 4);
+    if let Some(art_area) = art_area {
+        render_cover(frame, art_area, &app.art, app.art_enabled);
+    }
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(inner);
+        .split(text_area);
     let height = chunks[0].height as usize;
 
     let lines: Vec<Line> = if app.lyrics_loading {
@@ -446,7 +460,12 @@ fn render_detail_pane(frame: &mut Frame, area: Rect, app: &App) {
     };
 
     if let Some(art_area) = art_area {
-        render_cover(frame, art_area, app);
+        let pane_art = if app.tab == Tab::Playlists {
+            &app.playlist_art
+        } else {
+            &app.art
+        };
+        render_cover(frame, art_area, pane_art, app.art_enabled);
     }
 
     let lines = if app.tab == Tab::Playlists {
@@ -666,46 +685,104 @@ fn render_detail_pane(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(lines), text_area);
 }
 
-fn render_cover(frame: &mut Frame, area: Rect, app: &App) {
-    if let Some(protocol) = app.art.protocol() {
-        let size = protocol.size();
-        if size.width > 0
-            && size.height > 0
-            && size.width <= area.width
-            && size.height <= area.height
-        {
-            let x = area.x + (area.width - size.width) / 2;
-            let y = area.y + (area.height - size.height) / 2;
-            let image_area = Rect::new(x, y, size.width, size.height);
-            frame.render_widget(
-                ratatui_image::Image::new(protocol).allow_clipping(true),
-                image_area,
-            );
-            return;
-        }
+/// Find space for the current-track cover in a full-width pane. Side-by-side
+/// keeps the lyrics/queue list tall; narrow terminals fall back to a stacked
+/// cover, and very small terminals keep the full area for text.
+fn current_art_layout(
+    frame: &Frame,
+    area: Rect,
+    app: &App,
+    min_text_cols: u16,
+    min_text_rows: u16,
+) -> (Option<Rect>, Rect) {
+    if !app.art_enabled {
+        return (None, area);
     }
-    render_art_placeholder(frame, area, app);
+    let size = art::cover_size(frame.area());
+    if size.width == 0 || size.height == 0 {
+        return (None, area);
+    }
+    let art_cols = size.width.saturating_add(2);
+    if area.width >= art_cols.saturating_add(min_text_cols) && area.height >= min_text_rows {
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(art_cols), Constraint::Min(min_text_cols)])
+            .split(area);
+        return (Some(chunks[0]), chunks[1]);
+    }
+    let art_rows = size.height.saturating_add(2);
+    if area.width >= size.width && area.height >= art_rows.saturating_add(min_text_rows) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(art_rows), Constraint::Min(min_text_rows)])
+            .split(area);
+        return (Some(chunks[0]), chunks[1]);
+    }
+    (None, area)
 }
 
-fn render_art_placeholder(frame: &mut Frame, area: Rect, app: &App) {
-    let lines: Vec<Line> = app
-        .art
+/// Draw a protocol at its natural size, centred in `area`. Returns false when
+/// there is no image (or it does not fit), leaving the caller to show text.
+fn render_image(frame: &mut Frame, area: Rect, protocol: Option<&Protocol>) -> bool {
+    let Some(protocol) = protocol else {
+        return false;
+    };
+    let size = protocol.size();
+    if size.width == 0 || size.height == 0 || size.width > area.width || size.height > area.height {
+        return false;
+    }
+    let x = area.x + (area.width - size.width) / 2;
+    let y = area.y + (area.height - size.height) / 2;
+    frame.render_widget(
+        ratatui_image::Image::new(protocol).allow_clipping(true),
+        Rect::new(x, y, size.width, size.height),
+    );
+    true
+}
+
+fn render_cover(frame: &mut Frame, area: Rect, art: &CoverArt, art_enabled: bool) {
+    if render_image(frame, area, art.protocol()) {
+        return;
+    }
+    render_art_placeholder(frame, area, art, art_enabled);
+}
+
+fn render_art_placeholder(frame: &mut Frame, area: Rect, art: &CoverArt, art_enabled: bool) {
+    let mut lines: Vec<Line> = art
         .placeholder_lines()
         .into_iter()
         .map(|line| Line::from(Span::styled(line, Style::default().fg(DARK_GRAY).italic())))
         .collect();
-    let hint = if app.art_enabled {
+    let hint = if art_enabled {
         " [c] hide art"
     } else {
         " [c] show art"
     };
-    let mut lines = lines;
     if area.height > lines.len() as u16 + 1 {
         lines.push(Line::from(Span::styled(
             hint,
             Style::default().fg(DARK_GRAY),
         )));
     }
+    frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), area);
+}
+
+/// Persistent, compact now-playing art in the footer. Shown on every tab so the
+/// current track's cover is never lost while browsing playlists or downloads.
+fn render_footer_art(frame: &mut Frame, area: Rect, app: &App) {
+    if render_image(frame, area, app.art.thumbnail()) {
+        return;
+    }
+    let label = app.art.compact_placeholder();
+    if label.is_empty() {
+        return;
+    }
+    let padding = area.height.saturating_sub(1) / 2;
+    let mut lines = vec![Line::from(""); padding as usize];
+    lines.push(Line::from(Span::styled(
+        label,
+        Style::default().fg(DARK_GRAY).italic(),
+    )));
     frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), area);
 }
 
@@ -717,14 +794,35 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    const MIN_TEXT_COLS: u16 = 40;
+    let thumb_cols = art::THUMB_COLS.saturating_add(2);
+    let (thumb_area, text_area) = if app.art_enabled
+        && inner.width >= thumb_cols.saturating_add(MIN_TEXT_COLS)
+        && inner.height >= art::THUMB_ROWS
+    {
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(thumb_cols),
+                Constraint::Min(MIN_TEXT_COLS),
+            ])
+            .split(inner);
+        (Some(chunks[0]), chunks[1])
+    } else {
+        (None, inner)
+    };
+    if let Some(thumb_area) = thumb_area {
+        render_footer_art(frame, thumb_area, app);
+    }
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // track name
             Constraint::Length(1), // progress bar
-            Constraint::Length(1), // keybindings
+            Constraint::Min(1),    // keybindings (absorbs the extra thumbnail row)
         ])
-        .split(inner);
+        .split(text_area);
 
     let (track_text, progress, volume, playing) = match &app.now_playing {
         Some(np) => {
@@ -1008,14 +1106,44 @@ mod tests {
         terminal.draw(|frame| render(frame, &app)).unwrap();
 
         let image: image::DynamicImage = image::RgbImage::new(64, 64).into();
-        let protocol = art::build_protocol(
+        let (cover, thumbnail) = art::build_protocols(
             &Picker::halfblocks(),
             image.clone(),
             ratatui::layout::Size::new(14, 7),
         )
         .unwrap();
-        app.art = CoverArt::ready("https://example.com/cover.jpg", image, protocol);
+        app.art = CoverArt::ready("https://example.com/cover.jpg", image, cover, thumbnail);
         terminal.draw(|frame| render(frame, &app)).unwrap();
+    }
+
+    #[test]
+    fn lyrics_and_queue_tabs_render_current_track_art() {
+        let mut app = test_app();
+        app.tab = Tab::Lyrics;
+        app.art = CoverArt::no_art();
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("No cover art"),
+            "lyrics pane should reserve cover space"
+        );
+        assert!(text.contains("No lyrics for this track."));
+
+        let image: image::DynamicImage = image::RgbImage::new(64, 64).into();
+        let (cover, thumbnail) = art::build_protocols(
+            &Picker::halfblocks(),
+            image.clone(),
+            art::cover_size(Rect::new(0, 0, 100, 30)),
+        )
+        .unwrap();
+        app.art = CoverArt::ready("https://example.com/cover.jpg", image, cover, thumbnail);
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        assert!(buffer_text(&terminal).contains("No lyrics for this track."));
+
+        app.tab = Tab::Queue;
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        assert!(buffer_text(&terminal).contains("Queue"));
     }
 
     #[test]

@@ -19,7 +19,7 @@ or decisions change.
 | Audio backend | librespot-playback with rodio/ALSA (`SoftMixer` for volume) |
 | Offline | Download through the authenticated librespot session (`librespot-audio`/`librespot-metadata`), store decrypted Ogg Vorbis/MP3 in `cache/downloads`, index in v2 `downloads.json` with playlist memberships; `d` saves one track or a whole playlist from the Playlists tab; Offline tab can replay a whole saved playlist, single tracks play with rodio, saved copies are preferred online, and `--offline` works with no login/network. Audio keys are retried with backoff, never assumed missing, and files are header-checked before indexing |
 | Lyrics | LRCLIB (line-synced, no key) primary, original-language entry preferred; English translation via Google's public endpoint on demand. Cached in-memory by track URI and persisted to `lyrics.json` (including "no lyrics" results). Genius unsynced fallback deferred to polish |
-| Cover art | Album and playlist images from the Web API, rendered with `ratatui-image` 11.1.0 (Kitty/iTerm2/Sixel with halfblocks fallback); cover scales with the terminal up to 44x22 cells while reserving metadata rows, and rebuilds its protocol on resize without refetching; fetch/decode failures degrade to text placeholders; `TERMIFY_NO_ART`/`TERM=dumb` disable art. Playlist-tab selection loads the playlist's own image; current album URL is published as MPRIS `mpris:artUrl` |
+| Cover art | Album and playlist images from the Web API, rendered with `ratatui-image` 11.1.0 (Kitty/iTerm2/Sixel with halfblocks fallback); the current song's cover has an 8x4 footer thumbnail on every tab and a large adaptive pane in Lyrics/Queue/Details (up to 44x22 cells), with protocols rebuilt on resize without refetching. Fetch/decode failures degrade to text placeholders; `TERMIFY_NO_ART`/`TERM=dumb` disable all art areas. Playlist-tab selection uses a separate cover state so it never replaces the current song's art; current album URL is published as MPRIS `mpris:artUrl` |
 | Config/cache | Platform-specific `#[cfg]` blocks: Linux XDG (`~/.config/termify`, `~/.cache/termify`), macOS (`~/Library/Application Support/termify`, `~/Library/Caches/termify`), Windows (`%APPDATA%\termify`, `%LOCALAPPDATA%\termify\cache`) |
 | Redirect URI | `http://127.0.0.1:8989/callback` for PKCE; device pairing uses `https://spotify.com/pair` |
 | Desktop integration | `os_media.rs` dispatches to `mpris-server` 0.11 on Linux/BSD and `souvlaki` 0.9.3 on macOS/Windows (Now Playing / SMTC). Media keys are routed by the OS, not grabbed directly. Shuffle and repeat (`Loop_Status`) are published/controllable on supported platforms; repeat-all restarts the playlist in the current shuffle order. Windows uses a hidden Win32 message window because SMTC requires an HWND |
@@ -150,9 +150,10 @@ streaming tracks and from the rodio sink for downloaded files.
       `Enter` plays it, and the cursor follows the current track. Reordering is
       reset when shuffle is toggled or a new track list is loaded (unit tested)
 - [x] Cover art: `art.rs` downloads/decodes Spotify album images off-thread,
-      builds a `ratatui-image` protocol sized to the terminal (up to 44x22 cells)
-      after probing, and renders it in the Details pane; `c` toggles art at
-      runtime and resizes rebuild the protocol without a refetch
+      builds `ratatui-image` protocols sized to the terminal (up to 44x22 cells
+      plus an 8x4 footer thumbnail) after probing, and renders them in the
+      Details, Lyrics, Queue and footer areas; `c` toggles art at runtime and
+      resizes rebuild the protocols without a refetch
 - [x] Graceful image fallbacks: Kitty/iTerm2/Sixel detected at startup, halfblocks
       when no graphics protocol exists, text placeholders for no art/loading/
       failure, and art disabled entirely for `TERM=dumb` or `TERMIFY_NO_ART`
@@ -186,6 +187,12 @@ streaming tracks and from the rodio sink for downloaded files.
 - [x] Playlist cover art: `Playlist.art_url` comes from Spotify `images`; the
       Playlists tab loads and renders the selected playlist's own image through
       the existing `CoverArtLoaded` path, with stale responses ignored by target
+- [x] Current-song art everywhere: a separate `playlist_art` state keeps playlist
+      browsing from replacing the current track's cover; an 8x4 thumbnail in the
+      footer is visible on every tab, and Lyrics/Queue now render the full cover
+      beside the text (stacked on narrow terminals). Tab switches re-sync the
+      current track's art, and resize rebuilds both the large and thumbnail
+      protocols without another fetch
 - [x] Native media controls on macOS/Windows via `souvlaki` 0.9.3: Now Playing /
       MPRemoteCommandCenter and SMTC. Events map to the shared `Action` channel;
       Windows creates a hidden message window for SMTC's required HWND. Cross-
@@ -223,7 +230,7 @@ streaming tracks and from the rodio sink for downloaded files.
 - [x] Unit tests cover filename safety, v1/v2 index persistence/pruning, version
       rejection, header validation, audio-key retry setup, download
       progress/errors, tab loading, offline mode, deletion, offline playlist
-      playback and playlist cover selection (66 passing)
+      playback, playlist cover selection and persistent current-track art (69 passing)
 - [ ] Verify one real Premium download and `--offline` playback with user credentials
 
 ## Deferred (not in v1)
