@@ -20,9 +20,13 @@ library, play music, and read synced lyrics, all from the terminal.
 - Playlist details: owner, public/collaborative status, contributors and the
   user who added each track (from Spotify's per-item `added_by` field)
 - Playback controls: play/pause, next/prev, seek, volume, end-of-track auto-advance
-- Repeat modes (`r`): off, all and one, also exposed as MPRIS `Loop_Status`
+- Repeat modes (`r`): off, playlist and one. Playlist repeat restarts the whole
+  playlist when its last track ends, using the current shuffle order, and is
+  exposed as MPRIS `Loop_Status`
 - Offline downloads: save tracks through the librespot session, list them on the
   Offline tab, play them with rodio, and launch with `--offline` without a login
+- Press `d` on the Playlists tab to download every track of a playlist; already
+  saved and in-flight tracks are skipped, with progress shown in the list
 - Downloaded copies are preferred automatically, so selecting a saved track from
   search or a playlist also plays from disk; delete copies with `D`
 - Persistent `downloads.json` index with hashed filenames, atomic writes and
@@ -119,8 +123,8 @@ termify --relogin       # force re-login for both Web API and playback
 
 | Key | Action |
 | --- | --- |
-| `j` / `↓` | Move down (select lyric line on Lyrics tab; move cursor on Queue tab) |
-| `k` / `↑` | Move up (select lyric line on Lyrics tab; move cursor on Queue tab) |
+| `j` / `↓` | Move down (select playlist on Playlists tab; lyric line on Lyrics tab; cursor on Queue tab) |
+| `k` / `↑` | Move up (select playlist on Playlists tab; lyric line on Lyrics tab; cursor on Queue tab) |
 | `g` / `G` | First / last item (first/last lyric line on Lyrics tab) |
 | `PgUp` / `PgDn` | Page up / down |
 | `Enter` | Select track to play (offline copy when saved); open playlist; play queue/offline track; jump to selected lyric line |
@@ -133,7 +137,7 @@ termify --relogin       # force re-login for both Web API and playback
 | `l` | Lyrics tab |
 | `Q` | Queue tab |
 | `o` | Offline / downloads tab |
-| `d` | Download the selected track |
+| `d` | Download the selected track; download all tracks on the Playlists tab |
 | `D` | Delete the offline copy (Offline tab); discard staged playlist changes elsewhere |
 | `J` / `K` | Move selected queue track down / up (Queue tab only) |
 | `L` | Load liked songs |
@@ -145,7 +149,7 @@ termify --relogin       # force re-login for both Web API and playback
 | `[` / `]` | Same as `J` / `K` for playlist reordering |
 | `S` | Save all staged playlist changes in one batch |
 | `s` | Shuffle on / off (affects next/prev and auto-advance) |
-| `r` | Repeat off / all / one (also MPRIS Loop Status) |
+| `r` | Repeat off / playlist / one; playlist repeat restarts the shuffled order too (MPRIS Loop Status) |
 | `c` | Show / hide cover art (no effect when the terminal blocks images) |
 | `a` | Lyrics follow playback on / off (re-syncs the selected line when re-enabled) |
 | `t` | Translate lyrics to English (on the Lyrics tab) |
@@ -157,11 +161,14 @@ selected track with its neighbour and the cursor follows it; `Enter` starts that
 track. Toggling shuffle or loading a new track list rebuilds the order, so manual
 reordering is reset in those cases.
 
-`r` cycles repeat through off → all → one. Repeat-all wraps from the last track
-to the first, repeat-one reloads the current track from the beginning, and with
-repeat off the player stops at the end of the queue. Manual `n`/`p` still wrap
-regardless of the repeat mode. The current mode also appears in the footer and
-is the MPRIS `Loop_Status` property.
+`r` cycles repeat through off → playlist → one. While a playlist is open,
+playlist repeat explicitly restarts that playlist from the first entry of the
+current playback order when the last track ends. With shuffle enabled that means
+the whole shuffled cycle repeats; other track lists simply wrap from the last
+track to the first. Repeat-one reloads the current track from the beginning, and
+with repeat off the player stops at the end of the queue. Manual `n`/`p` still
+wrap regardless of the repeat mode. The current mode also appears in the footer
+and is the MPRIS `Loop_Status` property.
 
 On the Lyrics tab, `j`/`k` (and `g`/`G`, `PgUp`/`PgDn`) select a line with `»`,
 which disables follow mode. `Enter` seeks playback to that line's timestamp and
@@ -183,6 +190,13 @@ under Setup. The URI-to-file mapping is recorded in `downloads.json` atomically,
 with filenames derived from a hash of the URI, so stale entries disappear from
 the view on the next launch and no path traversal is possible from a tampered
 index.
+
+On the Playlists tab, `d` fetches the selected playlist's saved tracks and
+downloads all of them sequentially. Tracks already on disk or queued by a
+separate download are skipped, duplicates within the playlist are collapsed, and
+the list shows `offline n/total` progress while it runs. The final status reports
+how many tracks were saved and how many failed; a failed track does not stop the
+rest of the playlist.
 
 Press `o` (or `Tab`) to open the Offline tab. It lists saved tracks with a `↓`
 marker in other lists; `Enter` plays the selected copy and `D` deletes it. Once a

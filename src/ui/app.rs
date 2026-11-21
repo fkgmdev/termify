@@ -225,6 +225,18 @@ impl PlaylistDraft {
     }
 }
 
+/// Progress of a whole-playlist download. The URI set lets ordinary
+/// `DownloadFinished` actions update the playlist progress without adding a
+/// second download path.
+#[derive(Debug, Clone, Default)]
+pub struct PlaylistDownload {
+    pub name: String,
+    pub total: usize,
+    pub completed: usize,
+    pub failed: usize,
+    pub uris: HashSet<String>,
+}
+
 /// Playlist selection overlay shown when adding a track.
 #[derive(Debug, Clone)]
 pub struct PlaylistPicker {
@@ -284,6 +296,21 @@ pub enum Action {
     DownloadFinished {
         uri: String,
         result: Result<DownloadEntry, String>,
+    },
+    /// Playlist tracks were fetched and queued for offline download.
+    PlaylistDownloadStarted {
+        id: String,
+        name: String,
+        total: usize,
+        uris: Vec<String>,
+    },
+    /// All tracks for a playlist download finished, or fetching it failed.
+    PlaylistDownloadFinished {
+        id: String,
+        name: String,
+        total: usize,
+        failed: usize,
+        error: Option<String>,
     },
     PlayerEndOfTrack,
     PlayerPlaying(u32),
@@ -352,6 +379,8 @@ pub struct App {
     pub downloads: DownloadStore,
     /// URIs with a download in progress, to avoid duplicate background work.
     pub downloading: HashSet<String>,
+    /// Whole-playlist downloads currently in progress, keyed by playlist ID.
+    pub playlist_downloads: HashMap<String, PlaylistDownload>,
     /// Lazily created when an offline track is first played.
     offline_player: Option<OfflinePlayer>,
     pub playback_mode: PlaybackMode,
@@ -447,6 +476,7 @@ impl App {
             player: None,
             downloads: options.downloads.unwrap_or_else(DownloadStore::disabled),
             downloading: HashSet::new(),
+            playlist_downloads: HashMap::new(),
             offline_player: None,
             playback_mode: PlaybackMode::Online,
             offline_end_handled: false,
@@ -596,6 +626,12 @@ impl App {
     }
 
     fn download_selected(&mut self) {
+        // On the Playlists tab the selected row is a playlist, so `d` saves all
+        // of its tracks instead of the last track list shown in Search.
+        if self.tab == Tab::Playlists {
+            self.download_selected_playlist();
+            return;
+        }
         let Some(track) = self
             .list_state
             .selected()
@@ -631,6 +667,108 @@ impl App {
                 .send(Action::DownloadFinished {
                     uri: download_uri,
                     result,
+                })
+                .await;
+        });
+    }
+
+    /// Download every track of the selected playlist. Tracks that are already
+    /// stored or in flight are skipped; results reuse `DownloadFinished` so the
+    /// normal index and error handling still applies.
+    fn download_selected_playlist(&mut self) {
+        let Some(playlist) = self
+            .list_state
+            .selected()
+            .and_then(|index| self.playlists.get(index))
+            .cloned()
+        else {
+            self.status = "Select a playlist to download".to_string();
+            return;
+        };
+        if self.playlist_downloads.contains_key(&playlist.id) {
+            self.status = format!("Already downloading '{}'", playlist.name);
+            return;
+        }
+        let Some(client) = self.api_client.clone() else {
+            self.status = "Sign in to download playlists".to_string();
+            return;
+        };
+        let Some(player) = self.player.clone() else {
+            self.status = "Sign in with local playback enabled to download tracks".to_string();
+            return;
+        };
+
+        let id = playlist.id.clone();
+        let name = playlist.name.clone();
+        let mut skip: HashSet<String> = self.downloading.clone();
+        skip.extend(self.downloads.tracks().into_iter().map(|track| track.uri));
+        self.playlist_downloads.insert(
+            id.clone(),
+            PlaylistDownload {
+                name: name.clone(),
+                ..PlaylistDownload::default()
+            },
+        );
+        self.status = format!("Fetching '{}' for offline download...", name);
+
+        let tx = self.tx.clone();
+        let dir = self.downloads.dir().to_path_buf();
+        tokio::spawn(async move {
+            let tracks = match crate::api::playlist_details(&client, &id).await {
+                Ok((_, tracks)) => tracks,
+                Err(err) => {
+                    let message = format!("Could not download playlist '{name}': {err:#}");
+                    let _ = tx
+                        .send(Action::PlaylistDownloadFinished {
+                            id,
+                            name,
+                            total: 0,
+                            failed: 0,
+                            error: Some(message),
+                        })
+                        .await;
+                    return;
+                }
+            };
+
+            let mut seen = HashSet::new();
+            let pending: Vec<crate::ui::Track> = tracks
+                .into_iter()
+                .filter(|track| !skip.contains(&track.uri) && seen.insert(track.uri.clone()))
+                .collect();
+            let total = pending.len();
+            let uris: Vec<String> = pending.iter().map(|track| track.uri.clone()).collect();
+            let _ = tx
+                .send(Action::PlaylistDownloadStarted {
+                    id: id.clone(),
+                    name: name.clone(),
+                    total,
+                    uris,
+                })
+                .await;
+
+            let mut failed = 0;
+            for track in pending {
+                let result = offline::download_track(&player.session, &track, &dir)
+                    .await
+                    .map_err(|err| format!("{err:#}"));
+                if result.is_err() {
+                    failed += 1;
+                }
+                let _ = tx
+                    .send(Action::DownloadFinished {
+                        uri: track.uri.clone(),
+                        result,
+                    })
+                    .await;
+            }
+            let _ = tx
+                .send(Action::PlaylistDownloadFinished {
+                    id,
+                    name,
+                    total,
+                    failed,
+                    error: None,
                 })
                 .await;
         });
@@ -938,19 +1076,101 @@ impl App {
             }
             Action::DownloadFinished { uri, result } => {
                 self.downloading.remove(&uri);
-                match result {
-                    Ok(entry) => {
-                        let title = entry.track.title.clone();
-                        let audio_path = self.downloads.audio_path(&entry);
-                        if let Err(err) = self.downloads.insert(entry) {
-                            let _ = std::fs::remove_file(audio_path);
-                            self.set_error(format!("Could not index download: {err:#}"));
-                        } else {
-                            self.status = format!("Downloaded '{title}' for offline listening");
+                let playlist = self
+                    .playlist_downloads
+                    .values_mut()
+                    .find(|progress| progress.uris.contains(&uri));
+                if let Some(progress) = playlist {
+                    progress.completed += 1;
+                    match result {
+                        Ok(entry) => {
+                            let audio_path = self.downloads.audio_path(&entry);
+                            if self.downloads.insert(entry).is_err() {
+                                let _ = std::fs::remove_file(audio_path);
+                                progress.failed += 1;
+                            }
                         }
+                        Err(_) => progress.failed += 1,
                     }
-                    Err(err) => self.set_error(format!("Download failed: {err}")),
+                    let name = progress.name.clone();
+                    let total = progress.total;
+                    let completed = progress.completed;
+                    let failed = progress.failed;
+                    self.status = if completed >= total {
+                        format!(
+                            "Finished playlist '{name}': {} saved, {failed} failed",
+                            total.saturating_sub(failed)
+                        )
+                    } else {
+                        format!(
+                            "Downloading playlist '{name}': {completed}/{total} ({failed} failed)"
+                        )
+                    };
+                } else {
+                    match result {
+                        Ok(entry) => {
+                            let title = entry.track.title.clone();
+                            let audio_path = self.downloads.audio_path(&entry);
+                            if let Err(err) = self.downloads.insert(entry) {
+                                let _ = std::fs::remove_file(audio_path);
+                                self.set_error(format!("Could not index download: {err:#}"));
+                            } else {
+                                self.status = format!("Downloaded '{title}' for offline listening");
+                            }
+                        }
+                        Err(err) => self.set_error(format!("Download failed: {err}")),
+                    }
                 }
+            }
+            Action::PlaylistDownloadStarted {
+                id,
+                name,
+                total,
+                uris,
+            } => {
+                let progress = self
+                    .playlist_downloads
+                    .entry(id.clone())
+                    .or_insert_with(|| PlaylistDownload {
+                        name: name.clone(),
+                        ..PlaylistDownload::default()
+                    });
+                progress.name = name.clone();
+                progress.total = total;
+                progress.uris = uris.into_iter().collect();
+                for uri in &progress.uris {
+                    self.downloading.insert(uri.clone());
+                }
+                self.status = if total == 0 {
+                    format!("All tracks in '{name}' are already offline")
+                } else {
+                    format!("Downloading playlist '{name}': 0/{total}")
+                };
+            }
+            Action::PlaylistDownloadFinished {
+                id,
+                name,
+                total,
+                failed,
+                error,
+            } => {
+                self.playlist_downloads.remove(&id);
+                if let Some(message) = error {
+                    self.set_error(message);
+                    return Ok(());
+                }
+                self.status = if total == 0 {
+                    format!("All tracks in '{name}' are already offline")
+                } else if failed > 0 {
+                    format!(
+                        "Downloaded {}/{} tracks from '{name}' ({} failed)",
+                        total - failed,
+                        total,
+                        failed
+                    )
+                } else {
+                    format!("Downloaded {total} tracks from '{name}' for offline listening")
+                };
             }
             Action::PlayerEndOfTrack if self.playback_mode == PlaybackMode::Online => {
                 self.handle_track_end();
@@ -1223,7 +1443,7 @@ impl App {
                     self.set_lyric_cursor(last);
                 }
                 Tab::Queue => self.queue_cursor = self.play_order.len().saturating_sub(1),
-                _ if !self.tracks.is_empty() => self.move_to(self.tracks.len() - 1),
+                _ if self.list_len() > 0 => self.move_to(self.list_len() - 1),
                 _ => {}
             },
             KeyCode::PageDown => match self.tab {
@@ -1693,19 +1913,29 @@ impl App {
         self.status = format!("Discarded unsaved changes to '{}'", draft.original_name);
     }
 
+    /// Length of the list currently rendered on the left side.
+    fn list_len(&self) -> usize {
+        if self.tab == Tab::Playlists {
+            self.playlists.len()
+        } else {
+            self.tracks.len()
+        }
+    }
+
     fn move_selection(&mut self, delta: i32) {
-        if self.tracks.is_empty() {
+        let len = self.list_len();
+        if len == 0 {
             return;
         }
         let current = self.list_state.selected().unwrap_or(0) as i32;
-        let next = (current + delta).clamp(0, self.tracks.len() as i32 - 1) as usize;
+        let next = (current + delta).clamp(0, len as i32 - 1) as usize;
         self.list_state.select(Some(next));
     }
 
     fn move_to(&mut self, index: usize) {
-        if !self.tracks.is_empty() {
-            self.list_state
-                .select(Some(index.min(self.tracks.len() - 1)));
+        let len = self.list_len();
+        if len > 0 {
+            self.list_state.select(Some(index.min(len - 1)));
         }
     }
 
@@ -1849,11 +2079,16 @@ impl App {
 
     fn set_repeat(&mut self, repeat: RepeatMode) {
         self.repeat = repeat;
-        self.status = format!("Repeat {}", repeat.label());
+        self.status = if repeat == RepeatMode::All && self.current_playlist_id.is_some() {
+            "Repeat playlist".to_string()
+        } else {
+            format!("Repeat {}", repeat.label())
+        };
     }
 
     /// End-of-track behaviour, distinct from manual `n`: repeat-one restarts the
-    /// track, repeat-all wraps, and repeat-off stops at the end of the queue.
+    /// track, repeat-all restarts the playlist (in the current/shuffled order),
+    /// and repeat-off stops at the end of the queue.
     fn handle_track_end(&mut self) {
         self.offline_end_handled = true;
         if self.repeat == RepeatMode::One {
@@ -1867,10 +2102,47 @@ impl App {
             return;
         }
         let was_playing = self.now_playing.as_ref().is_some_and(|np| np.playing);
-        self.next_track();
+        let repeating_playlist =
+            at_last && self.repeat == RepeatMode::All && self.current_playlist_id.is_some();
+        if repeating_playlist {
+            self.restart_playlist();
+        } else {
+            self.next_track();
+        }
         if was_playing {
             self.set_playing(true);
         }
+        if repeating_playlist {
+            self.status = format!("Repeating playlist '{}'", self.current_playlist_label());
+        }
+    }
+
+    /// Return to the first track of the current playback order. With shuffle
+    /// enabled that is the first entry of the shuffled `play_order`, so a whole
+    /// shuffle cycle repeats instead of only wrapping one track at a time.
+    fn restart_playlist(&mut self) {
+        if self.tracks.is_empty() {
+            return;
+        }
+        if self.play_order.len() != self.tracks.len() {
+            self.build_play_order();
+        }
+        let Some(&first) = self.play_order.first() else {
+            return;
+        };
+        self.list_state.select(Some(first));
+        self.queue_cursor = 0;
+        self.select_current();
+    }
+
+    fn current_playlist_label(&self) -> String {
+        let Some(id) = &self.current_playlist_id else {
+            return "playlist".to_string();
+        };
+        self.playlists
+            .iter()
+            .find(|playlist| &playlist.id == id)
+            .map_or_else(|| "playlist".to_string(), |playlist| playlist.name.clone())
     }
 
     /// Reload the current URI from the start so librespot really restarts it.
@@ -3157,5 +3429,127 @@ mod tests {
         assert!(dir.join(second_file).exists());
         assert!(app.status.contains("Removed"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn playlist_tab_navigation_uses_playlists_even_with_no_tracks_loaded() {
+        let mut app = test_app();
+        app.tab = Tab::Playlists;
+        app.playlists = vec![
+            demo_playlist("id-1", "Road Trip"),
+            demo_playlist("id-2", "Workout"),
+            demo_playlist("id-3", "Chill"),
+        ];
+        app.list_state.select(Some(0));
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        app.handle_key(key(KeyCode::Down)).unwrap();
+        assert_eq!(app.list_state.selected(), Some(1));
+        app.handle_key(key(KeyCode::Char('j'))).unwrap();
+        assert_eq!(app.list_state.selected(), Some(2));
+        app.handle_key(key(KeyCode::Down)).unwrap();
+        assert_eq!(app.list_state.selected(), Some(2));
+        app.handle_key(key(KeyCode::Up)).unwrap();
+        assert_eq!(app.list_state.selected(), Some(1));
+        app.handle_key(key(KeyCode::Char('g'))).unwrap();
+        assert_eq!(app.list_state.selected(), Some(0));
+        app.handle_key(key(KeyCode::Char('G'))).unwrap();
+        assert_eq!(app.list_state.selected(), Some(2));
+    }
+
+    #[test]
+    fn download_key_on_playlist_tab_requires_sign_in() {
+        let (mut app, dir) = offline_test_app("playlist-no-player");
+        app.tab = Tab::Playlists;
+        app.playlists = vec![demo_playlist("id-1", "Road Trip")];
+        app.list_state.select(Some(0));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.status.contains("Sign in"));
+        assert!(app.playlist_downloads.is_empty());
+        assert!(app.downloading.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn playlist_download_actions_track_progress_and_summarise_failures() {
+        let (mut app, dir) = offline_test_app("playlist-progress");
+        let tracks = demo_tracks();
+        let id = "playlist-1".to_string();
+        let uris: Vec<String> = tracks.iter().take(3).map(|t| t.uri.clone()).collect();
+        app.handle_action(Action::PlaylistDownloadStarted {
+            id: id.clone(),
+            name: "Road Trip".to_string(),
+            total: 3,
+            uris: uris.clone(),
+        })
+        .unwrap();
+        assert!(uris.iter().all(|uri| app.downloading.contains(uri)));
+
+        for (track, file) in tracks
+            .iter()
+            .take(2)
+            .zip(["0000000000000001.ogg", "0000000000000002.ogg"])
+        {
+            let entry = stored_entry(track, file);
+            std::fs::write(dir.join(file), b"audio").expect("write audio");
+            app.handle_action(Action::DownloadFinished {
+                uri: track.uri.clone(),
+                result: Ok(entry),
+            })
+            .unwrap();
+        }
+        app.handle_action(Action::DownloadFinished {
+            uri: uris[2].clone(),
+            result: Err("key denied".to_string()),
+        })
+        .unwrap();
+        assert!(app.downloads.contains(&uris[0]));
+        assert!(app.downloads.contains(&uris[1]));
+        assert!(!app.downloads.contains(&uris[2]));
+        assert!(app.downloading.is_empty());
+        assert!(app.status.contains("Finished playlist 'Road Trip'"));
+        assert!(app.status.contains("2 saved, 1 failed"));
+
+        app.handle_action(Action::PlaylistDownloadFinished {
+            id,
+            name: "Road Trip".to_string(),
+            total: 3,
+            failed: 1,
+            error: None,
+        })
+        .unwrap();
+        assert!(app.playlist_downloads.is_empty());
+        assert!(app.status.contains("Downloaded 2/3 tracks"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn repeat_all_restarts_shuffled_playlist_from_first_track() {
+        let mut app = test_app();
+        app.playlists = vec![demo_playlist("id-1", "Road Trip")];
+        app.current_playlist_id = Some("id-1".into());
+        app.set_tracks(demo_tracks());
+        app.shuffle = true;
+        app.build_play_order();
+        app.set_repeat(RepeatMode::All);
+
+        let first = app.play_order[0];
+        let first_uri = app.tracks[first].uri.clone();
+        let last = *app.play_order.last().expect("play order");
+        app.list_state.select(Some(last));
+        app.now_playing = Some(NowPlaying {
+            track: app.tracks[last].clone(),
+            position: Duration::from_secs(10),
+            playing: true,
+            volume: 60,
+        });
+
+        app.handle_action(Action::PlayerEndOfTrack).unwrap();
+        assert_eq!(app.list_state.selected(), Some(first));
+        assert_eq!(app.now_playing.as_ref().unwrap().track.uri, first_uri);
+        assert!(app.now_playing.as_ref().unwrap().playing);
+        assert!(app.status.contains("Repeating playlist 'Road Trip'"));
     }
 }

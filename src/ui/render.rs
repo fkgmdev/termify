@@ -310,10 +310,17 @@ fn render_list_pane(frame: &mut Frame, area: Rect, app: &App) {
             app.playlists
                 .iter()
                 .map(|playlist| {
-                    ListItem::new(Line::from(Span::styled(
-                        playlist.display(),
-                        Style::default().fg(WHITE),
-                    )))
+                    let label = match app.playlist_downloads.get(&playlist.id) {
+                        Some(progress) if progress.total > 0 => format!(
+                            "{}  (offline {}/{})",
+                            playlist.display(),
+                            progress.completed,
+                            progress.total
+                        ),
+                        Some(_) => format!("{}  (fetching offline tracks)", playlist.display()),
+                        None => playlist.display(),
+                    };
+                    ListItem::new(Line::from(Span::styled(label, Style::default().fg(WHITE))))
                 })
                 .collect()
         }
@@ -451,9 +458,9 @@ fn render_detail_pane(frame: &mut Frame, area: Rect, app: &App) {
                 }
                 lines.push(Line::from(""));
                 let hint = if app.playlist_is_dirty() {
-                    "Enter load tracks · R rename · S save changes · D discard"
+                    "Enter load tracks · d download all · R rename · S save · D discard"
                 } else {
-                    "Enter load tracks · N new · R rename"
+                    "Enter load tracks · d download all · N new · R rename"
                 };
                 lines.push(Line::from(Span::styled(
                     hint,
@@ -682,7 +689,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled(" [r] ", Style::default().fg(YELLOW)),
         Span::raw(match app.repeat {
             RepeatMode::Off => "repeat",
-            RepeatMode::All => "repeat ALL",
+            RepeatMode::All => "repeat LIST",
             RepeatMode::One => "repeat ONE",
         }),
         Span::styled(" [t] ", Style::default().fg(YELLOW)),
@@ -831,7 +838,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::from("  l           Lyrics tab"),
         Line::from("  Q           Queue tab"),
         Line::from("  o           Offline / downloads tab"),
-        Line::from("  d           Download selected track"),
+        Line::from("  d           Download selected track (whole playlist on Playlists tab)"),
         Line::from("  D           Delete offline copy (Offline tab)"),
         Line::from("  J / K       Move queue track down / up (Queue tab)"),
         Line::from("  Enter       Play queue track / jump to selected lyric"),
@@ -843,7 +850,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::from("  S           Save all staged playlist changes at once"),
         Line::from("  D           Discard staged playlist changes"),
         Line::from("  s           Shuffle on / off"),
-        Line::from("  r           Repeat off / all / one (also MPRIS Loop Status)"),
+        Line::from("  r           Repeat off / playlist / one (shuffle-aware; MPRIS Loop Status)"),
         Line::from("  c           Show / hide cover art (falls back to text when unsupported)"),
         Line::from("  a           Lyrics follow playback on / off"),
         Line::from("  t           Translate lyrics to English (lyrics tab)"),

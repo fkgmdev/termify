@@ -17,12 +17,12 @@ or decisions change.
 | UI | `ratatui` 0.30 + `crossterm` 0.29 |
 | Runtime | `tokio` (multi-thread), single `mpsc` Action channel into `App` |
 | Audio backend | librespot-playback with rodio/ALSA (`SoftMixer` for volume) |
-| Offline | Download through the authenticated librespot session (`librespot-audio`/`librespot-metadata`), store decrypted Ogg Vorbis/MP3 in `cache/downloads`, index in `downloads.json`; play saved files with rodio, prefer them when online, and support `--offline` with no login/network |
+| Offline | Download through the authenticated librespot session (`librespot-audio`/`librespot-metadata`), store decrypted Ogg Vorbis/MP3 in `cache/downloads`, index in `downloads.json`; `d` saves one track or a whole playlist from the Playlists tab; play saved files with rodio, prefer them when online, and support `--offline` with no login/network |
 | Lyrics | LRCLIB (line-synced, no key) primary, original-language entry preferred; English translation via Google's public endpoint on demand. Cached in-memory by track URI and persisted to `lyrics.json` (including "no lyrics" results). Genius unsynced fallback deferred to polish |
 | Cover art | Album images from the Web API, rendered with `ratatui-image` 11.1.0 (Kitty/iTerm2/Sixel with halfblocks fallback); cover scales with the terminal up to 44x22 cells while reserving metadata rows, and rebuilds its protocol on resize without refetching; fetch/decode failures degrade to text placeholders; `TERMIFY_NO_ART`/`TERM=dumb` disable art. URL also published as MPRIS `mpris:artUrl` |
 | Config/cache | Platform-specific `#[cfg]` blocks: Linux XDG (`~/.config/termify`, `~/.cache/termify`), macOS (`~/Library/Application Support/termify`, `~/Library/Caches/termify`), Windows (`%APPDATA%\termify`, `%LOCALAPPDATA%\termify\cache`) |
 | Redirect URI | `http://127.0.0.1:8989/callback` for PKCE; device pairing uses `https://spotify.com/pair` |
-| Desktop integration | MPRIS via `mpris-server` 0.11 (`Player` builder); media keys are routed by the DE, not grabbed directly. Shuffle and repeat (`Loop_Status`) are published and controllable from the DE |
+| Desktop integration | MPRIS via `mpris-server` 0.11 (`Player` builder); media keys are routed by the DE, not grabbed directly. Shuffle and repeat (`Loop_Status`) are published and controllable from the DE; repeat-all restarts the playlist in the current shuffle order |
 
 Lyrics note: Spotify's Web API has **no** lyrics endpoint. The internal `color-lyrics`
 endpoint is deliberately out of scope for v1 (unofficial, needs an account cookie).
@@ -113,7 +113,9 @@ streaming tracks and from the rodio sink for downloaded files.
 - [x] Unit tests for LRC parsing, active-line tracking, scroll offsets, script
       detection, translation parsing, cache round-trips, queue reordering,
       lyric-line seek/key handling, MPRIS state/action handling, playlist edit
-      prompts/picker and arrow-fragment normalization, plus offline index/key tests (57 passing)
+      prompts/picker and arrow-fragment normalization, offline index/key tests,
+      playlist download progress, shuffled playlist repeat and Playlists-tab
+      navigation (61 passing)
 - [x] Fixed LRCLIB camelCase field mapping (`syncedLyrics`/`plainLyrics`) that
       made every lookup report "no lyrics"; verified with "Knee Socks"
 - [x] Prefer original-language LRCLIB entry when `/api/get` returns a translation
@@ -167,9 +169,13 @@ streaming tracks and from the rodio sink for downloaded files.
 - [x] Windows Terminal / Kitty navigation: wait for the image probe thread to
       restore raw mode before re-entering it, and normalize `ESC [ A/B/C/D` key
       fragments
-- [x] Repeat mode (`r`): off → all → one, with end-of-track behaviour for each
-      mode (stop at the end, wrap to the first track, or restart the current
-      track) and the same state exposed through MPRIS `Loop_Status`
+- [x] Repeat mode (`r`): off → playlist → one. At the end of an open playlist,
+      playlist repeat explicitly restarts it from the first entry of the current
+      playback order, including shuffled orders; other lists wrap to their first
+      track. Repeat-one restarts the current track, and the same state is exposed
+      through MPRIS `Loop_Status`
+- [x] Playlists-tab `j/k`, `g/G` and `PgUp/PgDn` now navigate the playlist list
+      even while the track list is empty (the left pane renders playlists there)
 - [x] Larger adaptive cover art: scales with terminal size while reserving seven
       metadata rows, uses `Resize::Scale` so the 300px source does not cap the
       drawn size, and re-encodes on `Action::Resize`
@@ -188,6 +194,9 @@ streaming tracks and from the rodio sink for downloaded files.
 - [x] Offline tab (`o`) lists saved tracks; `d` downloads the selected track,
       `D` deletes it, and downloaded copies are preferred automatically from any
       tab with a `↓` marker in other lists
+- [x] On the Playlists tab, `d` fetches the selected playlist's saved tracks and
+      downloads all of them sequentially, skipping saved/in-flight tracks and
+      duplicates; the list shows progress and a final saved/failed summary
 - [x] `--offline` starts with no config/login/network and plays saved files with
       a dedicated rodio sink; pause/seek/volume/repeat/end-of-track and MPRIS
       controls route to that backend
