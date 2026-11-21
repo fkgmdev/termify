@@ -238,7 +238,10 @@ immediately instead of being retried. termify never assumes a failed key means
 the file is unencrypted. The key is requested before the CDN stream is opened so
 failed attempts cannot leave a download task running, and each file is checked
 with the same decoder used for playback before it is indexed — not just a magic
-header. This prevents the old "skipping junk" / corrupt audio playback.
+header. This prevents the old "skipping junk" / corrupt audio playback. The
+librespot CDN timeout is raised from its 8-second default to 120 seconds at
+startup, and transient timeouts retry the whole download up to three times before
+a lower-quality format is tried.
 
 If the preferred format fails, termify now tries the remaining supported
 formats before giving up, so a key rejection or bad variant for one file does

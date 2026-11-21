@@ -56,6 +56,9 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    // Must run before any librespot player/decoder initialises the process-wide
+    // AudioFetchParams with its 8-second default timeout.
+    offline::configure_audio_fetch();
     let paths = Paths::discover()?;
 
     // Demo and offline modes bypass config validation so the TUI shell can be

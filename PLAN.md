@@ -244,10 +244,15 @@ streaming tracks and from the rodio sink for downloaded files.
       rejection, header validation, audio-key retry setup, download
       progress/errors, tab loading, offline mode, deletion, offline playlist
       playback, playlist cover selection, persistent current-track art and download
-      failure diagnostics (74 passing)
+      failure diagnostics, transient-timeout retry and explicit-format header validation
+      (75 passing)
 - [x] Fixed a real download failure where `.part` files were validated against the
       wrong container rules because their extension is `part`, not `ogg`/`mp3`;
       header validation now takes an explicit format hint and regression-tested it
+- [x] Fixed a real bulk-download timeout after ~10 tracks: librespot's 8-second
+      default fetch timeout is now replaced at startup (before any decoder locks in
+      defaults) with 120 seconds, transient CDN timeouts retry the whole format,
+      and stream-loader controllers close on every exit path via a drop guard
 - [ ] Verify one real Premium download and `--offline` playback with user credentials
 
 ## Deferred (not in v1)

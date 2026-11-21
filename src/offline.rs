@@ -35,6 +35,9 @@ const SPOTIFY_OGG_HEADER_END: u64 = 0xa7;
 /// out and retry with backoff instead of writing a file that cannot be decoded.
 const KEY_REQUEST_DELAY: Duration = Duration::from_millis(250);
 const KEY_REQUEST_ATTEMPTS: u32 = 4;
+/// CDN reads can time out when Spotify throttles a long playlist download.
+/// Retry the whole format once or twice before falling back to a lower bitrate.
+const DOWNLOAD_ATTEMPTS: u32 = 3;
 
 /// A track stored on disk, with just enough metadata for the Downloads view.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -446,6 +449,18 @@ fn bytes_per_second(format: AudioFileFormat) -> usize {
     }
 }
 
+/// A download error worth retrying: CDN timeouts, connection resets, and
+/// throttling. Container/permission failures will fail identically on retry.
+fn download_error_is_transient(error: &anyhow::Error) -> bool {
+    let mut chain = error.chain().map(|e| e.to_string()).collect::<Vec<_>>().join(" ");
+    chain.make_ascii_lowercase();
+    chain.contains("timeout")
+        || chain.contains("timed out")
+        || chain.contains("deadline expired")
+        || chain.contains("connection")
+        || chain.contains("rate limit")
+}
+
 /// True for key-service replies that are entitlement/compatibility failures
 /// rather than transient rate limits. Retrying these only burns time.
 fn audio_key_error_is_permanent(error: &str) -> bool {
@@ -525,6 +540,18 @@ fn record_download_failure(dir: &Path, track: &Track, error: &anyhow::Error) {
     let _ = file.write_all(line.as_bytes());
 }
 
+/// Install tuned librespot fetch parameters once, before any player or decoder
+/// can lock in the defaults with `AudioFetchParams::get()`. The default 8-second
+/// timeout is too short for bulk downloads when Spotify's CDN slows down.
+pub fn configure_audio_fetch() {
+    // `AudioFetchParams` is a process-wide OnceLock; only the first call wins.
+    let _ = AudioFetchParams::set(AudioFetchParams {
+        minimum_download_size: 256 * 1024,
+        download_timeout: Duration::from_secs(120),
+        ..Default::default()
+    });
+}
+
 /// Download one format into a temporary file and commit it only after its
 /// container header has been verified.
 async fn download_format(
@@ -553,6 +580,15 @@ async fn download_format(
         .get_stream_loader_controller()
         .context("starting audio download")?;
     controller.set_random_access_mode();
+    // Ensure the background loader is stopped on every exit path, including
+    // a timeout while reading the OGG header or an error in the blocking task.
+    struct CloseOnDrop(librespot_audio::StreamLoaderController);
+    impl Drop for CloseOnDrop {
+        fn drop(&mut self) {
+            self.0.close();
+        }
+    }
+    let _controller = CloseOnDrop(controller);
     let mut decrypted = AudioDecrypt::new(Some(key), encrypted);
     if AudioFiles::is_ogg_vorbis(format) {
         // Read rather than seek so the AES-CTR stream stays aligned even if a
@@ -592,7 +628,6 @@ async fn download_format(
     })
     .await
     .context("download task failed");
-    controller.close();
 
     let written = match write_result {
         Ok(Ok(bytes)) => bytes,
@@ -651,14 +686,8 @@ async fn download_format(
 /// format fails (for example, a key service rejection), lower-quality formats
 /// are tried before giving up so one bad variant cannot block offline listening.
 pub async fn download_track(session: &Session, track: &Track, dir: &Path) -> Result<DownloadEntry> {
-    // `AudioFetchParams` is a process-wide OnceLock, so only the first call has
-    // an effect; later downloads simply reuse the tuned values.
-    let _ = AudioFetchParams::set(AudioFetchParams {
-        minimum_download_size: 256 * 1024,
-        download_timeout: Duration::from_secs(60),
-        ..Default::default()
-    });
-
+    // Fetch params are installed once at startup (see `configure_audio_fetch`)
+    // before any player or decoder can lock in the defaults.
     let uri =
         SpotifyUri::from_uri(&track.uri).map_err(|err| anyhow!("invalid Spotify URI: {err}"))?;
     let requested_id: SpotifyId = (&uri)
@@ -683,7 +712,29 @@ pub async fn download_track(session: &Session, track: &Track, dir: &Path) -> Res
             continue;
         };
         attempted = true;
-        match download_format(session, track_id, file_id, format, track, dir).await {
+        let mut format_result = None;
+        for attempt in 1..=DOWNLOAD_ATTEMPTS {
+            match download_format(session, track_id, file_id, format, track, dir).await {
+                Ok(entry) => {
+                    format_result = Some(Ok(entry));
+                    break;
+                }
+                Err(err) => {
+                    let retryable = download_error_is_transient(&err);
+                    if retryable && attempt < DOWNLOAD_ATTEMPTS {
+                        tracing::warn!(
+                            "Transient download failure for {} as {format:?} (attempt {attempt}/{DOWNLOAD_ATTEMPTS}): {err:#}; retrying",
+                            track.uri
+                        );
+                        sleep(Duration::from_secs(attempt as u64)).await;
+                        continue;
+                    }
+                    format_result = Some(Err(err));
+                    break;
+                }
+            }
+        }
+        match format_result.expect("download loop always produces a result") {
             Ok(entry) => return Ok(entry),
             Err(err) => {
                 tracing::warn!("Could not download {} as {format:?}: {err:#}", track.uri);
@@ -852,6 +903,22 @@ mod tests {
         assert!(contents.contains("outer failure"));
         assert!(!contents.contains("access_token"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transient_download_errors_are_recognised() {
+        assert!(download_error_is_transient(&anyhow!(
+            "skipping header: Deadline expired before operation could complete"
+        )));
+        assert!(download_error_is_transient(
+            &anyhow!("connection reset").context("writing audio")
+        ));
+        assert!(!download_error_is_transient(&anyhow!(
+            "invalid container header"
+        )));
+        assert!(!download_error_is_transient(&anyhow!(
+            "Spotify refused the audio key"
+        )));
     }
 
     #[test]
