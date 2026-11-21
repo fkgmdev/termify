@@ -17,10 +17,10 @@ or decisions change.
 | UI | `ratatui` 0.30 + `crossterm` 0.29 |
 | Runtime | `tokio` (multi-thread), single `mpsc` Action channel into `App` |
 | Audio backend | librespot-playback with rodio/ALSA (`SoftMixer` for volume) |
-| Offline | Download through the authenticated librespot session (`librespot-audio`/`librespot-metadata`), store decrypted Ogg Vorbis/MP3 in `cache/downloads`, index in v2 `downloads.json` with playlist memberships; `d` saves one track or a whole playlist from the Playlists tab; Offline tab can replay a whole saved playlist, single tracks play with rodio, saved copies are preferred online, and `--offline` works with no login/network. Audio keys are retried with backoff, never assumed missing, and files are header-checked before indexing |
+| Offline | Download through the authenticated librespot session (`librespot-audio`/`librespot-metadata`), store decrypted Ogg Vorbis/MP3 in `cache/downloads`, index in v2 `downloads.json` with playlist memberships; `d` saves one track or a whole playlist from the Playlists tab; Offline tab can replay a whole saved playlist, single tracks play with rodio, saved copies are preferred online, and `--offline` works with no login/network. Audio keys are retried with backoff, never assumed missing, and files are header-checked before indexing; lower-quality formats are tried before failure, and full error chains go to `downloads/download-errors.log` plus a short Offline-tab history. A `termify download <uri>` CLI subcommand prints the full chain without the TUI |
 | Lyrics | LRCLIB (line-synced, no key) primary, original-language entry preferred; English translation via Google's public endpoint on demand. Cached in-memory by track URI and persisted to `lyrics.json` (including "no lyrics" results). Genius unsynced fallback deferred to polish |
 | Cover art | Album and playlist images from the Web API, rendered with `ratatui-image` 11.1.0 (Kitty/iTerm2/Sixel with halfblocks fallback); the current song's cover has an 8x4 footer thumbnail on every tab and a large adaptive pane in Lyrics/Queue/Details (up to 44x22 cells), with protocols rebuilt on resize without refetching. Fetch/decode failures degrade to text placeholders; `TERMIFY_NO_ART`/`TERM=dumb` disable all art areas. Playlist-tab selection uses a separate cover state so it never replaces the current song's art; current album URL is published as MPRIS `mpris:artUrl` |
-| Config/cache | Platform-specific `#[cfg]` blocks: Linux XDG (`~/.config/termify`, `~/.cache/termify`), macOS (`~/Library/Application Support/termify`, `~/Library/Caches/termify`), Windows (`%APPDATA%\termify`, `%LOCALAPPDATA%\termify\cache`) |
+| Config/cache | Platform-specific `#[cfg]` blocks: Linux XDG (`~/.config/termify`, `~/.cache/termify`), macOS (`~/Library/Application Support/termify`, `~/Library/Caches/termify`), Windows (`%APPDATA%\termify`, `%LOCALAPPDATA%\termify`) |
 | Redirect URI | `http://127.0.0.1:8989/callback` for PKCE; device pairing uses `https://spotify.com/pair` |
 | Desktop integration | `os_media.rs` dispatches to `mpris-server` 0.11 on Linux/BSD and `souvlaki` 0.9.3 on macOS/Windows (Now Playing / SMTC). Media keys are routed by the OS, not grabbed directly. Shuffle and repeat (`Loop_Status`) are published/controllable on supported platforms; repeat-all restarts the playlist in the current shuffle order. Windows uses a hidden Win32 message window because SMTC requires an HWND |
 
@@ -227,13 +227,18 @@ streaming tracks and from the rodio sink for downloaded files.
       four attempts with exponential backoff for transient key failures, and a
       container-header check before a file is indexed; bad `.part` files are
       removed
+- [x] Download failures fall back through lower-quality formats, use the track ID
+      resolved by Spotify metadata (important for alternatives), and append full
+      error chains to `download-errors.log`; the Offline tab shows the last five
+      failures and `termify download <uri>` prints the chain without the TUI
 - [x] `--offline` starts with no config/login/network and plays saved files with
       a dedicated rodio sink; pause/seek/volume/repeat/end-of-track and MPRIS
       controls route to that backend
 - [x] Unit tests cover filename safety, v1/v2 index persistence/pruning, version
       rejection, header validation, audio-key retry setup, download
       progress/errors, tab loading, offline mode, deletion, offline playlist
-      playback, playlist cover selection and persistent current-track art (69 passing)
+      playback, playlist cover selection, persistent current-track art and download
+      failure diagnostics (71 passing)
 - [ ] Verify one real Premium download and `--offline` playback with user credentials
 
 ## Deferred (not in v1)

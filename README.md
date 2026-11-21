@@ -84,7 +84,7 @@ Not in v1: Spotify Connect, daemon mode, audio visualization.
    | --- | --- | --- |
    | Linux | `$XDG_CONFIG_HOME/termify/config.toml` (default `~/.config/termify/config.toml`) | `$XDG_CACHE_HOME/termify` (default `~/.cache/termify`) |
    | macOS | `~/Library/Application Support/termify/config.toml` | `~/Library/Caches/termify` |
-   | Windows | `%APPDATA%\termify\config.toml` | `%LOCALAPPDATA%\termify\cache` |
+   | Windows | `%APPDATA%\termify\config.toml` | `%LOCALAPPDATA%\termify` |
 
    ```toml
    client_id = "your-client-id-here"
@@ -122,6 +122,7 @@ termify --offline       # play only downloaded tracks, no login or network
 termify auth            # force a fresh Web API login (reuse playback token)
 termify search <query>  # search tracks and print results
 termify play <uri>      # smoke test: play one track locally until Ctrl-C
+termify download <uri>  # save one track and print the full error chain on failure
 termify --relogin       # force re-login for both Web API and playback
 ```
 
@@ -196,12 +197,12 @@ Setup table:
 
 - Linux: `$XDG_CACHE_HOME/termify/downloads` (default `~/.cache/termify/downloads`)
 - macOS: `~/Library/Caches/termify/downloads`
-- Windows: `%LOCALAPPDATA%\termify\cache\downloads`
+- Windows: `%LOCALAPPDATA%\termify\downloads`
 
-The v2 index is `downloads.json` in the parent cache directory
-(`~/.cache/termify/downloads.json`, for example). It maps Spotify URIs to hashed
-`.ogg`/`.mp3` filenames and records which playlists each track belongs to. Writes
-are atomic, names are validated when the index is read, and stale entries
+The v2 index is `downloads.json` inside that `downloads/` folder
+(`~/.cache/termify/downloads/downloads.json`, for example). It maps Spotify URIs
+to hashed `.ogg`/`.mp3` filenames and records which playlists each track belongs
+to. Writes are atomic, names are validated when the index is read, and stale entries
 (missing files or invalid audio headers) disappear on the next launch without
 touching your other audio files.
 
@@ -236,6 +237,14 @@ spaced out and retried with backoff on transient failures such as
 the file is unencrypted. Files whose container header is invalid are deleted
 instead of being indexed, which prevents the old "skipping junk" / corrupt audio
 playback.
+
+If the preferred format fails, termify now tries the remaining supported
+formats before giving up, so a key rejection or bad variant for one file does
+not necessarily block the track. Every failed attempt is appended to
+`download-errors.log` beside `downloads.json`, and the Offline tab shows a short
+"Recent download errors" section. For a one-off diagnosis outside the TUI, run
+`termify download <uri>`; it prints the full error chain and the log path.
+The log contains track names/URIs and error messages only — never tokens.
 
 On the Playlists tab, `d` fetches the selected playlist's saved tracks and
 downloads all of them sequentially, with a 400 ms pause between tracks to avoid
@@ -413,10 +422,13 @@ on a 250 ms tick; offline progress comes from the rodio sink.
   missing key means the downloaded bytes are still encrypted, so termify no
   longer writes them. Key requests are now spaced out, retried up to four times
   with exponential backoff, and verified by container header before indexing.
-  If a bulk download still hits Spotify's key-service rate limit, wait a minute
-  and retry; `termify play spotify:track:<id>` is the quick check for account/key
-  delivery problems. Existing files with invalid headers are dropped from the
-  Offline tab on the next launch.
+  termify also falls back to lower-quality formats before reporting failure.
+  If every track fails, check that the Spotify account is Premium and that
+  `termify play spotify:track:<id>` streams normally; the desktop pairing token
+  must be refreshed with `termify --relogin` after switching accounts. Run
+  `termify download spotify:track:<id>` to print the exact failing stage.
+  Existing files with invalid headers are dropped from the Offline tab on the
+  next launch.
 - **vergen pin**: `librespot-core 0.8.0` depends on `vergen-gitcl 1.0.8`, which
   resolves to an incompatible `vergen 9.1.0`. `Cargo.lock` pins `vergen 9.0.6`.
   Do not delete `Cargo.lock` without re-applying `cargo update -p vergen --precise 9.0.6`.
@@ -424,9 +436,11 @@ on a 250 ms tick; offline progress comes from the rodio sink.
 - **Offline downloads**: saved audio is plain, unencrypted Ogg/MP3 in the cache
   directory's `downloads/` folder (see "Where downloads are saved" above). A
   failed download leaves no `.part` file, and an unreadable or outdated
-  `downloads.json` is ignored rather than deleting audio. If `termify --offline`
-  reports no tracks, check that folder; deleting its files also removes the
-  corresponding entries on the next launch.
+  `downloads.json` is ignored rather than deleting audio. Failed attempts are
+  appended to `download-errors.log` in the same folder and summarized in the
+  Offline tab; share that log (it contains no tokens) when reporting a problem.
+  If `termify --offline` reports no tracks, check that folder; deleting its files
+  also removes the corresponding entries on the next launch.
 - **Arrow keys in Kitty / Windows Terminal**: the cover-art probe signals
   completion before its background thread has restored the terminal, so termify
   waits for raw mode to be disabled before re-entering it. It also reassembles

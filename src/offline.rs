@@ -6,14 +6,15 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
+use chrono::Local;
 use librespot_audio::{AudioDecrypt, AudioFetchParams, AudioFile};
 use librespot_core::audio_key::AudioKey;
-use librespot_core::{Session, SpotifyId, SpotifyUri};
+use librespot_core::{FileId, Session, SpotifyId, SpotifyUri};
 use librespot_metadata::audio::{AudioFileFormat, AudioFiles, AudioItem};
 use rodio::{Decoder, OutputStream, OutputStreamBuilder, Sink};
 use serde::{Deserialize, Serialize};
@@ -26,6 +27,8 @@ use crate::ui::Track;
 const INDEX_VERSION: u8 = 2;
 const LEGACY_INDEX_VERSION: u8 = 1;
 const INDEX_FILE: &str = "downloads.json";
+/// Append-only record of failed downloads, with no token or credential data.
+const ERROR_LOG_FILE: &str = "download-errors.log";
 /// Spotify puts a 167-byte normalisation header before Ogg Vorbis audio.
 const SPOTIFY_OGG_HEADER_END: u64 = 0xa7;
 /// Audio-key requests can fail transiently during bulk downloads. Space them
@@ -459,48 +462,67 @@ async fn request_audio_key(
     ))
 }
 
-/// Download a track through the authenticated librespot session and write a
-/// plain (decrypted) audio file into `dir`. Ogg files have Spotify's extra
-/// normalisation header removed so generic decoders can read them.
-///
-/// The actual copy runs on a blocking thread because `AudioFile::read` waits
-/// on the background downloader rather than yielding to tokio.
-pub async fn download_track(session: &Session, track: &Track, dir: &Path) -> Result<DownloadEntry> {
-    let _ = AudioFetchParams::set(AudioFetchParams {
-        minimum_download_size: 256 * 1024,
-        download_timeout: Duration::from_secs(60),
-        ..Default::default()
-    });
+/// Path of the append-only download failure log.
+pub fn download_error_log(dir: &Path) -> PathBuf {
+    dir.join(ERROR_LOG_FILE)
+}
 
-    let uri =
-        SpotifyUri::from_uri(&track.uri).map_err(|err| anyhow!("invalid Spotify URI: {err}"))?;
-    let track_id: SpotifyId = (&uri)
-        .try_into()
-        .map_err(|err| anyhow!("invalid track ID: {err}"))?;
-    let item = AudioItem::get_file(session, uri.clone())
-        .await
-        .map_err(|err| anyhow!("track is not available for download: {err}"))?;
-    let (format, file_id) = PREFERRED_FORMATS
-        .into_iter()
-        .find_map(|format| item.files.get(&format).copied().map(|id| (format, id)))
-        .ok_or_else(|| anyhow!("track has no supported download format"))?;
+/// Record a full error chain without touching token caches. Failures are easy
+/// to miss in the TUI status bar, especially during bulk downloads, so keep a
+/// durable record next to the offline files.
+fn record_download_failure(dir: &Path, track: &Track, error: &anyhow::Error) {
+    let stamp = Local::now().format("%Y-%m-%d %H:%M:%S");
+    let line = format!(
+        "[{stamp}] {} ({}) — {} / {}: {error:#}\n",
+        track.title, track.uri, track.artist, track.album
+    );
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(download_error_log(dir))
+    else {
+        return;
+    };
+    let _ = file.write_all(line.as_bytes());
+}
 
+/// Download one format into a temporary file and commit it only after its
+/// container header has been verified.
+async fn download_format(
+    session: &Session,
+    track_id: SpotifyId,
+    file_id: FileId,
+    format: AudioFileFormat,
+    track: &Track,
+    dir: &Path,
+) -> Result<DownloadEntry> {
+    let label = format!("{format:?}");
     let encrypted = AudioFile::open(session, file_id, bytes_per_second(format))
         .await
-        .map_err(|err| anyhow!("could not open audio file: {err}"))?;
+        .with_context(|| format!("opening {label} audio"))?;
     let controller = encrypted
         .get_stream_loader_controller()
-        .map_err(|err| anyhow!("could not start audio download: {err}"))?;
+        .context("starting audio download")?;
     controller.set_random_access_mode();
 
     // A missing key means the bytes we would write are still encrypted. The
     // old fallback treated them as unencrypted audio, which produced files full
     // of junk that decoders could not play. Retry transient key-service failures
     // instead and never index an unverifiable file.
-    let key = request_audio_key(session, track_id, file_id, &track.uri).await?;
+    let key = request_audio_key(session, track_id, file_id, &track.uri)
+        .await
+        .with_context(|| format!("requesting {label} audio key"))?;
     let mut decrypted = AudioDecrypt::new(Some(key), encrypted);
     if AudioFiles::is_ogg_vorbis(format) {
-        decrypted.seek(SeekFrom::Start(SPOTIFY_OGG_HEADER_END))?;
+        // Read rather than seek so the AES-CTR stream stays aligned even if a
+        // future librespot version changes how `AudioDecrypt::seek` works.
+        let mut header = [0u8; SPOTIFY_OGG_HEADER_END as usize];
+        decrypted
+            .read_exact(&mut header)
+            .context("skipping Spotify OGG normalisation header")?;
     }
 
     let extension = if AudioFiles::is_mp3(format) {
@@ -508,8 +530,9 @@ pub async fn download_track(session: &Session, track: &Track, dir: &Path) -> Res
     } else {
         "ogg"
     };
-    let final_path = dir.join(format!("{}.{extension}", file_stem(&track.uri)));
-    let tmp_path = dir.join(format!("{}.{extension}.part", file_stem(&track.uri)));
+    let stem = file_stem(&track.uri);
+    let final_path = dir.join(format!("{stem}.{extension}"));
+    let tmp_path = dir.join(format!("{stem}.{extension}.part"));
     std::fs::create_dir_all(dir)
         .with_context(|| format!("creating downloads directory {}", dir.display()))?;
 
@@ -537,7 +560,7 @@ pub async fn download_track(session: &Session, track: &Track, dir: &Path) -> Res
         Ok(Ok(bytes)) => bytes,
         Ok(Err(err)) => {
             let _ = std::fs::remove_file(&tmp_path);
-            return Err(err);
+            return Err(err).context("writing downloaded audio");
         }
         Err(err) => {
             let _ = std::fs::remove_file(&tmp_path);
@@ -572,6 +595,60 @@ pub async fn download_track(session: &Session, track: &Track, dir: &Path) -> Res
         size,
         downloaded_at: now_timestamp(),
     })
+}
+
+/// Download a track through the authenticated librespot session and write a
+/// plain (decrypted) audio file into `dir`. Ogg files have Spotify's extra
+/// normalisation header removed so generic decoders can read them.
+///
+/// The actual copy runs on a blocking thread because `AudioFile::read` waits
+/// on the background downloader rather than yielding to tokio. If the best
+/// format fails (for example, a key service rejection), lower-quality formats
+/// are tried before giving up so one bad variant cannot block offline listening.
+pub async fn download_track(session: &Session, track: &Track, dir: &Path) -> Result<DownloadEntry> {
+    // `AudioFetchParams` is a process-wide OnceLock, so only the first call has
+    // an effect; later downloads simply reuse the tuned values.
+    let _ = AudioFetchParams::set(AudioFetchParams {
+        minimum_download_size: 256 * 1024,
+        download_timeout: Duration::from_secs(60),
+        ..Default::default()
+    });
+
+    let uri =
+        SpotifyUri::from_uri(&track.uri).map_err(|err| anyhow!("invalid Spotify URI: {err}"))?;
+    let requested_id: SpotifyId = (&uri)
+        .try_into()
+        .map_err(|err| anyhow!("invalid track ID: {err}"))?;
+    let item = AudioItem::get_file(session, uri.clone())
+        .await
+        .context("track is not available for download")?;
+    // Metadata may resolve an alternative track ID; that is the ID the key
+    // service expects, not necessarily the URI the client started with.
+    let track_id: SpotifyId = (&item.track_id).try_into().unwrap_or(requested_id);
+
+    let mut last_error = None;
+    let mut attempted = false;
+    for format in PREFERRED_FORMATS {
+        let Some(file_id) = item.files.get(&format).copied() else {
+            continue;
+        };
+        attempted = true;
+        match download_format(session, track_id, file_id, format, track, dir).await {
+            Ok(entry) => return Ok(entry),
+            Err(err) => {
+                tracing::warn!("Could not download {} as {format:?}: {err:#}", track.uri);
+                last_error = Some(err.context(format!("{format:?} audio")));
+            }
+        }
+    }
+
+    let error = match last_error {
+        Some(err) => err.context("no supported audio format could be downloaded"),
+        None if attempted => anyhow!("track lists formats but none could be prepared"),
+        None => anyhow!("track has no supported download format"),
+    };
+    record_download_failure(dir, track, &error);
+    Err(error)
 }
 
 /// Current Unix timestamp, used for download index entries.
@@ -709,6 +786,21 @@ mod tests {
         let tracks = reopened.playlist_tracks("playlist-1");
         assert_eq!(tracks.len(), 1);
         assert_eq!(tracks[0].uri, second.track.uri);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failures_are_appended_to_the_download_error_log() {
+        let dir = temp_dir("error-log");
+        let track = entry("spotify:track:failed", "ogg").track;
+        let error = anyhow!("outer failure").context("inner failure");
+        record_download_failure(&dir, &track, &error);
+
+        let contents = std::fs::read_to_string(download_error_log(&dir)).expect("read error log");
+        assert!(contents.contains("spotify:track:failed"));
+        assert!(contents.contains("inner failure"));
+        assert!(contents.contains("outer failure"));
+        assert!(!contents.contains("access_token"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -235,6 +235,14 @@ impl PlaylistDraft {
     }
 }
 
+/// A recent download failure kept in memory so the Offline tab can show what
+/// went wrong even after the status bar has moved on.
+#[derive(Debug, Clone)]
+pub struct DownloadFailure {
+    pub track: String,
+    pub message: String,
+}
+
 /// Progress of a whole-playlist download. The URI set lets ordinary
 /// `DownloadFinished` actions update the playlist progress without adding a
 /// second download path.
@@ -431,6 +439,9 @@ pub struct App {
     pub downloading: HashSet<String>,
     /// Whole-playlist downloads currently in progress, keyed by playlist ID.
     pub playlist_downloads: HashMap<String, PlaylistDownload>,
+    /// Most recent download failures, newest first. The full error chain is
+    /// also appended to `downloads/download-errors.log`.
+    pub download_failures: Vec<DownloadFailure>,
     /// Rows rendered on the Offline tab (playlists, all tracks, then tracks).
     pub offline_items: Vec<OfflineItem>,
     /// Queue selected on the Offline tab, used by next/prev and repeat-all.
@@ -541,6 +552,7 @@ impl App {
             downloads: options.downloads.unwrap_or_else(DownloadStore::disabled),
             downloading: HashSet::new(),
             playlist_downloads: HashMap::new(),
+            download_failures: Vec::new(),
             offline_items: Vec::new(),
             offline_queue: None,
             offline_track_index: 0,
@@ -1317,26 +1329,35 @@ impl App {
             }
             Action::DownloadFinished { uri, result } => {
                 self.downloading.remove(&uri);
+                let label = self.track_label_for_uri(&uri);
                 let playlist = self
                     .playlist_downloads
                     .values_mut()
                     .find(|progress| progress.uris.contains(&uri));
                 if let Some(progress) = playlist {
                     progress.completed += 1;
+                    let mut failure = None;
                     match result {
                         Ok(entry) => {
                             let audio_path = self.downloads.audio_path(&entry);
-                            if self.downloads.insert(entry).is_err() {
+                            if let Err(err) = self.downloads.insert(entry) {
                                 let _ = std::fs::remove_file(audio_path);
                                 progress.failed += 1;
+                                failure = Some(format!("Could not index download: {err:#}"));
                             }
                         }
-                        Err(_) => progress.failed += 1,
+                        Err(err) => {
+                            progress.failed += 1;
+                            failure = Some(err);
+                        }
                     }
                     let name = progress.name.clone();
                     let total = progress.total;
                     let completed = progress.completed;
                     let failed = progress.failed;
+                    if let Some(message) = failure {
+                        self.record_download_failure(label, message);
+                    }
                     self.status = if completed >= total {
                         format!(
                             "Finished playlist '{name}': {} saved, {failed} failed",
@@ -1354,12 +1375,19 @@ impl App {
                             let audio_path = self.downloads.audio_path(&entry);
                             if let Err(err) = self.downloads.insert(entry) {
                                 let _ = std::fs::remove_file(audio_path);
+                                self.record_download_failure(
+                                    label,
+                                    format!("Could not index download: {err:#}"),
+                                );
                                 self.set_error(format!("Could not index download: {err:#}"));
                             } else {
                                 self.status = format!("Downloaded '{title}' for offline listening");
                             }
                         }
-                        Err(err) => self.set_error(format!("Download failed: {err}")),
+                        Err(err) => {
+                            self.record_download_failure(label, err.clone());
+                            self.set_error(format!("Download failed: {err}"));
+                        }
                     }
                 }
             }
@@ -1400,11 +1428,14 @@ impl App {
             } => {
                 self.playlist_downloads.remove(&id);
                 if let Some(message) = error {
+                    self.record_download_failure(name, message.clone());
                     self.set_error(message);
                     return Ok(());
                 }
                 if let Err(err) = self.downloads.insert_playlist(&id, &name, &members) {
-                    self.set_error(format!("Could not save offline playlist: {err:#}"));
+                    let message = format!("Could not save offline playlist: {err:#}");
+                    self.record_download_failure(name, message.clone());
+                    self.set_error(message);
                     return Ok(());
                 }
                 if self.tab == Tab::Downloads {
@@ -1556,6 +1587,37 @@ impl App {
         self.loading = false;
         self.error = Some(message.clone());
         self.status = format!("Error: {message}");
+    }
+
+    /// Human-readable title for an in-flight download URI.
+    fn track_label_for_uri(&self, uri: &str) -> String {
+        self.tracks
+            .iter()
+            .find(|track| track.uri == uri)
+            .or_else(|| self.downloads.get(uri).map(|entry| &entry.track))
+            .map(|track| format!("{} — {}", track.title, track.artist))
+            .unwrap_or_else(|| uri.to_string())
+    }
+
+    /// Keep a short failure history in the UI while the full chain is logged
+    /// to disk by `offline::download_track`.
+    fn record_download_failure(&mut self, track: String, message: String) {
+        tracing::error!("Download failed for {track}: {message}");
+        let short = message
+            .lines()
+            .next()
+            .unwrap_or("unknown error")
+            .chars()
+            .take(160)
+            .collect();
+        self.download_failures.insert(
+            0,
+            DownloadFailure {
+                track,
+                message: short,
+            },
+        );
+        self.download_failures.truncate(5);
     }
 
     pub fn active_playlist_draft(&self) -> Option<&PlaylistDraft> {
@@ -3855,6 +3917,8 @@ mod tests {
                 .as_deref()
                 .is_some_and(|e| e.contains("network down"))
         );
+        assert_eq!(app.download_failures.len(), 1);
+        assert!(app.download_failures[0].message.contains("network down"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

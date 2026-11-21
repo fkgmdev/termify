@@ -42,6 +42,8 @@ enum Command {
     Play { uri: String },
     /// Search tracks and print the results (useful for diagnosing API errors).
     Search { query: String },
+    /// Download one track and print the full error chain if it fails.
+    Download { uri: String },
 }
 
 #[tokio::main]
@@ -88,6 +90,42 @@ async fn main() -> Result<()> {
             local.play_uri(&uri)?;
             println!("Playing {uri} locally. Press Ctrl-C to stop.");
             tokio::signal::ctrl_c().await?;
+        }
+        Some(Command::Download { uri }) => {
+            let access_token = auth::playback_access_token(&paths, cli.relogin)
+                .await
+                .context("authenticating for local playback")?;
+            let local = player::LocalPlayer::connect(&access_token, &config, &paths)
+                .await
+                .context("connecting to Spotify for local playback")?;
+            let mut downloads = offline::DownloadStore::open(&paths.downloads_dir)?;
+            let track = crate::ui::Track {
+                title: uri.clone(),
+                artist: String::new(),
+                album: String::new(),
+                duration: std::time::Duration::ZERO,
+                uri: uri.clone(),
+                art_url: None,
+                added_by: None,
+            };
+            match offline::download_track(&local.session, &track, downloads.dir()).await {
+                Ok(entry) => {
+                    let size = entry.size;
+                    downloads.insert(entry)?;
+                    println!(
+                        "Downloaded {uri} ({size} bytes) to {}",
+                        downloads.dir().display()
+                    );
+                }
+                Err(err) => {
+                    eprintln!("Download failed for {uri}: {err:#}");
+                    eprintln!(
+                        "See {}",
+                        offline::download_error_log(downloads.dir()).display()
+                    );
+                    std::process::exit(1);
+                }
+            }
         }
         Some(Command::Search { query }) => {
             let spotify = auth::authenticated(&config, &paths, cli.relogin)

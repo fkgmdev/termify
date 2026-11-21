@@ -13,6 +13,7 @@ const YELLOW: Color = Color::Yellow;
 const GRAY: Color = Color::Gray;
 const DARK_GRAY: Color = Color::DarkGray;
 const WHITE: Color = Color::White;
+const RED: Color = Color::Red;
 
 pub fn render(frame: &mut Frame, app: &App) {
     let chunks = Layout::default()
@@ -546,7 +547,7 @@ fn render_detail_pane(frame: &mut Frame, area: Rect, app: &App) {
             .selected()
             .and_then(|i| app.offline_items.get(i))
             .cloned();
-        match selected {
+        let mut lines = match selected {
             Some(super::app::OfflineItem::Playlist { name, count, .. }) => {
                 let active = app
                     .offline_queue
@@ -638,7 +639,21 @@ fn render_detail_pane(frame: &mut Frame, area: Rect, app: &App) {
                 "No downloads — press d on a track to save it offline",
                 Style::default().fg(DARK_GRAY).italic(),
             ))],
+        };
+        if !app.download_failures.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Recent download errors (full chain in download-errors.log):",
+                Style::default().fg(RED),
+            )));
+            for failure in app.download_failures.iter().take(2) {
+                lines.push(Line::from(Span::styled(
+                    format!("{}: {}", failure.track, failure.message),
+                    Style::default().fg(DARK_GRAY),
+                )));
+            }
         }
+        lines
     } else {
         match app.list_state.selected().and_then(|i| app.tracks.get(i)) {
             Some(track) => vec![
@@ -1074,7 +1089,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
 mod tests {
     use super::*;
     use crate::art::{self, CoverArt};
-    use crate::ui::app::{App, Playlist, PromptKind, Track};
+    use crate::ui::app::{App, DownloadFailure, Playlist, PromptKind, Track};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui_image::picker::Picker;
@@ -1144,6 +1159,22 @@ mod tests {
         app.tab = Tab::Queue;
         terminal.draw(|frame| render(frame, &app)).unwrap();
         assert!(buffer_text(&terminal).contains("Queue"));
+    }
+
+    #[test]
+    fn downloads_tab_shows_recent_failures() {
+        let mut app = test_app();
+        app.tab = Tab::Downloads;
+        app.download_failures.push(DownloadFailure {
+            track: "Song — Artist".to_string(),
+            message: "audio key error".to_string(),
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Recent download errors"));
+        assert!(text.contains("audio key error"));
     }
 
     #[test]
