@@ -244,7 +244,10 @@ streaming tracks and from the rodio sink for downloaded files.
       rejection, header validation, audio-key retry setup, download
       progress/errors, tab loading, offline mode, deletion, offline playlist
       playback, playlist cover selection, persistent current-track art and download
-      failure diagnostics (73 passing)
+      failure diagnostics (74 passing)
+- [x] Fixed a real download failure where `.part` files were validated against the
+      wrong container rules because their extension is `part`, not `ogg`/`mp3`;
+      header validation now takes an explicit format hint and regression-tested it
 - [ ] Verify one real Premium download and `--offline` playback with user credentials
 
 ## Deferred (not in v1)

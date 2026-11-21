@@ -256,7 +256,11 @@ impl DownloadStore {
             .tracks
             .into_iter()
             .filter(|(_, entry)| {
-                safe_file_name(&entry.file) && audio_file_header_valid(&self.dir.join(&entry.file))
+                safe_file_name(&entry.file)
+                    && audio_file_header_valid(
+                        &self.dir.join(&entry.file),
+                        entry.file.ends_with(".ogg"),
+                    )
             })
             .collect();
         // Playlists can only contain tracks that survived the check above.
@@ -325,7 +329,10 @@ fn safe_file_name(name: &str) -> bool {
 /// Check the first bytes of a stored file before offering it for playback.
 /// A download decrypted with the wrong (or no) key starts with random bytes,
 /// which decoders report as a long stream of "skipping junk" warnings.
-fn audio_file_header_valid(path: &Path) -> bool {
+///
+/// `is_ogg` is explicit rather than inferred from the path extension because
+/// validation also runs on `.part` files, whose extension is always `part`.
+fn audio_file_header_valid(path: &Path, is_ogg: bool) -> bool {
     let Ok(mut file) = File::open(path) else {
         return false;
     };
@@ -333,7 +340,7 @@ fn audio_file_header_valid(path: &Path) -> bool {
     if file.read_exact(&mut header).is_err() {
         return false;
     }
-    if path.extension().and_then(|ext| ext.to_str()) == Some("ogg") {
+    if is_ogg {
         return header == *b"OggS";
     }
     // MP3 files either carry an ID3 tag or start with an MPEG frame sync.
@@ -605,10 +612,16 @@ async fn download_format(
     // A wrong key produces bytes that look like audio to the file system but
     // not to a decoder. Verify both the magic and the container structure before
     // indexing the file.
-    if !audio_file_header_valid(&tmp_path) || !audio_file_decodes(&tmp_path) {
+    if !audio_file_header_valid(&tmp_path, AudioFiles::is_ogg_vorbis(format)) {
         let _ = std::fs::remove_file(&tmp_path);
         return Err(anyhow!(
-            "downloaded audio failed integrity/decode check; audio key may be unavailable"
+            "downloaded audio has an invalid {label} container header; audio key may be unavailable"
+        ));
+    }
+    if !audio_file_decodes(&tmp_path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(anyhow!(
+            "downloaded {label} audio could not be decoded; audio key may be unavailable"
         ));
     }
     if let Err(err) = std::fs::rename(&tmp_path, &final_path) {
@@ -860,8 +873,21 @@ mod tests {
         let bogus_mp3 = dir.join("bogus.mp3");
         // This passes the 4-byte MP3 frame magic but is not decodable audio.
         std::fs::write(&bogus_mp3, [0xff, 0xfb, 0x90, 0x00]).expect("write bogus mp3");
-        assert!(audio_file_header_valid(&bogus_mp3));
+        assert!(audio_file_header_valid(&bogus_mp3, false));
         assert!(!audio_file_decodes(&bogus_mp3));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn header_check_uses_explicit_format_even_for_part_files() {
+        let dir = temp_dir("part-header");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let ogg_part = dir.join("track.ogg.part");
+        std::fs::write(&ogg_part, b"OggS data").expect("write ogg part");
+        // The extension is `part`, so inferring the format from the path would
+        // apply MP3 rules and reject valid Ogg data.
+        assert!(audio_file_header_valid(&ogg_part, true));
+        assert!(!audio_file_header_valid(&ogg_part, false));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -877,10 +903,10 @@ mod tests {
         std::fs::write(&bad, b"random bytes").expect("write bad mp3");
         std::fs::write(&id3, b"ID3\x04 data").expect("write id3");
         std::fs::write(&frame, [0xff, 0xfb, 0x90, 0x00]).expect("write frame");
-        assert!(audio_file_header_valid(&ogg));
-        assert!(!audio_file_header_valid(&bad));
-        assert!(audio_file_header_valid(&id3));
-        assert!(audio_file_header_valid(&frame));
+        assert!(audio_file_header_valid(&ogg, true));
+        assert!(!audio_file_header_valid(&bad, false));
+        assert!(audio_file_header_valid(&id3, false));
+        assert!(audio_file_header_valid(&frame, false));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
