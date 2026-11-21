@@ -17,6 +17,7 @@ or decisions change.
 | UI | `ratatui` 0.30 + `crossterm` 0.29 |
 | Runtime | `tokio` (multi-thread), single `mpsc` Action channel into `App` |
 | Audio backend | librespot-playback with rodio/ALSA (`SoftMixer` for volume) |
+| Offline | Download through the authenticated librespot session (`librespot-audio`/`librespot-metadata`), store decrypted Ogg Vorbis/MP3 in `cache/downloads`, index in `downloads.json`; play saved files with rodio, prefer them when online, and support `--offline` with no login/network |
 | Lyrics | LRCLIB (line-synced, no key) primary, original-language entry preferred; English translation via Google's public endpoint on demand. Cached in-memory by track URI and persisted to `lyrics.json` (including "no lyrics" results). Genius unsynced fallback deferred to polish |
 | Cover art | Album images from the Web API, rendered with `ratatui-image` 11.1.0 (Kitty/iTerm2/Sixel with halfblocks fallback); cover scales with the terminal up to 44x22 cells while reserving metadata rows, and rebuilds its protocol on resize without refetching; fetch/decode failures degrade to text placeholders; `TERMIFY_NO_ART`/`TERM=dumb` disable art. URL also published as MPRIS `mpris:artUrl` |
 | Config/cache | Platform-specific `#[cfg]` blocks: Linux XDG (`~/.config/termify`, `~/.cache/termify`), macOS (`~/Library/Application Support/termify`, `~/Library/Caches/termify`), Windows (`%APPDATA%\termify`, `%LOCALAPPDATA%\termify\cache`) |
@@ -38,6 +39,7 @@ src/
   auth.rs            # PKCE + device-pairing flows, token caches + refresh
   api.rs             # rspotify wrapper (search, playlist details/edits, liked songs)
   player.rs          # librespot Session + Player, playback controls, events
+  offline.rs         # download/decrypt audio, downloads.json index, rodio offline playback
   lyrics.rs          # LRCLIB client, LRC parser, language preference, translation, disk cache
   mpris.rs           # MPRIS D-Bus server: state snapshots + media-key Action callbacks
   ui/
@@ -51,7 +53,8 @@ Key events, MPRIS controls and background tasks (API calls, player events, lyric
 and cover-art fetches) all push `Action`s into one channel. The main loop owns `App`, applies
 actions, publishes an MPRIS state snapshot and redraws. The MPRIS `Player` is
 `!Send`, so it runs on a dedicated thread with a current-thread runtime.
-Playback progress is derived from a local clock anchored on a 250 ms tick.
+Playback progress is derived from a local clock anchored on a 250 ms tick for
+streaming tracks and from the rodio sink for downloaded files.
 
 ## Milestones
 
@@ -77,7 +80,7 @@ Playback progress is derived from a local clock anchored on a 250 ms tick.
 
 ### M1 — TUI shell (done)
 - [x] Layout: header with tabs, list pane, detail pane, now-playing footer
-- [x] Keybindings: `j/k`, `g/G`, `PgUp/PgDn`, `Enter`, `/`, `Space`, `n/p`, `←/→`, `+/-`, `l`, `Q`, `J/K`, `L`, `s`, `r`, `c`, `a`, `t`, `Tab`, `?`, `q`, `Ctrl-C`
+- [x] Keybindings: `j/k`, `g/G`, `PgUp/PgDn`, `Enter`, `/`, `Space`, `n/p`, `←/→`, `+/-`, `l`, `Q`, `o`, `d`, `D`, `J/K`, `L`, `s`, `r`, `c`, `a`, `t`, `Tab`, `?`, `q`, `Ctrl-C`
       (Tab/Shift+Tab use crossterm's `Tab`/`BackTab` codes)
 - [x] Config loading (client ID, redirect URI, volume, audio backend)
 - [x] Single `mpsc` Action channel with crossterm event stream + 250 ms tick
@@ -110,7 +113,7 @@ Playback progress is derived from a local clock anchored on a 250 ms tick.
 - [x] Unit tests for LRC parsing, active-line tracking, scroll offsets, script
       detection, translation parsing, cache round-trips, queue reordering,
       lyric-line seek/key handling, MPRIS state/action handling, playlist edit
-      prompts/picker and arrow-fragment normalization (49 passing)
+      prompts/picker and arrow-fragment normalization, plus offline index/key tests (57 passing)
 - [x] Fixed LRCLIB camelCase field mapping (`syncedLyrics`/`plainLyrics`) that
       made every lookup report "no lyrics"; verified with "Knee Socks"
 - [x] Prefer original-language LRCLIB entry when `/api/get` returns a translation
@@ -171,6 +174,26 @@ Playback progress is derived from a local clock anchored on a 250 ms tick.
       metadata rows, uses `Resize::Scale` so the 300px source does not cap the
       drawn size, and re-encodes on `Action::Resize`
 - [ ] Integration tests with a mock HTTP layer
+
+### M6 — Offline listening (implemented, live check pending)
+- [x] `offline.rs` fetches an `AudioItem`, selects the best available Ogg/MP3
+      format, requests the audio key, decrypts with `AudioDecrypt`, strips the
+      167-byte Spotify Ogg header and writes a playable file via a blocking task
+- [x] Downloads are written to a `.part` file and renamed only after a complete,
+      non-empty copy; failures clean up the partial file and report through the
+      normal `Action` channel
+- [x] `downloads.json` records track metadata, file name, size and timestamp with
+      atomic replacement; on load, corrupt/outdated indexes, missing files and
+      unsafe names are ignored without deleting audio
+- [x] Offline tab (`o`) lists saved tracks; `d` downloads the selected track,
+      `D` deletes it, and downloaded copies are preferred automatically from any
+      tab with a `↓` marker in other lists
+- [x] `--offline` starts with no config/login/network and plays saved files with
+      a dedicated rodio sink; pause/seek/volume/repeat/end-of-track and MPRIS
+      controls route to that backend
+- [x] Unit tests cover filename safety, index persistence/pruning, version
+      rejection, download progress/errors, tab loading, offline mode and deletion
+- [ ] Verify one real Premium download and `--offline` playback with user credentials
 
 ## Deferred (not in v1)
 

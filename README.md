@@ -4,7 +4,7 @@ A terminal Spotify client written in Rust that **plays audio locally** through
 librespot — it does not control the official Spotify app. Browse and search your
 library, play music, and read synced lyrics, all from the terminal.
 
-> Status: early development (milestones M0–M4 implemented, M5 polish underway).
+> Status: early development (M0–M6 implemented; M5 polish and M6 live verification underway).
 > See [PLAN.md](PLAN.md) for the full roadmap and current progress.
 
 ## Features (v1 scope)
@@ -21,6 +21,12 @@ library, play music, and read synced lyrics, all from the terminal.
   user who added each track (from Spotify's per-item `added_by` field)
 - Playback controls: play/pause, next/prev, seek, volume, end-of-track auto-advance
 - Repeat modes (`r`): off, all and one, also exposed as MPRIS `Loop_Status`
+- Offline downloads: save tracks through the librespot session, list them on the
+  Offline tab, play them with rodio, and launch with `--offline` without a login
+- Downloaded copies are preferred automatically, so selecting a saved track from
+  search or a playlist also plays from disk; delete copies with `D`
+- Persistent `downloads.json` index with hashed filenames, atomic writes and
+  stale-entry cleanup
 - Playlist shuffling with a saved playback order (`s`)
 - Queue tab showing the playback order, with track reordering (`J`/`K`) and
   play-from-queue (`Enter`)
@@ -44,7 +50,7 @@ Not in v1: Spotify Connect, daemon mode, audio visualization.
 
 ## Requirements
 
-- Rust 1.81+ (tested with 1.99)
+- Rust 1.85+ (tested with 1.99; librespot 0.8 uses edition 2024)
 - A **Spotify Premium** account
 - ALSA development headers and pkg-config (Linux):
   - Debian/Ubuntu: `sudo apt install libasound2-dev pkg-config`
@@ -102,6 +108,7 @@ Not in v1: Spotify Connect, daemon mode, audio visualization.
 ```
 termify                 # launch the TUI (requires auth first)
 termify --demo          # TUI with sample data, no credentials needed
+termify --offline       # play only downloaded tracks, no login or network
 termify auth            # force a fresh Web API login (reuse playback token)
 termify search <query>  # search tracks and print results
 termify play <uri>      # smoke test: play one track locally until Ctrl-C
@@ -116,7 +123,7 @@ termify --relogin       # force re-login for both Web API and playback
 | `k` / `↑` | Move up (select lyric line on Lyrics tab; move cursor on Queue tab) |
 | `g` / `G` | First / last item (first/last lyric line on Lyrics tab) |
 | `PgUp` / `PgDn` | Page up / down |
-| `Enter` | Select track to play; open playlist; play queue track; jump to selected lyric line |
+| `Enter` | Select track to play (offline copy when saved); open playlist; play queue/offline track; jump to selected lyric line |
 | `/` | Search tracks |
 | `Tab` / `Shift+Tab` | Next / previous tab |
 | `Space` | Play / pause |
@@ -125,6 +132,9 @@ termify --relogin       # force re-login for both Web API and playback
 | `+` / `-` | Volume up / down |
 | `l` | Lyrics tab |
 | `Q` | Queue tab |
+| `o` | Offline / downloads tab |
+| `d` | Download the selected track |
+| `D` | Delete the offline copy (Offline tab); discard staged playlist changes elsewhere |
 | `J` / `K` | Move selected queue track down / up (Queue tab only) |
 | `L` | Load liked songs |
 | `N` | Create a new private playlist (Playlists tab) |
@@ -134,7 +144,6 @@ termify --relogin       # force re-login for both Web API and playback
 | `J` / `K` | Move the selected track down / up in the currently open playlist (staged) |
 | `[` / `]` | Same as `J` / `K` for playlist reordering |
 | `S` | Save all staged playlist changes in one batch |
-| `D` | Discard staged playlist changes |
 | `s` | Shuffle on / off (affects next/prev and auto-advance) |
 | `r` | Repeat off / all / one (also MPRIS Loop Status) |
 | `c` | Show / hide cover art (no effect when the terminal blocks images) |
@@ -164,6 +173,34 @@ Setup. Both successful results and tracks with no lyrics are cached; a corrupt
 or outdated cache is ignored and rewritten after the next successful lookup.
 English translations are still regenerated per session because the translation
 service can change its output.
+
+## Offline listening
+
+When local playback is connected, select any track and press `d`. termify fetches
+the audio through the authenticated librespot session, decrypts it and writes a
+plain Ogg Vorbis or MP3 file into `downloads/` under the cache directory listed
+under Setup. The URI-to-file mapping is recorded in `downloads.json` atomically,
+with filenames derived from a hash of the URI, so stale entries disappear from
+the view on the next launch and no path traversal is possible from a tampered
+index.
+
+Press `o` (or `Tab`) to open the Offline tab. It lists saved tracks with a `↓`
+marker in other lists; `Enter` plays the selected copy and `D` deletes it. Once a
+track has been downloaded it is preferred automatically even when you select it
+from search results or a playlist, so you do not need to switch tabs to use the
+offline copy. Downloads require a working local-playback session (the same
+device-pairing token used for streaming); browsing without one still works, but
+cannot fetch new audio.
+
+`termify --offline` skips config validation, Web API login and the playback
+session, then starts directly in the Offline tab. It uses rodio to play only
+saved files, so it needs an audio device but no network connection. Lyrics,
+cover art and API browsing are unavailable in this mode because they need
+Spotify/Web API access; MPRIS controls continue to work with the local player.
+
+Downloaded files are **not DRM-encrypted** — they are ordinary audio files in
+your cache directory. Protect that directory as you would any other media
+library; no tokens or credentials are stored there.
 
 ## Playlists and collaborators
 
@@ -255,20 +292,21 @@ src/
   auth.rs     # PKCE + device-pairing flows, token caches + refresh
   api.rs      # rspotify wrapper (search, playlists, liked songs)
   player.rs   # librespot session, Player, mixer, playback controls
+  offline.rs  # download/decrypt audio, disk index, rodio playback for saved tracks
   lyrics.rs   # LRCLIB client, LRC parser, language preference, translation, disk cache
   mpris.rs    # MPRIS D-Bus player: publishes state, forwards media-key controls
   ui/
-    app.rs    # App state, Action enum, keys, queue/shuffle/repeat/lyrics/cover
+    app.rs    # App state, Action enum, keys, queue/shuffle/repeat/lyrics/cover/downloads
     event.rs  # crossterm stream + tick -> Action channel
     render.rs # ratatui layout and widgets
 ```
 
 Events from the keyboard, MPRIS and background tasks (API calls, player events,
-lyrics, cover art) all flow into one `mpsc` channel. `App` owns all state, applies actions
+downloads, lyrics, cover art) all flow into one `mpsc` channel. `App` owns all state, applies actions
 and redraws. After each action it publishes a state snapshot to the MPRIS thread,
 which runs on its own current-thread Tokio runtime because `mpris-server`'s
-`Player` is `Rc`-based and not `Send`. Playback progress is derived from a local
-clock anchored on a 250 ms tick.
+`Player` is `Rc`-based and not `Send`. Online progress is derived from a local
+clock anchored on a 250 ms tick; offline progress comes from the rodio sink.
 
 ## Notes / troubleshooting
 
@@ -289,6 +327,11 @@ clock anchored on a 250 ms tick.
   resolves to an incompatible `vergen 9.1.0`. `Cargo.lock` pins `vergen 9.0.6`.
   Do not delete `Cargo.lock` without re-applying `cargo update -p vergen --precise 9.0.6`.
 - **Token file permissions**: both token caches are written with mode `0600`.
+- **Offline downloads**: saved audio is plain, unencrypted Ogg/MP3 in the cache
+  directory's `downloads/` folder. A failed download leaves no `.part` file, and
+  an unreadable or outdated `downloads.json` is ignored rather than deleting
+  audio. If `termify --offline` reports no tracks, check that folder; deleting
+  its files also removes the corresponding entries on the next launch.
 - **Arrow keys in Kitty / Windows Terminal**: the cover-art probe signals
   completion before its background thread has restored the terminal, so termify
   waits for raw mode to be disabled before re-entering it. It also reassembles

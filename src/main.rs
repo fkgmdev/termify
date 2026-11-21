@@ -4,6 +4,7 @@ mod auth;
 mod config;
 mod lyrics;
 mod mpris;
+mod offline;
 mod player;
 mod ui;
 
@@ -23,6 +24,10 @@ struct Cli {
     /// Launch the TUI with sample data (no Spotify credentials needed).
     #[arg(long)]
     demo: bool,
+
+    /// Play only downloaded tracks, with no network or Spotify login.
+    #[arg(long)]
+    offline: bool,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -50,9 +55,9 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let paths = Paths::discover()?;
 
-    // Demo mode bypasses config validation so the TUI shell can be exercised
-    // before credentials are configured.
-    let config = if cli.demo {
+    // Demo and offline modes bypass config validation so the TUI shell can be
+    // exercised without credentials or a network connection.
+    let config = if cli.demo || cli.offline {
         Config::default()
     } else {
         config::load(&paths)?
@@ -90,7 +95,9 @@ async fn main() -> Result<()> {
         }
         None => {
             if cli.demo {
-                run_tui(None, None, &paths).await?;
+                run_tui(None, None, &paths, false, false).await?;
+            } else if cli.offline {
+                run_tui(None, None, &paths, false, true).await?;
             } else {
                 let spotify = auth::authenticated(&config, &paths, cli.relogin).await?;
                 let access_token = auth::playback_access_token(&paths, cli.relogin).await?;
@@ -104,7 +111,7 @@ async fn main() -> Result<()> {
                         None
                     }
                 };
-                run_tui(Some(spotify), player, &paths).await?;
+                run_tui(Some(spotify), player, &paths, false, false).await?;
             }
         }
     }
@@ -116,6 +123,8 @@ async fn run_tui(
     spotify: Option<rspotify::AuthCodePkceSpotify>,
     local_player: Option<player::LocalPlayer>,
     paths: &config::Paths,
+    demo: bool,
+    offline: bool,
 ) -> Result<()> {
     use crossterm::execute;
     use crossterm::terminal::{
@@ -173,11 +182,15 @@ async fn run_tui(
         .unwrap_or(ratatui::layout::Size::new(100, 30));
 
     let (tx, mut rx) = mpsc::channel(64);
-    let mut app = ui::App::new_with_paths(
+    let downloads = offline::DownloadStore::open(&paths.downloads_dir)?;
+    let mut app = ui::App::new_with_options(
         tx.clone(),
         picker,
         art_blocked_reason,
-        Some(paths.lyrics_cache_file.clone()),
+        ui::AppOptions {
+            lyrics_cache_file: Some(paths.lyrics_cache_file.clone()),
+            downloads: Some(downloads),
+        },
     );
     app.set_terminal_size(terminal_size.width, terminal_size.height);
 
@@ -185,7 +198,9 @@ async fn run_tui(
         app.api_client = Some(std::sync::Arc::new(client));
         app.status = "Signed in — loading your playlists...".to_string();
         app.load_playlists();
-    } else {
+    } else if offline {
+        app.set_offline_mode();
+    } else if demo {
         app.load_demo();
     }
 

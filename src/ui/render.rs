@@ -46,6 +46,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         Tab::Playlists => 1,
         Tab::Queue => 2,
         Tab::Lyrics => 3,
+        Tab::Downloads => 4,
     };
 
     let block = Block::default()
@@ -296,6 +297,7 @@ fn render_list_pane(frame: &mut Frame, area: Rect, app: &App) {
         Tab::Playlists => " Playlists ".to_string(),
         Tab::Queue => " Queue ".to_string(),
         Tab::Lyrics => " Lyrics ".to_string(),
+        Tab::Downloads => format!(" Offline — {} tracks ", app.downloads.len()),
     };
 
     let items: Vec<ListItem> = if app.tab == Tab::Playlists {
@@ -330,10 +332,20 @@ fn render_list_pane(frame: &mut Frame, area: Rect, app: &App) {
                     .is_some_and(|np| np.track.uri == track.uri);
                 let style = if is_current {
                     Style::default().fg(YELLOW)
+                } else if app.downloads.contains(&track.uri) {
+                    Style::default().fg(Color::Green)
                 } else {
                     Style::default().fg(WHITE)
                 };
-                ListItem::new(Line::from(Span::styled(track.display(), style)))
+                let marker = if app.downloads.contains(&track.uri) {
+                    "↓ "
+                } else {
+                    "  "
+                };
+                ListItem::new(Line::from(Span::styled(
+                    format!("{marker}{}", track.display()),
+                    style,
+                )))
             })
             .collect()
     };
@@ -451,6 +463,54 @@ fn render_detail_pane(frame: &mut Frame, area: Rect, app: &App) {
             }
             None => vec![Line::from(Span::styled(
                 "Select a playlist to see details",
+                Style::default().fg(DARK_GRAY).italic(),
+            ))],
+        }
+    } else if app.tab == Tab::Downloads {
+        match app.list_state.selected().and_then(|i| app.tracks.get(i)) {
+            Some(track) => {
+                let download = app.downloads.get(&track.uri);
+                let size = download.map_or_else(
+                    || "—".to_string(),
+                    |entry| {
+                        let mb = entry.size as f64 / (1024.0 * 1024.0);
+                        format!("{mb:.1} MB")
+                    },
+                );
+                let mode = if app.playback_mode == super::app::PlaybackMode::Offline {
+                    "offline"
+                } else {
+                    "online"
+                };
+                vec![
+                    Line::from(vec![
+                        Span::styled("Title:    ", Style::default().fg(DARK_GRAY)),
+                        Span::styled(track.title.clone(), Style::default().fg(WHITE).bold()),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("Artist:   ", Style::default().fg(DARK_GRAY)),
+                        Span::styled(track.artist.clone(), Style::default().fg(WHITE)),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("Length:   ", Style::default().fg(DARK_GRAY)),
+                        Span::styled(format_duration(track.duration), Style::default().fg(WHITE)),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("Size:     ", Style::default().fg(DARK_GRAY)),
+                        Span::styled(size, Style::default().fg(GRAY)),
+                        Span::raw("   "),
+                        Span::styled("Playback: ", Style::default().fg(DARK_GRAY)),
+                        Span::styled(mode, Style::default().fg(GRAY)),
+                    ]),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "Enter play · D delete offline copy · --offline starts without network",
+                        Style::default().fg(DARK_GRAY).italic(),
+                    )),
+                ]
+            }
+            None => vec![Line::from(Span::styled(
+                "No downloads — press d on a track to save it offline",
                 Style::default().fg(DARK_GRAY).italic(),
             ))],
         }
@@ -633,6 +693,10 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         }),
         Span::styled(" [a] ", Style::default().fg(YELLOW)),
         Span::raw("follow"),
+        Span::styled(" [o] ", Style::default().fg(YELLOW)),
+        Span::raw("offline"),
+        Span::styled(" [d] ", Style::default().fg(YELLOW)),
+        Span::raw("save"),
         Span::styled(" [Enter] ", Style::default().fg(YELLOW)),
         Span::raw("jump"),
         Span::styled(" [?] ", Style::default().fg(YELLOW)),
@@ -766,6 +830,9 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::from("  + / -       Volume up / down"),
         Line::from("  l           Lyrics tab"),
         Line::from("  Q           Queue tab"),
+        Line::from("  o           Offline / downloads tab"),
+        Line::from("  d           Download selected track"),
+        Line::from("  D           Delete offline copy (Offline tab)"),
         Line::from("  J / K       Move queue track down / up (Queue tab)"),
         Line::from("  Enter       Play queue track / jump to selected lyric"),
         Line::from("  N           New private playlist (Playlists tab)"),

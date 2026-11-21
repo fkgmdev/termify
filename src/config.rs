@@ -53,6 +53,7 @@ pub struct Paths {
     pub token_file: PathBuf,
     pub playback_token_file: PathBuf,
     pub lyrics_cache_file: PathBuf,
+    pub downloads_dir: PathBuf,
 }
 
 /// Accept an environment-supplied base directory only when it is absolute, as
@@ -128,6 +129,7 @@ impl Paths {
             token_file: cache_dir.join("token.json"),
             playback_token_file: cache_dir.join("playback_token.json"),
             lyrics_cache_file: crate::lyrics::cache_file(&cache_dir),
+            downloads_dir: cache_dir.join("downloads"),
             config_dir,
             cache_dir,
         })
@@ -211,6 +213,10 @@ mod tests {
         assert_eq!(
             cache.join("lyrics.json"),
             Path::new("cache/termify/lyrics.json")
+        );
+        assert_eq!(
+            cache.join("downloads"),
+            Path::new("cache/termify/downloads")
         );
     }
 }

@@ -3323,6 +3323,7 @@ dependencies = [
  "cpal",
  "dasp_sample",
  "num-rational",
+ "symphonia",
 ]
 
 [[package]]
@@ -4099,13 +4100,16 @@ dependencies = [
  "crossterm",
  "futures",
  "image",
+ "librespot-audio",
  "librespot-core",
+ "librespot-metadata",
  "librespot-playback",
  "mpris-server",
  "rand 0.8.8",
  "ratatui",
  "ratatui-image",
  "reqwest",
+ "rodio",
  "rspotify",
  "serde",
  "serde_json",
