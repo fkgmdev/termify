@@ -125,7 +125,6 @@ async fn run_tui(
     use ratatui_image::picker::Picker;
     use std::io::IsTerminal;
 
-    enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
 
@@ -150,6 +149,12 @@ async fn run_tui(
     } else {
         Picker::halfblocks()
     };
+
+    // `Picker::from_query_stdio` enables raw mode while probing and then
+    // disables it before returning. On Windows that restores processed input,
+    // so Windows Terminal swallows ↑/↓ (and other navigation keys) instead of
+    // delivering them to crossterm. Re-enter raw mode after the probe.
+    enable_raw_mode()?;
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;

@@ -56,6 +56,8 @@ pub struct Track {
     pub uri: String,
     /// Album-cover URL from the Web API, used for TUI and MPRIS artwork.
     pub art_url: Option<String>,
+    /// Spotify user who added this track to the current playlist, when known.
+    pub added_by: Option<String>,
 }
 
 impl Track {
@@ -72,15 +74,55 @@ pub struct Playlist {
     pub name: String,
     pub description: String,
     pub track_count: Option<u32>,
+    /// Playlist owner's display name (or Spotify ID).
+    pub owner: Option<String>,
+    pub collaborative: bool,
+    pub is_public: Option<bool>,
+    /// Distinct users who added items to the playlist (from item attribution).
+    pub contributors: Vec<String>,
+    /// Needed to make reorder requests against the right playlist version.
+    pub snapshot_id: String,
 }
 
 impl Playlist {
     pub fn display(&self) -> String {
-        match self.track_count {
-            Some(count) => format!("{}  ({count} tracks)", self.name),
-            None => self.name.clone(),
+        let mut details = Vec::new();
+        if let Some(count) = self.track_count {
+            details.push(format!("{count} tracks"));
+        }
+        if self.collaborative {
+            details.push("collaborative".to_string());
+        }
+        if details.is_empty() {
+            self.name.clone()
+        } else {
+            format!("{}  ({})", self.name, details.join(", "))
         }
     }
+}
+
+/// Text input overlay used for playlist name editing.
+#[derive(Debug, Clone)]
+pub enum PromptKind {
+    NewPlaylist,
+    RenamePlaylist { id: String },
+}
+
+impl PromptKind {
+    pub fn label(&self) -> &'static str {
+        match self {
+            PromptKind::NewPlaylist => "New playlist name",
+            PromptKind::RenamePlaylist { .. } => "Rename playlist",
+        }
+    }
+}
+
+/// Playlist selection overlay shown when adding a track.
+#[derive(Debug, Clone)]
+pub struct PlaylistPicker {
+    pub cursor: usize,
+    pub track_uri: String,
+    pub track_title: String,
 }
 
 #[derive(Debug, Clone)]
@@ -99,7 +141,22 @@ pub enum Action {
     Loading(String),
     SearchResults(Result<Vec<Track>, String>),
     PlaylistsLoaded(Result<Vec<Playlist>, String>),
-    PlaylistTracksLoaded(Result<Vec<Track>, String>),
+    /// Full playlist metadata plus its tracks and per-track attribution.
+    PlaylistDetailsLoaded(Result<(Playlist, Vec<Track>), String>),
+    PlaylistCreated(Result<Playlist, String>),
+    PlaylistRenamed {
+        id: String,
+        result: Result<String, String>,
+    },
+    /// Result of an add/remove/reorder command. `reload_playlists` requests a
+    /// fresh list; otherwise the currently open playlist is reloaded.
+    PlaylistEdited {
+        message: String,
+        result: Result<(), String>,
+        reload_playlists: bool,
+        /// Reload the currently viewed playlist when it matches this ID.
+        reload_playlist: Option<String>,
+    },
     LikedSongsLoaded(Result<Vec<Track>, String>),
     PlayerEndOfTrack,
     PlayerPlaying(u32),
@@ -145,6 +202,13 @@ pub struct App {
     pub list_state: ListState,
     pub tracks: Vec<Track>,
     pub playlists: Vec<Playlist>,
+    /// Playlist whose tracks are currently loaded (for track edits).
+    pub current_playlist_id: Option<String>,
+    /// Active playlist name input overlay.
+    pub prompt: Option<PromptKind>,
+    pub prompt_input: String,
+    /// Active "add track to playlist" overlay.
+    pub playlist_picker: Option<PlaylistPicker>,
     pub now_playing: Option<NowPlaying>,
     pub status: String,
     pub loading: bool,
@@ -192,6 +256,10 @@ impl App {
             list_state,
             tracks: Vec::new(),
             playlists: Vec::new(),
+            current_playlist_id: None,
+            prompt: None,
+            prompt_input: String::new(),
+            playlist_picker: None,
             now_playing: None,
             status: "Ready — press / to search, ? for help".to_string(),
             loading: false,
@@ -228,6 +296,7 @@ impl App {
                 duration: Duration::from_secs(354),
                 uri: "spotify:track:demo1".into(),
                 art_url: None,
+                added_by: Some("Demo User".into()),
             },
             Track {
                 title: "Stairway to Heaven".into(),
@@ -236,6 +305,7 @@ impl App {
                 duration: Duration::from_secs(482),
                 uri: "spotify:track:demo2".into(),
                 art_url: None,
+                added_by: Some("Demo User".into()),
             },
             Track {
                 title: "Imagine".into(),
@@ -244,6 +314,7 @@ impl App {
                 duration: Duration::from_secs(183),
                 uri: "spotify:track:demo3".into(),
                 art_url: None,
+                added_by: Some("Alice".into()),
             },
             Track {
                 title: "Hotel California".into(),
@@ -252,6 +323,7 @@ impl App {
                 duration: Duration::from_secs(391),
                 uri: "spotify:track:demo4".into(),
                 art_url: None,
+                added_by: Some("Bob".into()),
             },
             Track {
                 title: "Sweet Child O' Mine".into(),
@@ -260,6 +332,7 @@ impl App {
                 duration: Duration::from_secs(356),
                 uri: "spotify:track:demo5".into(),
                 art_url: None,
+                added_by: None,
             },
         ];
         self.build_play_order();
@@ -316,6 +389,7 @@ impl App {
                 self.loading = false;
                 match result {
                     Ok(tracks) => {
+                        self.current_playlist_id = None;
                         self.set_tracks(tracks);
                         self.status = format!("Found {} tracks", self.tracks.len());
                     }
@@ -332,13 +406,67 @@ impl App {
                     Err(err) => self.set_error(err),
                 }
             }
-            Action::PlaylistTracksLoaded(result) => {
+            Action::PlaylistDetailsLoaded(result) => {
                 self.loading = false;
                 match result {
-                    Ok(tracks) => {
+                    Ok((playlist, tracks)) => {
+                        self.current_playlist_id = Some(playlist.id.clone());
+                        if let Some(existing) = self
+                            .playlists
+                            .iter_mut()
+                            .find(|item| item.id == playlist.id)
+                        {
+                            *existing = playlist;
+                        } else {
+                            self.playlists.push(playlist);
+                        }
                         self.set_tracks(tracks);
                         self.tab = Tab::Search;
                         self.status = format!("Loaded {} playlist tracks", self.tracks.len());
+                    }
+                    Err(err) => self.set_error(err),
+                }
+            }
+            Action::PlaylistCreated(result) => {
+                self.loading = false;
+                match result {
+                    Ok(playlist) => {
+                        let name = playlist.name.clone();
+                        self.playlists.push(playlist);
+                        self.status = format!("Created playlist '{name}'");
+                    }
+                    Err(err) => self.set_error(err),
+                }
+            }
+            Action::PlaylistRenamed { id, result } => {
+                self.loading = false;
+                match result {
+                    Ok(name) => {
+                        if let Some(playlist) = self.playlists.iter_mut().find(|p| p.id == id) {
+                            playlist.name = name.clone();
+                        }
+                        self.status = format!("Renamed playlist to '{name}'");
+                    }
+                    Err(err) => self.set_error(err),
+                }
+            }
+            Action::PlaylistEdited {
+                message,
+                result,
+                reload_playlists,
+                reload_playlist,
+            } => {
+                self.loading = false;
+                match result {
+                    Ok(()) => {
+                        self.status = message;
+                        if reload_playlists {
+                            self.load_playlists();
+                        } else if reload_playlist.as_deref() == self.current_playlist_id.as_deref()
+                            && self.current_playlist_id.is_some()
+                        {
+                            self.load_playlist_tracks(reload_playlist.unwrap());
+                        }
                     }
                     Err(err) => self.set_error(err),
                 }
@@ -347,6 +475,7 @@ impl App {
                 self.loading = false;
                 match result {
                     Ok(tracks) => {
+                        self.current_playlist_id = None;
                         self.set_tracks(tracks);
                         self.tab = Tab::Search;
                         self.status = format!("Loaded {} liked songs", self.tracks.len());
@@ -460,6 +589,22 @@ impl App {
             return Ok(());
         }
 
+        // Ctrl+C always quits, even while an overlay owns the keyboard.
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            self.running = false;
+            return Ok(());
+        }
+
+        if self.playlist_picker.is_some() {
+            self.handle_playlist_picker_key(key);
+            return Ok(());
+        }
+
+        if self.prompt.is_some() {
+            self.handle_prompt_key(key);
+            return Ok(());
+        }
+
         if self.search_active {
             match key.code {
                 KeyCode::Esc => {
@@ -490,12 +635,6 @@ impl App {
             if matches!(key.code, KeyCode::Char('?') | KeyCode::Esc | KeyCode::Enter) {
                 self.show_help = false;
             }
-            return Ok(());
-        }
-
-        // Ctrl+C always quits.
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            self.running = false;
             return Ok(());
         }
 
@@ -535,8 +674,8 @@ impl App {
                 Tab::Queue => self.move_queue_cursor(-10),
                 _ => self.move_selection(-10),
             },
-            KeyCode::Char('J') => self.reorder_queue(1),
-            KeyCode::Char('K') => self.reorder_queue(-1),
+            KeyCode::Char('J') if self.tab == Tab::Queue => self.reorder_queue(1),
+            KeyCode::Char('K') if self.tab == Tab::Queue => self.reorder_queue(-1),
             KeyCode::Tab | KeyCode::BackTab => {
                 // crossterm reports Shift+Tab as BackTab; some terminals instead
                 // send Tab with the SHIFT modifier, so handle both.
@@ -583,10 +722,315 @@ impl App {
                 self.loading = true;
                 self.load_liked_songs();
             }
+            // Playlist editing keys are upper-case so they don't collide with
+            // the single-letter navigation/playback commands.
+            KeyCode::Char('N') => self.begin_new_playlist(),
+            KeyCode::Char('R') => self.begin_rename_playlist(),
+            KeyCode::Char('A') => self.begin_add_to_playlist(),
+            KeyCode::Char('X') => self.remove_selected_playlist_track(),
+            KeyCode::Char('[') => self.move_playlist_track(-1),
+            KeyCode::Char(']') => self.move_playlist_track(1),
             KeyCode::Char('?') => self.show_help = true,
             _ => {}
         }
         Ok(())
+    }
+
+    /// Key handling while the "add track to playlist" overlay is open.
+    fn handle_playlist_picker_key(&mut self, key: KeyEvent) {
+        enum PickerStep {
+            Move(i32),
+            First,
+            Last,
+            Confirm,
+            Cancel,
+            Ignore,
+        }
+        let step = match key.code {
+            KeyCode::Esc => PickerStep::Cancel,
+            KeyCode::Enter => PickerStep::Confirm,
+            KeyCode::Up | KeyCode::Char('k') => PickerStep::Move(-1),
+            KeyCode::Down | KeyCode::Char('j') => PickerStep::Move(1),
+            KeyCode::Char('g') => PickerStep::First,
+            KeyCode::Char('G') => PickerStep::Last,
+            _ => PickerStep::Ignore,
+        };
+        match step {
+            PickerStep::Cancel => {
+                self.playlist_picker = None;
+                self.status = "Add to playlist cancelled".to_string();
+            }
+            PickerStep::Confirm => {
+                let Some(picker) = self.playlist_picker.take() else {
+                    return;
+                };
+                let Some(playlist) = self.playlists.get(picker.cursor).cloned() else {
+                    self.status = "No playlist selected".to_string();
+                    return;
+                };
+                self.add_track_to_playlist(playlist, picker.track_uri, picker.track_title);
+            }
+            PickerStep::Move(delta) => {
+                if let Some(picker) = &mut self.playlist_picker {
+                    let max = self.playlists.len().saturating_sub(1) as i32;
+                    picker.cursor = (picker.cursor as i32 + delta).clamp(0, max) as usize;
+                }
+            }
+            PickerStep::First => {
+                if let Some(picker) = &mut self.playlist_picker {
+                    picker.cursor = 0;
+                }
+            }
+            PickerStep::Last => {
+                if let Some(picker) = &mut self.playlist_picker {
+                    picker.cursor = self.playlists.len().saturating_sub(1);
+                }
+            }
+            PickerStep::Ignore => {}
+        }
+    }
+
+    /// Key handling while a playlist name prompt is open.
+    fn handle_prompt_key(&mut self, key: KeyEvent) {
+        enum PromptStep {
+            Cancel,
+            Confirm,
+            Backspace,
+            Insert(char),
+            Ignore,
+        }
+        let step = match key.code {
+            KeyCode::Esc => PromptStep::Cancel,
+            KeyCode::Enter => PromptStep::Confirm,
+            KeyCode::Backspace => PromptStep::Backspace,
+            KeyCode::Char(c) => PromptStep::Insert(c),
+            _ => PromptStep::Ignore,
+        };
+        match step {
+            PromptStep::Cancel => {
+                self.prompt = None;
+                self.prompt_input.clear();
+                self.status = "Cancelled".to_string();
+            }
+            PromptStep::Backspace => {
+                self.prompt_input.pop();
+            }
+            PromptStep::Insert(c) => {
+                // Playlist names are capped well below Spotify's own limit.
+                if self.prompt_input.chars().count() < 100 {
+                    self.prompt_input.push(c);
+                }
+            }
+            PromptStep::Confirm => {
+                let name = self.prompt_input.trim().to_string();
+                let Some(prompt) = self.prompt.take() else {
+                    return;
+                };
+                self.prompt_input.clear();
+                if name.is_empty() {
+                    self.status = "Playlist name cannot be empty".to_string();
+                    return;
+                }
+                match prompt {
+                    PromptKind::NewPlaylist => self.create_playlist(name),
+                    PromptKind::RenamePlaylist { id } => self.rename_playlist(id, name),
+                }
+            }
+            PromptStep::Ignore => {}
+        }
+    }
+
+    fn begin_new_playlist(&mut self) {
+        self.prompt = Some(PromptKind::NewPlaylist);
+        self.prompt_input.clear();
+        self.status = "New playlist (private): type a name, Enter to create".to_string();
+    }
+
+    fn begin_rename_playlist(&mut self) {
+        let selected = if self.tab == Tab::Playlists {
+            self.list_state.selected().and_then(|i| self.playlists.get(i))
+        } else {
+            None
+        };
+        let Some(playlist) = selected else {
+            self.status = "Select a playlist on the Playlists tab first".to_string();
+            return;
+        };
+        self.prompt = Some(PromptKind::RenamePlaylist {
+            id: playlist.id.clone(),
+        });
+        self.prompt_input = playlist.name.clone();
+        self.status = "Rename playlist: Enter to save, Esc to cancel".to_string();
+    }
+
+    fn begin_add_to_playlist(&mut self) {
+        if self.tab == Tab::Playlists {
+            self.status = "Select a track, then press A to add it to a playlist".to_string();
+            return;
+        }
+        let Some(track) = self
+            .list_state
+            .selected()
+            .and_then(|i| self.tracks.get(i))
+            .cloned()
+        else {
+            self.status = "No track selected".to_string();
+            return;
+        };
+        if self.playlists.is_empty() {
+            self.status = "No playlists loaded — open the Playlists tab first".to_string();
+            return;
+        }
+        self.playlist_picker = Some(PlaylistPicker {
+            cursor: 0,
+            track_uri: track.uri,
+            track_title: track.title,
+        });
+        self.status = "Add to playlist: Enter to add, Esc to cancel".to_string();
+    }
+
+    fn create_playlist(&mut self, name: String) {
+        let Some(client) = self.api_client.clone() else {
+            self.status = "Sign in to edit playlists".to_string();
+            return;
+        };
+        self.loading = true;
+        self.status = "Creating playlist...".to_string();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = crate::api::create_playlist(&client, &name)
+                .await
+                .map_err(|err| format!("{err:#}"));
+            let _ = tx.send(Action::PlaylistCreated(result)).await;
+        });
+    }
+
+    fn rename_playlist(&mut self, id: String, name: String) {
+        let Some(client) = self.api_client.clone() else {
+            self.status = "Sign in to edit playlists".to_string();
+            return;
+        };
+        self.loading = true;
+        self.status = "Renaming playlist...".to_string();
+        let tx = self.tx.clone();
+        let result_name = name.clone();
+        tokio::spawn(async move {
+            let result = crate::api::rename_playlist(&client, &id, &name)
+                .await
+                .map(|()| result_name)
+                .map_err(|err| format!("{err:#}"));
+            let _ = tx.send(Action::PlaylistRenamed { id, result }).await;
+        });
+    }
+
+    fn add_track_to_playlist(&mut self, playlist: Playlist, track_uri: String, track_title: String) {
+        let Some(client) = self.api_client.clone() else {
+            self.status = "Sign in to edit playlists".to_string();
+            return;
+        };
+        self.loading = true;
+        self.status = format!("Adding '{track_title}' to '{}'...", playlist.name);
+        let tx = self.tx.clone();
+        let playlist_name = playlist.name.clone();
+        let playlist_id = playlist.id.clone();
+        tokio::spawn(async move {
+            let result = crate::api::add_playlist_track(&client, &playlist_id, &track_uri)
+                .await
+                .map_err(|err| format!("{err:#}"));
+            let _ = tx
+                .send(Action::PlaylistEdited {
+                    message: format!("Added '{track_title}' to '{playlist_name}'"),
+                    result,
+                    reload_playlists: false,
+                    reload_playlist: Some(playlist_id),
+                })
+                .await;
+        });
+    }
+
+    fn remove_selected_playlist_track(&mut self) {
+        let Some(playlist_id) = self.current_playlist_id.clone() else {
+            self.status = "Open a playlist first, then press X to remove a track".to_string();
+            return;
+        };
+        let Some(track) = self
+            .list_state
+            .selected()
+            .and_then(|i| self.tracks.get(i))
+            .cloned()
+        else {
+            self.status = "No track selected".to_string();
+            return;
+        };
+        let Some(client) = self.api_client.clone() else {
+            self.status = "Sign in to edit playlists".to_string();
+            return;
+        };
+        self.loading = true;
+        self.status = format!("Removing '{}' from playlist...", track.title);
+        let tx = self.tx.clone();
+        let title = track.title.clone();
+        let reload_id = playlist_id.clone();
+        tokio::spawn(async move {
+            let result = crate::api::remove_playlist_track(&client, &playlist_id, &track.uri)
+                .await
+                .map_err(|err| format!("{err:#}"));
+            let _ = tx
+                .send(Action::PlaylistEdited {
+                    message: format!("Removed '{title}' from playlist"),
+                    result,
+                    reload_playlists: false,
+                    reload_playlist: Some(reload_id),
+                })
+                .await;
+        });
+    }
+
+    fn move_playlist_track(&mut self, delta: i32) {
+        let Some(playlist_id) = self.current_playlist_id.clone() else {
+            self.status = "Open a playlist first, then press [ or ] to reorder".to_string();
+            return;
+        };
+        let Some(from) = self.list_state.selected() else {
+            self.status = "No track selected".to_string();
+            return;
+        };
+        let to = (from as i32 + delta).clamp(0, self.tracks.len().saturating_sub(1) as i32) as usize;
+        if from == to {
+            return;
+        }
+        let Some(snapshot_id) = self
+            .playlists
+            .iter()
+            .find(|p| p.id == playlist_id)
+            .map(|p| p.snapshot_id.clone())
+        else {
+            self.status = "Playlist snapshot unavailable; reopen the playlist".to_string();
+            return;
+        };
+        let Some(client) = self.api_client.clone() else {
+            self.status = "Sign in to edit playlists".to_string();
+            return;
+        };
+        self.loading = true;
+        self.status = format!("Moving track to position {}...", to + 1);
+        let tx = self.tx.clone();
+        let reload_id = playlist_id.clone();
+        tokio::spawn(async move {
+            let result = crate::api::move_playlist_track(
+                &client, &playlist_id, &snapshot_id, from, to,
+            )
+            .await
+            .map_err(|err| format!("{err:#}"));
+            let _ = tx
+                .send(Action::PlaylistEdited {
+                    message: format!("Moved track to position {}", to + 1),
+                    result,
+                    reload_playlists: false,
+                    reload_playlist: Some(reload_id),
+                })
+                .await;
+        });
     }
 
     fn move_selection(&mut self, delta: i32) {
@@ -1008,10 +1452,10 @@ impl App {
         let tx = self.tx.clone();
         self.send(Action::Loading("Loading playlist tracks...".to_string()));
         tokio::spawn(async move {
-            let result = crate::api::playlist_tracks(&client, &playlist_id)
+            let result = crate::api::playlist_details(&client, &playlist_id)
                 .await
                 .map_err(|err| format!("{err:#}"));
-            let _ = tx.send(Action::PlaylistTracksLoaded(result)).await;
+            let _ = tx.send(Action::PlaylistDetailsLoaded(result)).await;
         });
     }
 
@@ -1115,8 +1559,23 @@ mod tests {
                 duration: Duration::from_secs(120),
                 uri: format!("spotify:track:test{i}"),
                 art_url: None,
+                added_by: Some("Test User".into()),
             })
             .collect()
+    }
+
+    fn demo_playlist(id: &str, name: &str) -> Playlist {
+        Playlist {
+            id: id.to_string(),
+            name: name.to_string(),
+            description: String::new(),
+            track_count: Some(2),
+            owner: Some("Alice".to_string()),
+            collaborative: true,
+            is_public: Some(false),
+            contributors: vec!["Alice".into(), "Bob".into()],
+            snapshot_id: "snapshot-1".to_string(),
+        }
     }
 
     #[tokio::test]
@@ -1496,6 +1955,67 @@ mod tests {
         assert_eq!(app.art.status(), ArtStatus::Failed);
         assert!(app.art.placeholder_lines()[1].contains("offline"));
         assert!(app.error.is_none());
+    }
+
+    #[test]
+    fn playlist_name_prompt_edits_and_cancels() {
+        let mut app = test_app();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        app.handle_key(key(KeyCode::Char('N'))).unwrap();
+        assert!(matches!(app.prompt, Some(PromptKind::NewPlaylist)));
+        for c in "Mixtape".chars() {
+            app.handle_key(key(KeyCode::Char(c))).unwrap();
+        }
+        app.handle_key(key(KeyCode::Backspace)).unwrap();
+        assert_eq!(app.prompt_input, "Mixtap");
+
+        // No API client in tests: submitting reports that sign-in is required
+        // instead of issuing a request.
+        app.handle_key(key(KeyCode::Enter)).unwrap();
+        assert!(app.prompt.is_none());
+        assert!(app.prompt_input.is_empty());
+        assert!(app.status.contains("Sign in"));
+
+        app.tab = Tab::Playlists;
+        app.playlists = vec![demo_playlist("id-1", "Road Trip")];
+        app.list_state.select(Some(0));
+        app.handle_key(key(KeyCode::Char('R'))).unwrap();
+        assert!(matches!(
+            app.prompt,
+            Some(PromptKind::RenamePlaylist { ref id }) if id == "id-1"
+        ));
+        assert_eq!(app.prompt_input, "Road Trip");
+
+        app.handle_key(key(KeyCode::Esc)).unwrap();
+        assert!(app.prompt.is_none());
+        assert!(app.prompt_input.is_empty());
+    }
+
+    #[test]
+    fn add_to_playlist_picker_navigates_and_cancels() {
+        let mut app = test_app();
+        app.set_tracks(demo_tracks());
+        app.playlists = vec![
+            demo_playlist("id-1", "Road Trip"),
+            demo_playlist("id-2", "Workout"),
+        ];
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        app.handle_key(key(KeyCode::Char('A'))).unwrap();
+        let picker = app.playlist_picker.as_ref().unwrap();
+        assert_eq!(picker.cursor, 0);
+        assert_eq!(picker.track_uri, "spotify:track:test0");
+
+        app.handle_key(key(KeyCode::Down)).unwrap();
+        assert_eq!(app.playlist_picker.as_ref().unwrap().cursor, 1);
+        app.handle_key(key(KeyCode::Up)).unwrap();
+        assert_eq!(app.playlist_picker.as_ref().unwrap().cursor, 0);
+        app.handle_key(key(KeyCode::Char('G'))).unwrap();
+        assert_eq!(app.playlist_picker.as_ref().unwrap().cursor, 1);
+        app.handle_key(key(KeyCode::Esc)).unwrap();
+        assert!(app.playlist_picker.is_none());
+        assert!(app.status.contains("cancelled"));
     }
 
     #[test]

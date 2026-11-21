@@ -12,7 +12,8 @@ or decisions change.
 | --- | --- |
 | Playback | Local streaming via librespot 0.8 (no remote control of the official app) |
 | Auth | Two tokens: user Client ID + PKCE for Web API; Spotify desktop Client ID + device pairing for local playback |
-| Web API | `rspotify` 0.16 (`AuthCodePkceSpotify`, loaded from the PKCE token) |
+| Web API | `rspotify` 0.16 (`AuthCodePkceSpotify`, loaded from the PKCE token); PKCE scopes include `playlist-modify-private`/`playlist-modify-public`, with re-login when a cached token lacks them |
+| Playlists | Create/rename/add/remove/reorder via the Web API; owner, collaborative flag and contributors shown. Contributors are derived from playlist item `added_by` because Spotify no longer exposes a separate collaborator list |
 | UI | `ratatui` 0.30 + `crossterm` 0.29 |
 | Runtime | `tokio` (multi-thread), single `mpsc` Action channel into `App` |
 | Audio backend | librespot-playback with rodio/ALSA (`SoftMixer` for volume) |
@@ -35,14 +36,14 @@ src/
   config.rs          # config.toml (client id, redirect URI, volume, backend), platform paths
   art.rs             # cover-art state, fetch/decode, terminal protocol helpers
   auth.rs            # PKCE + device-pairing flows, token caches + refresh
-  api.rs             # rspotify wrapper (search, playlists, liked songs)
+  api.rs             # rspotify wrapper (search, playlist details/edits, liked songs)
   player.rs          # librespot Session + Player, playback controls, events
   lyrics.rs          # LRCLIB client, LRC parser, language preference, translation
   mpris.rs           # MPRIS D-Bus server: state snapshots + media-key Action callbacks
   ui/
     mod.rs
     app.rs           # App state, Action enum, key handling, async helpers
-    event.rs         # crossterm stream -> Action
+    event.rs         # crossterm stream -> Action (incl. Windows arrow-fragment normalization)
     render.rs        # ratatui layout + widgets
 ```
 
@@ -108,7 +109,8 @@ Playback progress is derived from a local clock anchored on a 250 ms tick.
 - [x] Plain-lyrics fallback, "no lyrics" state, in-memory cache by track URI
 - [x] Unit tests for LRC parsing, active-line tracking, scroll offsets, script
       detection, translation parsing, queue reordering, lyric-line seek/key
-      handling and MPRIS state/action handling (28 passing after M5 art work)
+      handling, MPRIS state/action handling, playlist edit prompts/picker and
+      arrow-fragment normalization (35 passing)
 - [x] Fixed LRCLIB camelCase field mapping (`syncedLyrics`/`plainLyrics`) that
       made every lookup report "no lyrics"; verified with "Knee Socks"
 - [x] Prefer original-language LRCLIB entry when `/api/get` returns a translation
@@ -144,6 +146,13 @@ Playback progress is derived from a local clock anchored on a 250 ms tick.
 - [x] Platform-specific config/cache `#[cfg]` blocks for Linux (XDG), macOS and
       Windows with absolute-path validation and a fallback for other targets
 - [x] MPRIS `mpris:artUrl` now populated from the current track's album image
+- [x] Playlist editing: `N` create, `R` rename, `A` add track, `X` remove track,
+      `[`/`]` reorder; Web API write scopes added with forced re-login when a
+      cached token lacks them
+- [x] Playlist attribution: owner, collaborative/visibility state and distinct
+      contributors from playlist item `added_by`; per-track "Added by" in Details
+- [x] Windows Terminal navigation: re-enter raw mode after the image capability
+      probe (which disables it) and normalize `ESC [ A/B/C/D` key fragments
 - [ ] Repeat mode
 - [ ] Integration tests with a mock HTTP layer
 

@@ -27,6 +27,9 @@ const WEB_SCOPES: &[&str] = &[
     "user-library-read",
     "playlist-read-private",
     "playlist-read-collaborative",
+    // Required by the playlist editing commands (create/rename/add/remove/reorder).
+    "playlist-modify-private",
+    "playlist-modify-public",
 ];
 const PLAYBACK_SCOPES: &str = "streaming";
 
@@ -58,6 +61,7 @@ async fn client_from_cache(
     path: &std::path::Path,
     credentials: Credentials,
     oauth: OAuth,
+    required_scopes: &HashSet<String>,
 ) -> Result<Option<AuthCodePkceSpotify>> {
     let token = match Token::from_cache(path) {
         Ok(token) => token,
@@ -66,6 +70,12 @@ async fn client_from_cache(
             return Ok(None);
         }
     };
+    // Refresh tokens cannot gain new scopes. If the cached token predates the
+    // playlist write scopes, fall through to a fresh interactive login.
+    if !required_scopes.is_subset(&token.scopes) {
+        tracing::info!("Cached token is missing required scopes; re-authorizing");
+        return Ok(None);
+    }
     let client = AuthCodePkceSpotify::from_token_with_config(
         token,
         credentials,
@@ -130,11 +140,17 @@ pub async fn authenticated(
     force_login: bool,
 ) -> Result<AuthCodePkceSpotify> {
     if !force_login && paths.token_file.exists() {
-        if let Some(client) =
-            client_from_cache(&paths.token_file, web_credentials(config), web_oauth(config)).await?
+        if let Some(client) = client_from_cache(
+            &paths.token_file,
+            web_credentials(config),
+            web_oauth(config),
+            &scope_set(WEB_SCOPES),
+        )
+        .await?
         {
             return Ok(client);
         }
+        println!("Re-authorizing with Spotify to enable playlist editing...");
     }
     web_login(config, paths).await
 }
@@ -244,6 +260,7 @@ pub async fn playback_access_token(paths: &Paths, force_login: bool) -> Result<S
             &paths.playback_token_file,
             playback_credentials(),
             playback_oauth(),
+            &HashSet::new(),
         )
         .await?
         {

@@ -14,6 +14,11 @@ library, play music, and read synced lyrics, all from the terminal.
   with Spotify's desktop client ID through the device-pairing flow
 - Two separate cached tokens so Web API rate limits do not affect playback
 - Search tracks, browse playlists, load playlist tracks and liked songs
+- Playlist editing: create/rename private playlists, add tracks from search,
+  remove tracks, and reorder tracks; re-login is required once for the new
+  `playlist-modify-private`/`playlist-modify-public` scopes
+- Playlist details: owner, public/collaborative status, contributors and the
+  user who added each track (from Spotify's per-item `added_by` field)
 - Playback controls: play/pause, next/prev, seek, volume, end-of-track auto-advance
 - Playlist shuffling with a saved playback order (`s`)
 - Queue tab showing the playback order, with track reordering (`J`/`K`) and
@@ -116,8 +121,13 @@ termify --relogin       # force re-login for both Web API and playback
 | `+` / `-` | Volume up / down |
 | `l` | Lyrics tab |
 | `Q` | Queue tab |
-| `J` / `K` | Move selected queue track down / up |
+| `J` / `K` | Move selected queue track down / up (Queue tab only) |
 | `L` | Load liked songs |
+| `N` | Create a new private playlist (Playlists tab) |
+| `R` | Rename the selected playlist (Playlists tab) |
+| `A` | Add the selected track to a playlist (choose from the popup) |
+| `X` | Remove the selected track from the currently open playlist |
+| `[` / `]` | Move the selected playlist track up / down |
 | `s` | Shuffle on / off (affects next/prev and auto-advance) |
 | `c` | Show / hide cover art (no effect when the terminal blocks images) |
 | `a` | Lyrics follow playback on / off (re-syncs the selected line when re-enabled) |
@@ -134,6 +144,27 @@ On the Lyrics tab, `j`/`k` (and `g`/`G`, `PgUp`/`PgDn`) select a line with `»`,
 which disables follow mode. `Enter` seeks playback to that line's timestamp and
 re-enables following; `a` manually re-syncs the selection to the line currently
 playing. The active playback line stays marked with `▶`.
+
+## Playlists and collaborators
+
+Opening a playlist with `Enter` shows its owner, visibility, collaborative flag
+and the distinct contributors Spotify reports through the tracks' `added_by`
+field; each track in the Details pane also shows who added it. Spotify's Web
+API no longer exposes a full collaborator list, so the contributor list is
+built from those per-track attributions (older items may be attributed to the
+owner or omitted).
+
+On the Playlists tab, `N` creates a private playlist and `R` renames the
+selected one; both open a small text prompt. With tracks loaded, `A` opens a
+playlist picker to add the selected track. `X` removes the selected track from
+the playlist you currently have open, and `[`/`]` move it toward the start/end
+of that playlist. Changes are sent to Spotify immediately and the playlist is
+reloaded so the displayed attribution and track order stay in sync.
+
+Playlist edits need the `playlist-modify-private` and `playlist-modify-public`
+scopes. Cached Web API tokens without them are rejected at startup and termify
+reopens the browser login (refresh tokens cannot add scopes). Run
+`termify auth` to force this once after upgrading.
 
 ## Cover art
 
@@ -219,6 +250,10 @@ clock anchored on a 250 ms tick.
   resolves to an incompatible `vergen 9.1.0`. `Cargo.lock` pins `vergen 9.0.6`.
   Do not delete `Cargo.lock` without re-applying `cargo update -p vergen --precise 9.0.6`.
 - **Token file permissions**: both token caches are written with mode `0600`.
+- **Arrow keys in Windows Terminal**: termify re-enters raw mode after the
+  cover-art terminal probe (the probe temporarily disables it) and also
+  reassembles `ESC [ A/B/C/D` fragments, so `↑`/`↓` navigate lists and lyrics
+  in Windows Terminal and ConPTY hosts without VT input processing.
 - **Lyrics**: LRCLIB is a free third-party service with no API key; availability
   may vary. If its exact-match lookup returns a translated entry for a non-Latin
   track, termify searches LRCLIB for the original-language entry (verified with
