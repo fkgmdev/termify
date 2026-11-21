@@ -2,6 +2,7 @@ mod api;
 mod auth;
 mod config;
 mod lyrics;
+mod mpris;
 mod player;
 mod ui;
 
@@ -169,12 +170,28 @@ async fn run_tui(
 
     let event_task = tokio::spawn(ui::event::run(tx.clone()));
 
+    // Publish state to the desktop (MPRIS) and route global media keys back
+    // into the same action channel. Absent D-Bus simply disables this.
+    let mpris = match mpris::spawn(tx.clone()) {
+        Ok(handle) => handle,
+        Err(err) => {
+            tracing::warn!("Could not start MPRIS server: {err:#}");
+            None
+        }
+    };
+    if let Some(handle) = &mpris {
+        handle.publish(app.mpris_state());
+    }
+
     terminal.draw(|frame| ui::render::render(frame, &app))?;
 
     let result = async {
         while app.running {
             if let Some(action) = rx.recv().await {
                 app.handle_action(action)?;
+                if let Some(handle) = &mpris {
+                    handle.publish(app.mpris_state());
+                }
                 terminal.draw(|frame| ui::render::render(frame, &app))?;
             }
         }

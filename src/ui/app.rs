@@ -107,6 +107,21 @@ pub enum Action {
         uri: String,
         result: Result<Vec<String>, String>,
     },
+    // Controls coming from MPRIS (desktop media player / global media keys).
+    MprisPlayPause,
+    MprisPlay,
+    MprisPause,
+    MprisNext,
+    MprisPrev,
+    /// Relative seek, in milliseconds (negative seeks backwards).
+    MprisSeek(i64),
+    /// Absolute seek; ignored unless `track` matches the current track id.
+    MprisSetPosition { track: String, position_ms: u64 },
+    /// Volume in the MPRIS range 0.0..=1.0.
+    MprisSetVolume(f64),
+    MprisSetShuffle(bool),
+    MprisOpenUri(String),
+    MprisQuit,
     Error(String),
 }
 
@@ -224,6 +239,25 @@ impl App {
         self.status = "Demo mode — press ? for help".to_string();
     }
 
+    /// Snapshot of everything the desktop needs to show in its media player.
+    pub fn mpris_state(&self) -> crate::mpris::MprisState {
+        let now_playing = self.now_playing.as_ref();
+        crate::mpris::MprisState {
+            track: now_playing.map(|np| crate::mpris::MprisTrack {
+                uri: np.track.uri.clone(),
+                title: np.track.title.clone(),
+                artist: np.track.artist.clone(),
+                album: np.track.album.clone(),
+                art_url: None,
+                duration: np.track.duration,
+            }),
+            position: now_playing.map_or(Duration::ZERO, |np| np.position),
+            playing: now_playing.is_some_and(|np| np.playing),
+            volume: now_playing.map_or(1.0, |np| f64::from(np.volume) / 100.0),
+            shuffle: self.shuffle,
+        }
+    }
+
     pub fn handle_action(&mut self, action: Action) -> Result<()> {
         match action {
             Action::Tick => {
@@ -330,6 +364,33 @@ impl App {
                     }
                 }
             }
+            Action::MprisPlayPause => self.toggle_play(),
+            Action::MprisPlay => self.set_playing(true),
+            Action::MprisPause => self.set_playing(false),
+            Action::MprisNext => self.next_track(),
+            Action::MprisPrev => self.prev_track(),
+            Action::MprisSeek(millis) => self.seek_millis(millis),
+            Action::MprisSetPosition { track, position_ms } => {
+                let current = self
+                    .now_playing
+                    .as_ref()
+                    .map(|np| crate::mpris::track_id(&np.track.uri));
+                if current.as_deref() == Some(track.as_str()) {
+                    self.seek_to(position_ms);
+                }
+            }
+            Action::MprisSetVolume(volume) => {
+                if volume.is_finite() {
+                    self.set_volume_percent((volume.clamp(0.0, 1.0) * 100.0).round() as u8);
+                }
+            }
+            Action::MprisSetShuffle(shuffle) => {
+                if shuffle != self.shuffle {
+                    self.toggle_shuffle();
+                }
+            }
+            Action::MprisOpenUri(uri) => self.play_uri(&uri),
+            Action::MprisQuit => self.running = false,
             Action::Error(message) => self.set_error(message),
         }
         Ok(())
@@ -531,25 +592,21 @@ impl App {
 
     /// Seek playback to the timestamp of the selected lyric line.
     fn jump_to_lyric(&mut self) {
-        let (time, text) = {
-            let Some(lyrics) = self.current_lyrics() else {
-                self.status = "No lyrics for this track".to_string();
-                return;
-            };
-            let Some(line) = lyrics.lines.get(self.lyric_cursor) else {
-                return;
-            };
-            (line.time, line.text.clone())
+        let Some((time, text)) = self.current_lyrics().and_then(|lyrics| {
+            lyrics
+                .lines
+                .get(self.lyric_cursor)
+                .map(|line| (line.time, line.text.clone()))
+        }) else {
+            self.status = "No lyrics for this track".to_string();
+            return;
         };
-        let Some(np) = &mut self.now_playing else {
+        let Some(np) = &self.now_playing else {
             return;
         };
         let target = time.min(np.track.duration);
-        np.position = target;
-        if let Some(player) = &self.player {
-            player.seek(target.as_millis().min(u128::from(u32::MAX)) as u32);
-        }
         self.lyrics_auto_scroll = true;
+        self.seek_to(target.as_millis() as u64);
         self.status = format!("Jumped to {} — {}", format_duration(target), text);
     }
 
@@ -699,9 +756,17 @@ impl App {
     }
 
     fn toggle_play(&mut self) {
+        let playing = self.now_playing.as_ref().is_some_and(|np| !np.playing);
+        self.set_playing(playing);
+    }
+
+    /// Idempotent play/pause used by both keybindings and MPRIS controls.
+    fn set_playing(&mut self, playing: bool) {
         let Some(np) = &mut self.now_playing else { return };
-        np.playing = !np.playing;
-        let playing = np.playing;
+        if np.playing == playing {
+            return;
+        }
+        np.playing = playing;
         if let Some(player) = &self.player {
             if playing {
                 player.play();
@@ -752,31 +817,59 @@ impl App {
         self.select_current();
     }
 
+    /// Relative seek, in seconds (used by the left/right keybindings).
     fn seek(&mut self, seconds: i64) {
+        self.seek_millis(seconds.saturating_mul(1000));
+    }
+
+    /// Relative seek, in milliseconds (used by MPRIS `Seek`).
+    fn seek_millis(&mut self, delta_ms: i64) {
+        let Some(np) = &self.now_playing else { return };
+        let current = np.position.as_millis() as i64;
+        let target = (current.saturating_add(delta_ms)).clamp(0, np.track.duration.as_millis() as i64);
+        self.seek_to(target as u64);
+    }
+
+    /// Absolute seek to a position within the current track.
+    fn seek_to(&mut self, position_ms: u64) {
         let Some(np) = &mut self.now_playing else { return };
-        let delta = if seconds < 0 {
-            Duration::from_secs(seconds.unsigned_abs())
-        } else {
-            Duration::from_secs(seconds as u64)
-        };
-        np.position = if seconds < 0 {
-            np.position.saturating_sub(delta)
-        } else {
-            np.position.saturating_add(delta).min(np.track.duration)
-        };
+        let target = Duration::from_millis(position_ms).min(np.track.duration);
+        np.position = target;
         if let Some(player) = &self.player {
-            player.seek(np.position.as_millis().min(u128::from(u32::MAX)) as u32);
+            player.seek(target.as_millis().min(u128::from(u32::MAX)) as u32);
         }
-        self.status = format!("Seek to {:.0}s", np.position.as_secs_f64());
+        self.status = format!("Seek to {:.0}s", target.as_secs_f64());
+        self.sync_lyric_cursor();
     }
 
     fn adjust_volume(&mut self, delta: i16) {
+        let Some(np) = &self.now_playing else { return };
+        let next = (np.volume as i16 + delta).clamp(0, 100) as u8;
+        self.set_volume_percent(next);
+    }
+
+    /// Set volume in percent, shared by keybindings and MPRIS.
+    fn set_volume_percent(&mut self, percent: u8) {
         let Some(np) = &mut self.now_playing else { return };
-        np.volume = (np.volume as i16 + delta).clamp(0, 100) as u8;
-        if let Some(player) = &self.player {
-            player.set_volume(u16::from(np.volume));
+        let percent = percent.min(100);
+        if np.volume == percent {
+            return;
         }
-        self.status = format!("Volume: {}%", np.volume);
+        np.volume = percent;
+        if let Some(player) = &self.player {
+            player.set_volume(u16::from(percent));
+        }
+        self.status = format!("Volume: {}%", percent);
+    }
+
+    /// Start playing a track by URI (used by MPRIS `OpenUri`).
+    fn play_uri(&mut self, uri: &str) {
+        let Some(index) = self.tracks.iter().position(|track| track.uri == uri) else {
+            self.status = format!("Unknown track: {uri}");
+            return;
+        };
+        self.list_state.select(Some(index));
+        self.select_current();
     }
 
     pub fn search_tracks(&self, query: String) {
@@ -1111,5 +1204,130 @@ mod tests {
         assert_eq!(app.now_playing.as_ref().unwrap().position, Duration::from_secs(37));
         assert!(app.lyrics_auto_scroll);
         assert!(app.status.contains("Jumped to 00:37"));
+    }
+
+    #[test]
+    fn mpris_state_snapshot_matches_now_playing() {
+        let mut app = test_app();
+        app.set_tracks(demo_tracks());
+        app.now_playing = Some(NowPlaying {
+            track: app.tracks[1].clone(),
+            position: Duration::from_secs(12),
+            playing: true,
+            volume: 40,
+        });
+        app.shuffle = true;
+
+        let state = app.mpris_state();
+        let track = state.track.unwrap();
+        assert_eq!(track.uri, "spotify:track:test1");
+        assert_eq!(track.title, "Track 1");
+        assert_eq!(track.artist, "Artist");
+        assert_eq!(track.album, "Album");
+        assert_eq!(track.duration, Duration::from_secs(120));
+        assert_eq!(state.position, Duration::from_secs(12));
+        assert!(state.playing);
+        assert_eq!(state.volume, 0.4);
+        assert!(state.shuffle);
+    }
+
+    #[tokio::test]
+    async fn mpris_controls_drive_playback() {
+        let mut app = test_app();
+        app.set_tracks(demo_tracks());
+        for track in &app.tracks {
+            app.lyrics.insert(
+                track.uri.clone(),
+                crate::lyrics::Lyrics {
+                    lines: Vec::new(),
+                    synced: true,
+                    source: "test".into(),
+                },
+            );
+        }
+        app.now_playing = Some(NowPlaying {
+            track: app.tracks[0].clone(),
+            position: Duration::from_secs(10),
+            playing: false,
+            volume: 50,
+        });
+
+        app.handle_action(Action::MprisPlay).unwrap();
+        assert!(app.now_playing.as_ref().unwrap().playing);
+        app.handle_action(Action::MprisPlay).unwrap(); // idempotent
+        assert!(app.now_playing.as_ref().unwrap().playing);
+        app.handle_action(Action::MprisPlayPause).unwrap();
+        assert!(!app.now_playing.as_ref().unwrap().playing);
+        app.handle_action(Action::MprisPlayPause).unwrap();
+        assert!(app.now_playing.as_ref().unwrap().playing);
+
+        app.handle_action(Action::MprisSeek(-4_000)).unwrap();
+        assert_eq!(
+            app.now_playing.as_ref().unwrap().position,
+            Duration::from_secs(6)
+        );
+        app.handle_action(Action::MprisSeek(2_000)).unwrap();
+        assert_eq!(
+            app.now_playing.as_ref().unwrap().position,
+            Duration::from_secs(8)
+        );
+
+        // A stale SetPosition from another track must be ignored.
+        app.handle_action(Action::MprisSetPosition {
+            track: crate::mpris::track_id("spotify:track:other"),
+            position_ms: 99_000,
+        })
+        .unwrap();
+        assert_eq!(
+            app.now_playing.as_ref().unwrap().position,
+            Duration::from_secs(8)
+        );
+        app.handle_action(Action::MprisSetPosition {
+            track: crate::mpris::track_id("spotify:track:test0"),
+            position_ms: 30_000,
+        })
+        .unwrap();
+        assert_eq!(
+            app.now_playing.as_ref().unwrap().position,
+            Duration::from_secs(30)
+        );
+
+        app.handle_action(Action::MprisSetVolume(0.25)).unwrap();
+        assert_eq!(app.now_playing.as_ref().unwrap().volume, 25);
+        app.handle_action(Action::MprisSetVolume(2.0)).unwrap();
+        assert_eq!(app.now_playing.as_ref().unwrap().volume, 100);
+
+        app.handle_action(Action::MprisSetShuffle(true)).unwrap();
+        assert!(app.shuffle);
+        app.handle_action(Action::MprisSetShuffle(false)).unwrap();
+        assert!(!app.shuffle);
+
+        app.handle_action(Action::MprisNext).unwrap();
+        assert_eq!(
+            app.now_playing.as_ref().unwrap().track.uri,
+            "spotify:track:test1"
+        );
+        app.handle_action(Action::MprisPrev).unwrap();
+        assert_eq!(
+            app.now_playing.as_ref().unwrap().track.uri,
+            "spotify:track:test0"
+        );
+
+        app.handle_action(Action::MprisOpenUri("spotify:track:test3".into()))
+            .unwrap();
+        assert_eq!(
+            app.now_playing.as_ref().unwrap().track.uri,
+            "spotify:track:test3"
+        );
+        app.handle_action(Action::MprisOpenUri("spotify:track:missing".into()))
+            .unwrap();
+        assert_eq!(
+            app.now_playing.as_ref().unwrap().track.uri,
+            "spotify:track:test3"
+        );
+        assert!(app.status.contains("Unknown track"));
+
+        app.handle_action(Action::MprisQuit).unwrap();
+        assert!(!app.running);
     }
 }

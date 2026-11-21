@@ -19,6 +19,7 @@ or decisions change.
 | Lyrics | LRCLIB (line-synced, no key) primary, original-language entry preferred; English translation via Google's public endpoint on demand. Cached in-memory by track URI. Genius unsynced fallback deferred to polish |
 | Config/cache | `~/.config/termify/config.toml`, `~/.cache/termify/` (`token.json` for Web API, `playback_token.json` for playback, audio cache) |
 | Redirect URI | `http://127.0.0.1:8989/callback` for PKCE; device pairing uses `https://spotify.com/pair` |
+| Desktop integration | MPRIS via `mpris-server` 0.11 (`Player` builder); media keys are routed by the DE, not grabbed directly |
 
 Lyrics note: Spotify's Web API has **no** lyrics endpoint. The internal `color-lyrics`
 endpoint is deliberately out of scope for v1 (unofficial, needs an account cookie).
@@ -35,6 +36,7 @@ src/
   api.rs             # rspotify wrapper (search, playlists, liked songs)
   player.rs          # librespot Session + Player, playback controls, events
   lyrics.rs          # LRCLIB client, LRC parser, language preference, translation
+  mpris.rs           # MPRIS D-Bus server: state snapshots + media-key Action callbacks
   ui/
     mod.rs
     app.rs           # App state, Action enum, key handling, async helpers
@@ -42,8 +44,10 @@ src/
     render.rs        # ratatui layout + widgets
 ```
 
-Key events and background tasks (API calls, player events, lyrics fetches) all push
-`Action`s into one channel. The main loop owns `App`, applies actions and redraws.
+Key events, MPRIS controls and background tasks (API calls, player events, lyrics
+fetches) all push `Action`s into one channel. The main loop owns `App`, applies
+actions, publishes an MPRIS state snapshot and redraws. The MPRIS `Player` is
+`!Send`, so it runs on a dedicated thread with a current-thread runtime.
 Playback progress is derived from a local clock anchored on a 250 ms tick.
 
 ## Milestones
@@ -101,8 +105,8 @@ Playback progress is derived from a local clock anchored on a 250 ms tick.
       selection, and the current playback line stays marked with `▶`
 - [x] Plain-lyrics fallback, "no lyrics" state, in-memory cache by track URI
 - [x] Unit tests for LRC parsing, active-line tracking, scroll offsets, script
-      detection, translation parsing, queue reordering and lyric-line seek/key
-      handling (14 passing)
+      detection, translation parsing, queue reordering, lyric-line seek/key
+      handling and MPRIS state/action handling (18 passing)
 - [x] Fixed LRCLIB camelCase field mapping (`syncedLyrics`/`plainLyrics`) that
       made every lookup report "no lyrics"; verified with "Knee Socks"
 - [x] Prefer original-language LRCLIB entry when `/api/get` returns a translation
@@ -117,6 +121,11 @@ Playback progress is derived from a local clock anchored on a 250 ms tick.
 - [ ] Disk-persisted lyrics cache
 - [x] Token refresh persistence verified in practice (expired cache refreshed,
       playback succeeded, new token cached with `0600`)
+- [x] MPRIS D-Bus player: track metadata, playback status, position, volume and
+      shuffle published to the DE; play/pause, next/previous, seek/set-position,
+      volume, shuffle and OpenUri forwarded into the `Action` channel. Verified
+      live with `playerctl` on the session bus (metadata, status, next/prev,
+      seek, volume and shuffle all round-trip through the app)
 - [x] Playlist shuffling (`s`): Fisher-Yates playback order, current track first,
       applied to `n/p` and end-of-track auto-advance; next/prev wrap and visit
       every track exactly once per cycle (unit tested)
@@ -129,8 +138,8 @@ Playback progress is derived from a local clock anchored on a 250 ms tick.
 
 ## Deferred (not in v1)
 
-Spotify Connect device registration, cover art, daemon mode, media keys, CLI
-scripting, audio visualization, desktop notifications.
+Spotify Connect device registration, cover art (`mpris:artUrl`), daemon mode,
+CLI scripting, audio visualization, desktop notifications.
 
 ## User-provided credentials needed
 

@@ -24,9 +24,12 @@ library, play music, and read synced lyrics, all from the terminal.
 - Original-language lyrics preferred over translated LRCLIB entries; optional
   English translation (`t`), cached per track
 - Ratatui TUI with a single async action loop and `--demo` mode
+- MPRIS integration: the current track appears in the desktop media player, and
+  global XF86 audio keys (play/pause, next, previous, volume, seek) work
+  anywhere on the desktop through the window manager's MPRIS media-key routing
 
-Not in v1: Spotify Connect, cover art, daemon mode, media keys, repeat mode,
-audio visualization.
+Not in v1: Spotify Connect, cover art, daemon mode, repeat mode, audio
+visualization.
 
 ## Requirements
 
@@ -123,6 +126,31 @@ which disables follow mode. `Enter` seeks playback to that line's timestamp and
 re-enables following; `a` manually re-syncs the selection to the line currently
 playing. The active playback line stays marked with `▶`.
 
+## Desktop media player / global media keys
+
+termify exports the standard [MPRIS](https://specifications.freedesktop.org/mpris-spec/latest/)
+D-Bus interfaces (`org.mpris.MediaPlayer2` and `.Player`) under a per-process
+bus name such as `org.mpris.MediaPlayer2.termify.instance1234`. As soon as a
+track is selected, your desktop's media widget and OSD show its title, artist,
+album, duration and playback position/state.
+
+Media-key handling is delegated to the desktop environment: GNOME, KDE Plasma,
+XFCE and friends already bind `XF86AudioPlay`, `XF86AudioNext`,
+`XF86AudioPrev`, `XF86AudioRaiseVolume` and friends to the active MPRIS player.
+No global key grab is needed, so termify does not fight your window manager.
+Players like `playerctl` work too:
+
+```
+playerctl metadata
+playerctl play-pause
+playerctl next
+playerctl position 30
+playerctl volume 0.5
+```
+
+MPRIS is silently disabled when `DBUS_SESSION_BUS_ADDRESS` is unset (for
+example over a plain SSH session); the TUI keeps working normally.
+
 ## Architecture
 
 Single binary, modular source:
@@ -135,15 +163,19 @@ src/
   api.rs      # rspotify wrapper (search, playlists, liked songs)
   player.rs   # librespot session, Player, mixer, playback controls
   lyrics.rs   # LRCLIB client, LRC parser, language preference, translation
+  mpris.rs    # MPRIS D-Bus player: publishes state, forwards media-key controls
   ui/
     app.rs    # App state, Action enum, key handling, queue/shuffle/lyric-seek/translation
     event.rs  # crossterm stream + tick -> Action channel
     render.rs # ratatui layout and widgets
 ```
 
-Events from the keyboard and background tasks (API calls, player events, lyrics)
-all flow into one `mpsc` channel. `App` owns all state, applies actions and redraws.
-Playback progress is derived from a local clock anchored on a 250 ms tick.
+Events from the keyboard, MPRIS and background tasks (API calls, player events,
+lyrics) all flow into one `mpsc` channel. `App` owns all state, applies actions
+and redraws. After each action it publishes a state snapshot to the MPRIS thread,
+which runs on its own current-thread Tokio runtime because `mpris-server`'s
+`Player` is `Rc`-based and not `Send`. Playback progress is derived from a local
+clock anchored on a 250 ms tick.
 
 ## Notes / troubleshooting
 
