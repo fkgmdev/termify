@@ -39,10 +39,7 @@ pub fn render(frame: &mut Frame, app: &App) {
 }
 
 fn render_header(frame: &mut Frame, area: Rect, app: &App) {
-    let titles: Vec<Line<'static>> = Tab::ALL
-        .iter()
-        .map(|tab| Line::from(tab.title()))
-        .collect();
+    let titles: Vec<Line<'static>> = Tab::ALL.iter().map(|tab| Line::from(tab.title())).collect();
 
     let selected = match app.tab {
         Tab::Search => 0,
@@ -355,7 +352,12 @@ fn render_list_pane(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_detail_pane(frame: &mut Frame, area: Rect, app: &App) {
-    let block = Block::default().borders(Borders::ALL).title(" Details ");
+    let title = if app.playlist_is_dirty() {
+        " Details — unsaved playlist changes "
+    } else {
+        " Details "
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -388,11 +390,7 @@ fn render_detail_pane(frame: &mut Frame, area: Rect, app: &App) {
                     Some(false) => "Private",
                     None => "Unknown",
                 };
-                let collaboration = if playlist.collaborative {
-                    "Yes"
-                } else {
-                    "No"
-                };
+                let collaboration = playlist.collaboration_label();
                 let contributors = if playlist.contributors.is_empty() {
                     "—".to_string()
                 } else {
@@ -440,8 +438,13 @@ fn render_detail_pane(frame: &mut Frame, area: Rect, app: &App) {
                     )));
                 }
                 lines.push(Line::from(""));
+                let hint = if app.playlist_is_dirty() {
+                    "Enter load tracks · R rename · S save changes · D discard"
+                } else {
+                    "Enter load tracks · N new · R rename"
+                };
                 lines.push(Line::from(Span::styled(
-                    "Enter load tracks · N new · R rename",
+                    hint,
                     Style::default().fg(DARK_GRAY).italic(),
                 )));
                 lines
@@ -473,17 +476,14 @@ fn render_detail_pane(frame: &mut Frame, area: Rect, app: &App) {
                 Line::from(vec![
                     Span::styled("Added by:", Style::default().fg(DARK_GRAY)),
                     Span::styled(
-                        track
-                            .added_by
-                            .clone()
-                            .unwrap_or_else(|| "—".to_string()),
+                        track.added_by.clone().unwrap_or_else(|| "—".to_string()),
                         Style::default().fg(GRAY),
                     ),
                 ]),
                 Line::from(""),
                 Line::from(Span::styled(
                     if app.current_playlist_id.is_some() {
-                        "Enter play · A add · X remove · [ ] reorder"
+                        "Enter play · J/K or [ ] reorder · A add · X remove · S save · D discard"
                     } else {
                         "Enter play · A add to playlist"
                     },
@@ -503,7 +503,11 @@ fn render_detail_pane(frame: &mut Frame, area: Rect, app: &App) {
 fn render_cover(frame: &mut Frame, area: Rect, app: &App) {
     if let Some(protocol) = app.art.protocol() {
         let size = protocol.size();
-        if size.width > 0 && size.height > 0 && size.width <= area.width && size.height <= area.height {
+        if size.width > 0
+            && size.height > 0
+            && size.width <= area.width
+            && size.height <= area.height
+        {
             let x = area.x + (area.width - size.width) / 2;
             let y = area.y + (area.height - size.height) / 2;
             let image_area = Rect::new(x, y, size.width, size.height);
@@ -522,12 +526,7 @@ fn render_art_placeholder(frame: &mut Frame, area: Rect, app: &App) {
         .art
         .placeholder_lines()
         .into_iter()
-        .map(|line| {
-            Line::from(Span::styled(
-                line,
-                Style::default().fg(DARK_GRAY).italic(),
-            ))
-        })
+        .map(|line| Line::from(Span::styled(line, Style::default().fg(DARK_GRAY).italic())))
         .collect();
     let hint = if app.art_enabled {
         " [c] hide art"
@@ -536,7 +535,10 @@ fn render_art_placeholder(frame: &mut Frame, area: Rect, app: &App) {
     };
     let mut lines = lines;
     if area.height > lines.len() as u16 + 1 {
-        lines.push(Line::from(Span::styled(hint, Style::default().fg(DARK_GRAY))));
+        lines.push(Line::from(Span::styled(
+            hint,
+            Style::default().fg(DARK_GRAY),
+        )));
     }
     frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), area);
 }
@@ -618,7 +620,11 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled(" [s] ", Style::default().fg(YELLOW)),
         Span::raw(if app.shuffle { "shuffle ON" } else { "shuffle" }),
         Span::styled(" [t] ", Style::default().fg(YELLOW)),
-        Span::raw(if app.translate_lyrics { "translate ON" } else { "translate" }),
+        Span::raw(if app.translate_lyrics {
+            "translate ON"
+        } else {
+            "translate"
+        }),
         Span::styled(" [a] ", Style::default().fg(YELLOW)),
         Span::raw("follow"),
         Span::styled(" [Enter] ", Style::default().fg(YELLOW)),
@@ -629,7 +635,10 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         Span::raw("quit"),
         Span::styled(format!("  {state}"), Style::default().fg(DARK_GRAY)),
     ]);
-    frame.render_widget(Paragraph::new(keys).style(Style::default().fg(GRAY)), chunks[2]);
+    frame.render_widget(
+        Paragraph::new(keys).style(Style::default().fg(GRAY)),
+        chunks[2],
+    );
 }
 
 /// Centered overlay for the "add selected track to playlist" picker.
@@ -646,7 +655,7 @@ fn render_playlist_picker(frame: &mut Frame, area: Rect, app: &App) {
 
     let mut lines = vec![
         Line::from(vec![Span::styled(
-            format!(" Add '{}' to playlist ", picker.track_title),
+            format!(" Add '{}' to playlist ", picker.track.title),
             Style::default().fg(CYAN).bold(),
         )]),
         Line::from(""),
@@ -682,11 +691,8 @@ fn render_playlist_picker(frame: &mut Frame, area: Rect, app: &App) {
         Style::default().fg(DARK_GRAY),
     )));
 
-    let widget = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" Playlists "),
-    );
+    let widget =
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Playlists "));
     frame.render_widget(ratatui::widgets::Clear, popup);
     Widget::render(widget, popup, frame.buffer_mut());
 }
@@ -730,13 +736,16 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_help(frame: &mut Frame, area: Rect) {
     let popup_width = area.width.min(64);
-    let popup_height = area.height.min(36);
+    let popup_height = area.height.min(40);
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
     let popup = Rect::new(x, y, popup_width, popup_height);
 
     let help_text = Text::from(vec![
-        Line::from(Span::styled(" termify keybindings ", Style::default().fg(CYAN).bold())),
+        Line::from(Span::styled(
+            " termify keybindings ",
+            Style::default().fg(CYAN).bold(),
+        )),
         Line::from(""),
         Line::from("  j / ↓       Move down (select lyric line on Lyrics tab)"),
         Line::from("  k / ↑       Move up (select lyric line on Lyrics tab)"),
@@ -754,10 +763,12 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::from("  J / K       Move queue track down / up (Queue tab)"),
         Line::from("  Enter       Play queue track / jump to selected lyric"),
         Line::from("  N           New private playlist (Playlists tab)"),
-        Line::from("  R           Rename selected playlist (Playlists tab)"),
+        Line::from("  R           Rename selected playlist (open playlist is staged)"),
         Line::from("  A           Add selected track to a playlist"),
-        Line::from("  X           Remove selected track from open playlist"),
-        Line::from("  [ / ]       Move playlist track up / down"),
+        Line::from("  X           Remove selected track from open playlist (staged)"),
+        Line::from("  J/K, [ / ]  Move selected track in open playlist (staged)"),
+        Line::from("  S           Save all staged playlist changes at once"),
+        Line::from("  D           Discard staged playlist changes"),
         Line::from("  s           Shuffle on / off"),
         Line::from("  c           Show / hide cover art (falls back to text when unsupported)"),
         Line::from("  a           Lyrics follow playback on / off"),
@@ -765,7 +776,10 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::from("  ?           Toggle this help"),
         Line::from("  q / Ctrl-C  Quit"),
         Line::from(""),
-        Line::from(Span::styled(" Press ? / Esc / Enter to close ", Style::default().fg(DARK_GRAY).italic())),
+        Line::from(Span::styled(
+            " Press ? / Esc / Enter to close ",
+            Style::default().fg(DARK_GRAY).italic(),
+        )),
     ]);
 
     let widget = Paragraph::new(help_text).block(
@@ -866,6 +880,31 @@ mod tests {
     }
 
     #[test]
+    fn details_infers_shared_playlist_from_contributors() {
+        let (tx, _rx) = mpsc::channel(8);
+        let mut app = App::new(tx, Picker::halfblocks(), None);
+        app.art_enabled = false;
+        app.tab = Tab::Playlists;
+        app.playlists = vec![Playlist {
+            id: "id-shared".into(),
+            name: "Shared".into(),
+            description: String::new(),
+            track_count: Some(2),
+            owner: Some("Alice".into()),
+            collaborative: false,
+            is_public: Some(false),
+            contributors: vec!["Alice".into(), "Bob".into()],
+            snapshot_id: "snapshot".into(),
+        }];
+        app.list_state.select(Some(0));
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Yes (inferred)"));
+    }
+
+    #[test]
     fn edit_overlays_render() {
         let (tx, _rx) = mpsc::channel(8);
         let mut app = App::new(tx, Picker::halfblocks(), None);
@@ -882,8 +921,15 @@ mod tests {
         app.prompt = None;
         app.playlist_picker = Some(crate::ui::app::PlaylistPicker {
             cursor: 0,
-            track_uri: "spotify:track:song".into(),
-            track_title: "Song".into(),
+            track: Track {
+                title: "Song".into(),
+                artist: "Artist".into(),
+                album: "Album".into(),
+                duration: std::time::Duration::from_secs(120),
+                uri: "spotify:track:song".into(),
+                art_url: None,
+                added_by: None,
+            },
         });
         app.playlists = vec![Playlist {
             id: "id-1".into(),

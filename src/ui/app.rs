@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -64,7 +65,10 @@ impl Track {
     pub fn display(&self) -> String {
         let mins = self.duration.as_secs() / 60;
         let secs = self.duration.as_secs() % 60;
-        format!("{} — {}  [{:02}:{:02}]", self.title, self.artist, mins, secs)
+        format!(
+            "{} — {}  [{:02}:{:02}]",
+            self.title, self.artist, mins, secs
+        )
     }
 }
 
@@ -80,11 +84,30 @@ pub struct Playlist {
     pub is_public: Option<bool>,
     /// Distinct users who added items to the playlist (from item attribution).
     pub contributors: Vec<String>,
-    /// Needed to make reorder requests against the right playlist version.
+    /// Kept for future optimistic-concurrency checks; batch saves use positions.
+    #[allow(dead_code)]
     pub snapshot_id: String,
 }
 
 impl Playlist {
+    /// Spotify's `collaborative` flag is often stale or missing even when
+    /// several people have added tracks, so infer a shared playlist too.
+    pub fn is_shared(&self) -> bool {
+        self.collaborative || self.contributors.len() > 1
+    }
+
+    /// Label used in the Details pane. The inferred case makes it clear that
+    /// Spotify did not set the flag but the item attribution disagrees.
+    pub fn collaboration_label(&self) -> &'static str {
+        if self.collaborative {
+            "Yes"
+        } else if self.is_shared() {
+            "Yes (inferred)"
+        } else {
+            "No"
+        }
+    }
+
     pub fn display(&self) -> String {
         let mut details = Vec::new();
         if let Some(count) = self.track_count {
@@ -92,6 +115,8 @@ impl Playlist {
         }
         if self.collaborative {
             details.push("collaborative".to_string());
+        } else if self.is_shared() {
+            details.push("shared".to_string());
         }
         if details.is_empty() {
             self.name.clone()
@@ -117,12 +142,45 @@ impl PromptKind {
     }
 }
 
+/// Locally staged edits for one playlist. Nothing is sent to Spotify until
+/// `S` is pressed, so repeated reorders cost one batched save instead of one
+/// request per keystroke.
+#[derive(Debug, Clone)]
+pub struct PlaylistDraft {
+    pub original_name: String,
+    pub name: String,
+    pub original_uris: Vec<String>,
+    pub original_tracks: Vec<Track>,
+    pub tracks: Vec<Track>,
+}
+
+impl PlaylistDraft {
+    fn new(playlist: &Playlist, tracks: &[Track]) -> Self {
+        let original_uris = tracks.iter().map(|track| track.uri.clone()).collect();
+        Self {
+            original_name: playlist.name.clone(),
+            name: playlist.name.clone(),
+            original_uris,
+            original_tracks: tracks.to_vec(),
+            tracks: tracks.to_vec(),
+        }
+    }
+
+    pub fn uris(&self) -> Vec<String> {
+        self.tracks.iter().map(|track| track.uri.clone()).collect()
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.name != self.original_name || self.uris() != self.original_uris
+    }
+}
+
 /// Playlist selection overlay shown when adding a track.
 #[derive(Debug, Clone)]
 pub struct PlaylistPicker {
     pub cursor: usize,
-    pub track_uri: String,
-    pub track_title: String,
+    /// Full selected track so staging an add keeps all metadata (art, length).
+    pub track: Track,
 }
 
 #[derive(Debug, Clone)]
@@ -157,6 +215,12 @@ pub enum Action {
         /// Reload the currently viewed playlist when it matches this ID.
         reload_playlist: Option<String>,
     },
+    /// Result of saving a locally staged playlist draft.
+    PlaylistSaved {
+        id: String,
+        name: String,
+        result: Result<(), String>,
+    },
     LikedSongsLoaded(Result<Vec<Track>, String>),
     PlayerEndOfTrack,
     PlayerPlaying(u32),
@@ -184,7 +248,10 @@ pub enum Action {
     /// Relative seek, in milliseconds (negative seeks backwards).
     MprisSeek(i64),
     /// Absolute seek; ignored unless `track` matches the current track id.
-    MprisSetPosition { track: String, position_ms: u64 },
+    MprisSetPosition {
+        track: String,
+        position_ms: u64,
+    },
     /// Volume in the MPRIS range 0.0..=1.0.
     MprisSetVolume(f64),
     MprisSetShuffle(bool),
@@ -209,6 +276,8 @@ pub struct App {
     pub prompt_input: String,
     /// Active "add track to playlist" overlay.
     pub playlist_picker: Option<PlaylistPicker>,
+    /// Unsaved edits keyed by playlist ID; applied locally until `S`/`D`.
+    pub playlist_drafts: HashMap<String, PlaylistDraft>,
     pub now_playing: Option<NowPlaying>,
     pub status: String,
     pub loading: bool,
@@ -260,6 +329,7 @@ impl App {
             prompt: None,
             prompt_input: String::new(),
             playlist_picker: None,
+            playlist_drafts: HashMap::new(),
             now_playing: None,
             status: "Ready — press / to search, ? for help".to_string(),
             loading: false,
@@ -400,7 +470,16 @@ impl App {
                 self.loading = false;
                 match result {
                     Ok(playlists) => {
-                        self.playlists = playlists;
+                        self.playlists = playlists
+                            .into_iter()
+                            .map(|mut playlist| {
+                                if let Some(draft) = self.playlist_drafts.get(&playlist.id) {
+                                    playlist.name = draft.name.clone();
+                                    playlist.track_count = Some(draft.tracks.len() as u32);
+                                }
+                                playlist
+                            })
+                            .collect();
                         self.status = format!("Loaded {} playlists", self.playlists.len());
                     }
                     Err(err) => self.set_error(err),
@@ -409,12 +488,19 @@ impl App {
             Action::PlaylistDetailsLoaded(result) => {
                 self.loading = false;
                 match result {
-                    Ok((playlist, tracks)) => {
-                        self.current_playlist_id = Some(playlist.id.clone());
-                        if let Some(existing) = self
-                            .playlists
-                            .iter_mut()
-                            .find(|item| item.id == playlist.id)
+                    Ok((mut playlist, server_tracks)) => {
+                        let id = playlist.id.clone();
+                        // Reopening a playlist with staged edits restores the
+                        // local draft instead of silently losing the changes.
+                        let tracks = if let Some(draft) = self.playlist_drafts.get(&id) {
+                            playlist.name = draft.name.clone();
+                            playlist.track_count = Some(draft.tracks.len() as u32);
+                            draft.tracks.clone()
+                        } else {
+                            server_tracks
+                        };
+                        self.current_playlist_id = Some(id.clone());
+                        if let Some(existing) = self.playlists.iter_mut().find(|item| item.id == id)
                         {
                             *existing = playlist;
                         } else {
@@ -422,7 +508,18 @@ impl App {
                         }
                         self.set_tracks(tracks);
                         self.tab = Tab::Search;
-                        self.status = format!("Loaded {} playlist tracks", self.tracks.len());
+                        let dirty = self
+                            .playlist_drafts
+                            .get(&id)
+                            .is_some_and(PlaylistDraft::is_dirty);
+                        self.status = if dirty {
+                            format!(
+                                "Restored {} unsaved playlist edits — S save / D discard",
+                                self.tracks.len()
+                            )
+                        } else {
+                            format!("Loaded {} playlist tracks", self.tracks.len())
+                        };
                     }
                     Err(err) => self.set_error(err),
                 }
@@ -466,6 +563,24 @@ impl App {
                             && self.current_playlist_id.is_some()
                         {
                             self.load_playlist_tracks(reload_playlist.unwrap());
+                        }
+                    }
+                    Err(err) => self.set_error(err),
+                }
+            }
+            Action::PlaylistSaved { id, name, result } => {
+                self.loading = false;
+                match result {
+                    Ok(()) => {
+                        self.playlist_drafts.remove(&id);
+                        if let Some(playlist) = self.playlists.iter_mut().find(|p| p.id == id) {
+                            playlist.name = name.clone();
+                        }
+                        self.status = format!("Saved playlist '{name}'");
+                        if self.current_playlist_id.as_deref() == Some(id.as_str()) {
+                            self.load_playlist_tracks(id);
+                        } else {
+                            self.load_playlists();
                         }
                     }
                     Err(err) => self.set_error(err),
@@ -583,6 +698,84 @@ impl App {
         self.status = format!("Error: {message}");
     }
 
+    pub fn active_playlist_draft(&self) -> Option<&PlaylistDraft> {
+        self.current_playlist_id
+            .as_deref()
+            .and_then(|id| self.playlist_drafts.get(id))
+    }
+
+    pub fn playlist_is_dirty(&self) -> bool {
+        self.active_playlist_draft()
+            .is_some_and(PlaylistDraft::is_dirty)
+    }
+
+    /// Prefer the open playlist, but allow saving a dirty draft left behind on
+    /// another playlist after the user searched for something else.
+    fn draft_id_for_action(&self) -> Option<String> {
+        if let Some(id) = &self.current_playlist_id
+            && self
+                .playlist_drafts
+                .get(id)
+                .is_some_and(PlaylistDraft::is_dirty)
+        {
+            return Some(id.clone());
+        }
+        self.playlist_drafts
+            .iter()
+            .find(|(_, draft)| draft.is_dirty())
+            .map(|(id, _)| id.clone())
+    }
+
+    fn ensure_playlist_draft(&mut self) {
+        let Some(id) = self.current_playlist_id.clone() else {
+            return;
+        };
+        if self.playlist_drafts.contains_key(&id) {
+            return;
+        }
+        let Some(playlist) = self.playlists.iter().find(|p| p.id == id).cloned() else {
+            return;
+        };
+        let draft = PlaylistDraft::new(&playlist, &self.tracks);
+        self.playlist_drafts.insert(id, draft);
+    }
+
+    fn replace_tracks_keep_selection(&mut self, tracks: Vec<Track>) {
+        let selected = self.list_state.selected();
+        self.tracks = tracks;
+        self.build_play_order();
+        self.queue_cursor = 0;
+        self.list_state.select(if self.tracks.is_empty() {
+            None
+        } else {
+            Some(selected.unwrap_or(0).min(self.tracks.len() - 1))
+        });
+    }
+
+    /// Mirror staged draft changes into the visible list and details panes.
+    fn apply_draft_to_view(&mut self) {
+        let Some(id) = self.current_playlist_id.clone() else {
+            return;
+        };
+        let Some(draft) = self.playlist_drafts.get(&id).cloned() else {
+            return;
+        };
+        if let Some(playlist) = self.playlists.iter_mut().find(|p| p.id == id) {
+            playlist.name = draft.name.clone();
+            playlist.track_count = Some(draft.tracks.len() as u32);
+            let mut contributors = playlist.contributors.clone();
+            for track in &draft.tracks {
+                if let Some(name) = &track.added_by
+                    && !contributors.contains(name)
+                {
+                    contributors.push(name.clone());
+                }
+            }
+            playlist.contributors = contributors;
+        }
+        self.replace_tracks_keep_selection(draft.tracks.clone());
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
         // Ignore key release/repeat events; only act on presses.
         if key.kind == crossterm::event::KeyEventKind::Release {
@@ -657,7 +850,9 @@ impl App {
             },
             KeyCode::Char('G') | KeyCode::End => match self.tab {
                 Tab::Lyrics => {
-                    let last = self.current_lyrics().map_or(0, |l| l.lines.len().saturating_sub(1));
+                    let last = self
+                        .current_lyrics()
+                        .map_or(0, |l| l.lines.len().saturating_sub(1));
                     self.set_lyric_cursor(last);
                 }
                 Tab::Queue => self.queue_cursor = self.play_order.len().saturating_sub(1),
@@ -676,11 +871,18 @@ impl App {
             },
             KeyCode::Char('J') if self.tab == Tab::Queue => self.reorder_queue(1),
             KeyCode::Char('K') if self.tab == Tab::Queue => self.reorder_queue(-1),
+            // With a playlist open, J/K are a faster alternative to [ ].
+            KeyCode::Char('J') if self.tab == Tab::Search && self.current_playlist_id.is_some() => {
+                self.move_playlist_track(1)
+            }
+            KeyCode::Char('K') if self.tab == Tab::Search && self.current_playlist_id.is_some() => {
+                self.move_playlist_track(-1)
+            }
             KeyCode::Tab | KeyCode::BackTab => {
                 // crossterm reports Shift+Tab as BackTab; some terminals instead
                 // send Tab with the SHIFT modifier, so handle both.
-                let backward = key.code == KeyCode::BackTab
-                    || key.modifiers.contains(KeyModifiers::SHIFT);
+                let backward =
+                    key.code == KeyCode::BackTab || key.modifiers.contains(KeyModifiers::SHIFT);
                 self.tab = if backward {
                     self.tab.prev()
                 } else {
@@ -730,6 +932,8 @@ impl App {
             KeyCode::Char('X') => self.remove_selected_playlist_track(),
             KeyCode::Char('[') => self.move_playlist_track(-1),
             KeyCode::Char(']') => self.move_playlist_track(1),
+            KeyCode::Char('S') => self.save_playlist_draft(),
+            KeyCode::Char('D') => self.discard_playlist_draft(),
             KeyCode::Char('?') => self.show_help = true,
             _ => {}
         }
@@ -768,7 +972,7 @@ impl App {
                     self.status = "No playlist selected".to_string();
                     return;
                 };
-                self.add_track_to_playlist(playlist, picker.track_uri, picker.track_title);
+                self.add_track_to_playlist(playlist, picker.track);
             }
             PickerStep::Move(delta) => {
                 if let Some(picker) = &mut self.playlist_picker {
@@ -848,7 +1052,15 @@ impl App {
 
     fn begin_rename_playlist(&mut self) {
         let selected = if self.tab == Tab::Playlists {
-            self.list_state.selected().and_then(|i| self.playlists.get(i))
+            self.list_state
+                .selected()
+                .and_then(|i| self.playlists.get(i))
+                .cloned()
+                .or_else(|| {
+                    self.current_playlist_id
+                        .as_deref()
+                        .and_then(|id| self.playlists.iter().find(|p| p.id == id).cloned())
+                })
         } else {
             None
         };
@@ -856,11 +1068,16 @@ impl App {
             self.status = "Select a playlist on the Playlists tab first".to_string();
             return;
         };
+        let staged = self.current_playlist_id.as_deref() == Some(playlist.id.as_str());
         self.prompt = Some(PromptKind::RenamePlaylist {
             id: playlist.id.clone(),
         });
         self.prompt_input = playlist.name.clone();
-        self.status = "Rename playlist: Enter to save, Esc to cancel".to_string();
+        self.status = if staged {
+            "Rename playlist: Enter stages it, S saves, Esc cancels".to_string()
+        } else {
+            "Rename playlist: Enter to save, Esc to cancel".to_string()
+        };
     }
 
     fn begin_add_to_playlist(&mut self) {
@@ -881,11 +1098,7 @@ impl App {
             self.status = "No playlists loaded — open the Playlists tab first".to_string();
             return;
         }
-        self.playlist_picker = Some(PlaylistPicker {
-            cursor: 0,
-            track_uri: track.uri,
-            track_title: track.title,
-        });
+        self.playlist_picker = Some(PlaylistPicker { cursor: 0, track });
         self.status = "Add to playlist: Enter to add, Esc to cancel".to_string();
     }
 
@@ -906,6 +1119,17 @@ impl App {
     }
 
     fn rename_playlist(&mut self, id: String, name: String) {
+        // Renaming the open playlist joins its staged batch; other playlists
+        // still use the immediate single-field API call.
+        if self.current_playlist_id.as_deref() == Some(id.as_str()) {
+            self.ensure_playlist_draft();
+            if let Some(draft) = self.playlist_drafts.get_mut(&id) {
+                draft.name = name.clone();
+            }
+            self.apply_draft_to_view();
+            self.status = format!("Staged rename to '{name}' — press S to save");
+            return;
+        }
         let Some(client) = self.api_client.clone() else {
             self.status = "Sign in to edit playlists".to_string();
             return;
@@ -923,16 +1147,36 @@ impl App {
         });
     }
 
-    fn add_track_to_playlist(&mut self, playlist: Playlist, track_uri: String, track_title: String) {
+    fn add_track_to_playlist(&mut self, playlist: Playlist, track: Track) {
+        if self.current_playlist_id.as_deref() == Some(playlist.id.as_str()) {
+            self.ensure_playlist_draft();
+            if let Some(draft) = self.playlist_drafts.get_mut(&playlist.id) {
+                let mut staged = track.clone();
+                staged.added_by = Some("You".to_string());
+                draft.tracks.push(staged);
+            }
+            self.apply_draft_to_view();
+            if let Some(draft) = self.playlist_drafts.get(&playlist.id) {
+                self.list_state
+                    .select(Some(draft.tracks.len().saturating_sub(1)));
+            }
+            self.status = format!(
+                "Staged '{}' in '{}' — press S to save",
+                track.title, playlist.name
+            );
+            return;
+        }
         let Some(client) = self.api_client.clone() else {
             self.status = "Sign in to edit playlists".to_string();
             return;
         };
         self.loading = true;
-        self.status = format!("Adding '{track_title}' to '{}'...", playlist.name);
+        self.status = format!("Adding '{}' to '{}'...", track.title, playlist.name);
         let tx = self.tx.clone();
         let playlist_name = playlist.name.clone();
         let playlist_id = playlist.id.clone();
+        let track_title = track.title.clone();
+        let track_uri = track.uri.clone();
         tokio::spawn(async move {
             let result = crate::api::add_playlist_track(&client, &playlist_id, &track_uri)
                 .await
@@ -949,88 +1193,128 @@ impl App {
     }
 
     fn remove_selected_playlist_track(&mut self) {
-        let Some(playlist_id) = self.current_playlist_id.clone() else {
+        if self.loading {
+            return;
+        }
+        let Some(id) = self.current_playlist_id.clone() else {
             self.status = "Open a playlist first, then press X to remove a track".to_string();
             return;
         };
-        let Some(track) = self
-            .list_state
-            .selected()
-            .and_then(|i| self.tracks.get(i))
-            .cloned()
-        else {
+        let Some(index) = self.list_state.selected() else {
             self.status = "No track selected".to_string();
             return;
         };
-        let Some(client) = self.api_client.clone() else {
-            self.status = "Sign in to edit playlists".to_string();
-            return;
+        self.ensure_playlist_draft();
+        let removed = {
+            let Some(draft) = self.playlist_drafts.get_mut(&id) else {
+                return;
+            };
+            if index >= draft.tracks.len() {
+                return;
+            }
+            draft.tracks.remove(index)
         };
-        self.loading = true;
-        self.status = format!("Removing '{}' from playlist...", track.title);
-        let tx = self.tx.clone();
-        let title = track.title.clone();
-        let reload_id = playlist_id.clone();
-        tokio::spawn(async move {
-            let result = crate::api::remove_playlist_track(&client, &playlist_id, &track.uri)
-                .await
-                .map_err(|err| format!("{err:#}"));
-            let _ = tx
-                .send(Action::PlaylistEdited {
-                    message: format!("Removed '{title}' from playlist"),
-                    result,
-                    reload_playlists: false,
-                    reload_playlist: Some(reload_id),
-                })
-                .await;
-        });
+        self.apply_draft_to_view();
+        self.status = format!("Staged removal of '{}' — press S to save", removed.title);
     }
 
     fn move_playlist_track(&mut self, delta: i32) {
-        let Some(playlist_id) = self.current_playlist_id.clone() else {
-            self.status = "Open a playlist first, then press [ or ] to reorder".to_string();
+        if self.loading {
+            return;
+        }
+        let Some(id) = self.current_playlist_id.clone() else {
+            self.status = "Open a playlist first, then press J/K or [ ] to reorder".to_string();
             return;
         };
         let Some(from) = self.list_state.selected() else {
             self.status = "No track selected".to_string();
             return;
         };
-        let to = (from as i32 + delta).clamp(0, self.tracks.len().saturating_sub(1) as i32) as usize;
+        let to =
+            (from as i32 + delta).clamp(0, self.tracks.len().saturating_sub(1) as i32) as usize;
         if from == to {
             return;
         }
-        let Some(snapshot_id) = self
-            .playlists
-            .iter()
-            .find(|p| p.id == playlist_id)
-            .map(|p| p.snapshot_id.clone())
-        else {
-            self.status = "Playlist snapshot unavailable; reopen the playlist".to_string();
+        self.ensure_playlist_draft();
+        let adjusted_to;
+        {
+            let Some(draft) = self.playlist_drafts.get_mut(&id) else {
+                return;
+            };
+            if from >= draft.tracks.len() {
+                return;
+            }
+            adjusted_to = to.min(draft.tracks.len() - 1);
+            let track = draft.tracks.remove(from);
+            draft.tracks.insert(adjusted_to, track);
+        }
+        self.apply_draft_to_view();
+        self.list_state.select(Some(adjusted_to));
+        self.status = format!(
+            "Moved track to position {} (staged) — press S to save",
+            adjusted_to + 1
+        );
+    }
+
+    fn save_playlist_draft(&mut self) {
+        if self.loading {
+            return;
+        }
+        let Some(id) = self.draft_id_for_action() else {
+            self.status = "No staged playlist changes to save".to_string();
+            return;
+        };
+        let Some(draft) = self.playlist_drafts.get(&id).cloned() else {
             return;
         };
         let Some(client) = self.api_client.clone() else {
-            self.status = "Sign in to edit playlists".to_string();
+            self.status = "Sign in to save playlist changes".to_string();
             return;
         };
         self.loading = true;
-        self.status = format!("Moving track to position {}...", to + 1);
+        self.status = format!("Saving playlist '{}'...", draft.name);
         let tx = self.tx.clone();
-        let reload_id = playlist_id.clone();
+        let original_name = draft.original_name.clone();
+        let name = draft.name.clone();
+        let original = draft.original_uris.clone();
+        let current = draft.uris();
         tokio::spawn(async move {
-            let result = crate::api::move_playlist_track(
-                &client, &playlist_id, &snapshot_id, from, to,
-            )
-            .await
-            .map_err(|err| format!("{err:#}"));
-            let _ = tx
-                .send(Action::PlaylistEdited {
-                    message: format!("Moved track to position {}", to + 1),
-                    result,
-                    reload_playlists: false,
-                    reload_playlist: Some(reload_id),
-                })
-                .await;
+            let result =
+                crate::api::save_playlist(&client, &id, &original_name, &name, &original, &current)
+                    .await
+                    .map_err(|err| format!("{err:#}"));
+            let _ = tx.send(Action::PlaylistSaved { id, name, result }).await;
         });
+    }
+
+    fn discard_playlist_draft(&mut self) {
+        if self.loading {
+            return;
+        }
+        let Some(id) = self.draft_id_for_action() else {
+            self.status = "No staged playlist changes to discard".to_string();
+            return;
+        };
+        let Some(draft) = self.playlist_drafts.remove(&id) else {
+            return;
+        };
+        if let Some(playlist) = self.playlists.iter_mut().find(|p| p.id == id) {
+            playlist.name = draft.original_name.clone();
+            playlist.track_count = Some(draft.original_tracks.len() as u32);
+            let mut contributors = Vec::new();
+            for track in &draft.original_tracks {
+                if let Some(name) = &track.added_by
+                    && !contributors.contains(name)
+                {
+                    contributors.push(name.clone());
+                }
+            }
+            playlist.contributors = contributors;
+        }
+        if self.current_playlist_id.as_deref() == Some(id.as_str()) {
+            self.replace_tracks_keep_selection(draft.original_tracks.clone());
+        }
+        self.status = format!("Discarded unsaved changes to '{}'", draft.original_name);
     }
 
     fn move_selection(&mut self, delta: i32) {
@@ -1044,7 +1328,8 @@ impl App {
 
     fn move_to(&mut self, index: usize) {
         if !self.tracks.is_empty() {
-            self.list_state.select(Some(index.min(self.tracks.len() - 1)));
+            self.list_state
+                .select(Some(index.min(self.tracks.len() - 1)));
         }
     }
 
@@ -1059,8 +1344,8 @@ impl App {
             return;
         }
         self.lyrics_auto_scroll = false;
-        self.lyric_cursor = (self.lyric_cursor as i32 + delta)
-            .clamp(0, line_count as i32 - 1) as usize;
+        self.lyric_cursor =
+            (self.lyric_cursor as i32 + delta).clamp(0, line_count as i32 - 1) as usize;
     }
 
     fn set_lyric_cursor(&mut self, index: usize) {
@@ -1111,8 +1396,8 @@ impl App {
         if self.play_order.is_empty() {
             return;
         }
-        self.queue_cursor = (self.queue_cursor as i32 + delta)
-            .clamp(0, self.play_order.len() as i32 - 1) as usize;
+        self.queue_cursor =
+            (self.queue_cursor as i32 + delta).clamp(0, self.play_order.len() as i32 - 1) as usize;
     }
 
     /// Swap the selected queue entry with its neighbour so it plays earlier or
@@ -1145,8 +1430,11 @@ impl App {
         self.tracks = tracks;
         self.build_play_order();
         self.queue_cursor = 0;
-        self.list_state
-            .select(if self.tracks.is_empty() { None } else { Some(0) });
+        self.list_state.select(if self.tracks.is_empty() {
+            None
+        } else {
+            Some(0)
+        });
     }
 
     /// Build the order used by next/prev. With shuffle on, the current track is
@@ -1308,7 +1596,9 @@ impl App {
 
     /// Idempotent play/pause used by both keybindings and MPRIS controls.
     fn set_playing(&mut self, playing: bool) {
-        let Some(np) = &mut self.now_playing else { return };
+        let Some(np) = &mut self.now_playing else {
+            return;
+        };
         if np.playing == playing {
             return;
         }
@@ -1372,13 +1662,16 @@ impl App {
     fn seek_millis(&mut self, delta_ms: i64) {
         let Some(np) = &self.now_playing else { return };
         let current = np.position.as_millis() as i64;
-        let target = (current.saturating_add(delta_ms)).clamp(0, np.track.duration.as_millis() as i64);
+        let target =
+            (current.saturating_add(delta_ms)).clamp(0, np.track.duration.as_millis() as i64);
         self.seek_to(target as u64);
     }
 
     /// Absolute seek to a position within the current track.
     fn seek_to(&mut self, position_ms: u64) {
-        let Some(np) = &mut self.now_playing else { return };
+        let Some(np) = &mut self.now_playing else {
+            return;
+        };
         let target = Duration::from_millis(position_ms).min(np.track.duration);
         np.position = target;
         if let Some(player) = &self.player {
@@ -1396,7 +1689,9 @@ impl App {
 
     /// Set volume in percent, shared by keybindings and MPRIS.
     fn set_volume_percent(&mut self, percent: u8) {
-        let Some(np) = &mut self.now_playing else { return };
+        let Some(np) = &mut self.now_playing else {
+            return;
+        };
         let percent = percent.min(100);
         if np.volume == percent {
             return;
@@ -1534,7 +1829,11 @@ pub fn lyric_scroll_offset(
     height: usize,
 ) -> usize {
     let max_offset = line_count.saturating_sub(height);
-    let focus = if auto_scroll { active } else { cursor.or(active) };
+    let focus = if auto_scroll {
+        active
+    } else {
+        cursor.or(active)
+    };
     focus
         .unwrap_or(0)
         .saturating_sub(height / 2)
@@ -1763,7 +2062,10 @@ mod tests {
         app.lyric_cursor = 1;
         app.lyrics_auto_scroll = false;
         app.jump_to_lyric();
-        assert_eq!(app.now_playing.as_ref().unwrap().position, Duration::from_secs(37));
+        assert_eq!(
+            app.now_playing.as_ref().unwrap().position,
+            Duration::from_secs(37)
+        );
         assert!(app.lyrics_auto_scroll);
         assert!(app.status.contains("Jumped to 00:37"));
     }
@@ -1993,6 +2295,52 @@ mod tests {
     }
 
     #[test]
+    fn playlist_edits_stage_locally_and_discard_restores() {
+        let mut app = test_app();
+        let original = demo_tracks();
+        app.playlists = vec![demo_playlist("id-1", "Road Trip")];
+        app.current_playlist_id = Some("id-1".into());
+        app.set_tracks(original.clone());
+        app.ensure_playlist_draft();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        app.handle_key(key(KeyCode::Char('J'))).unwrap();
+        assert_eq!(app.tracks[0].uri, "spotify:track:test1");
+        assert_eq!(app.list_state.selected(), Some(1));
+        assert!(app.playlist_is_dirty());
+
+        app.handle_key(key(KeyCode::Char('X'))).unwrap();
+        assert_eq!(app.tracks.len(), original.len() - 1);
+
+        app.tab = Tab::Playlists;
+        app.handle_key(key(KeyCode::Char('R'))).unwrap();
+        app.prompt_input.clear();
+        for c in "Mix".chars() {
+            app.handle_key(key(KeyCode::Char(c))).unwrap();
+        }
+        app.handle_key(key(KeyCode::Enter)).unwrap();
+        assert_eq!(app.active_playlist_draft().unwrap().name, "Mix");
+        assert_eq!(app.playlists[0].name, "Mix");
+
+        // No client in tests, so save is refused without losing the draft.
+        app.handle_key(key(KeyCode::Char('S'))).unwrap();
+        assert!(app.status.contains("Sign in"));
+        assert!(app.playlist_is_dirty());
+
+        app.handle_key(key(KeyCode::Char('D'))).unwrap();
+        assert!(!app.playlist_is_dirty());
+        assert!(app.playlist_drafts.is_empty());
+        assert_eq!(app.playlists[0].name, "Road Trip");
+        assert_eq!(
+            app.tracks
+                .iter()
+                .map(|t| t.uri.as_str())
+                .collect::<Vec<_>>(),
+            original.iter().map(|t| t.uri.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn add_to_playlist_picker_navigates_and_cancels() {
         let mut app = test_app();
         app.set_tracks(demo_tracks());
@@ -2005,7 +2353,7 @@ mod tests {
         app.handle_key(key(KeyCode::Char('A'))).unwrap();
         let picker = app.playlist_picker.as_ref().unwrap();
         assert_eq!(picker.cursor, 0);
-        assert_eq!(picker.track_uri, "spotify:track:test0");
+        assert_eq!(picker.track.uri, "spotify:track:test0");
 
         app.handle_key(key(KeyCode::Down)).unwrap();
         assert_eq!(app.playlist_picker.as_ref().unwrap().cursor, 1);
@@ -2021,11 +2369,7 @@ mod tests {
     #[test]
     fn blocked_terminal_cannot_enable_art() {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        let mut app = App::new(
-            tx,
-            Picker::halfblocks(),
-            Some("TERM=dumb".to_string()),
-        );
+        let mut app = App::new(tx, Picker::halfblocks(), Some("TERM=dumb".to_string()));
         assert!(!app.art_enabled);
 
         app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE))

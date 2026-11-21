@@ -110,7 +110,7 @@ Playback progress is derived from a local clock anchored on a 250 ms tick.
 - [x] Unit tests for LRC parsing, active-line tracking, scroll offsets, script
       detection, translation parsing, queue reordering, lyric-line seek/key
       handling, MPRIS state/action handling, playlist edit prompts/picker and
-      arrow-fragment normalization (35 passing)
+      arrow-fragment normalization (40 passing)
 - [x] Fixed LRCLIB camelCase field mapping (`syncedLyrics`/`plainLyrics`) that
       made every lookup report "no lyrics"; verified with "Knee Socks"
 - [x] Prefer original-language LRCLIB entry when `/api/get` returns a translation
@@ -151,8 +151,15 @@ Playback progress is derived from a local clock anchored on a 250 ms tick.
       cached token lacks them
 - [x] Playlist attribution: owner, collaborative/visibility state and distinct
       contributors from playlist item `added_by`; per-track "Added by" in Details
-- [x] Windows Terminal navigation: re-enter raw mode after the image capability
-      probe (which disables it) and normalize `ESC [ A/B/C/D` key fragments
+      with readable labels (`You`, `Collaborator N`, or `display_name`)
+- [x] Shared playlists are inferred from more than one contributor when Spotify's
+      `collaborative` flag is false; Details shows `Yes (inferred)`
+- [x] Batched playlist editing: `R`/`A`/`X`/`J`/`K`/`[`/`]` stage changes locally,
+      `S` saves rename + minimal add/remove/reorder calls at once, `D` discards;
+      drafts survive reopening the playlist and retained tracks keep `added_by`
+- [x] Windows Terminal / Kitty navigation: wait for the image probe thread to
+      restore raw mode before re-entering it, and normalize `ESC [ A/B/C/D` key
+      fragments
 - [ ] Repeat mode
 - [ ] Integration tests with a mock HTTP layer
 

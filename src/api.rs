@@ -2,16 +2,17 @@
 //! editing operations the TUI needs. Converts Spotify model types into the
 //! UI's simple `Track` and `Playlist` types.
 
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use rspotify::{AuthCodePkceSpotify, ClientError};
 use rspotify::clients::{BaseClient, OAuthClient};
 use rspotify::model::{
     FullPlaylist, FullTrack, Image as SpotifyImage, PlayableId, PlayableItem, PlaylistId,
     PlaylistItem, PublicUser, SearchResult, SearchType, SimplifiedPlaylist, TrackId,
 };
 use rspotify::prelude::*;
+use rspotify::{AuthCodePkceSpotify, ClientError};
 
 use crate::ui::{Playlist, Track};
 
@@ -36,14 +37,55 @@ fn pick_art_url(images: &[SpotifyImage]) -> Option<String> {
         .map(|image| image.url.clone())
 }
 
-/// Spotify often omits `display_name` for older playlist items; the stable ID
-/// is still a useful attribution.
-fn user_name(user: &PublicUser) -> String {
+/// Spotify frequently returns `added_by` objects with no `display_name`.
+fn display_name(user: &PublicUser) -> Option<String> {
     user.display_name
         .as_deref()
         .filter(|name| !name.trim().is_empty())
         .map(str::to_string)
-        .unwrap_or_else(|| user.id.id().to_string())
+}
+
+fn label_for_user(user: &PublicUser, me_id: Option<&str>, fallback: &str) -> String {
+    display_name(user).unwrap_or_else(|| {
+        if Some(user.id.id()) == me_id {
+            "You".to_string()
+        } else {
+            fallback.to_string()
+        }
+    })
+}
+
+/// Build readable labels for the user IDs found in playlist items. Anonymous
+/// IDs become "You" (for the signed-in user) or "Collaborator N" instead of
+/// being shown as Spotify's opaque user IDs.
+fn build_user_labels(full: &FullPlaylist, me_id: Option<&str>) -> HashMap<String, String> {
+    let mut known: Vec<(String, Option<String>)> = Vec::new();
+    for item in &full.items.items {
+        let Some(user) = &item.added_by else { continue };
+        let id = user.id.id().to_string();
+        if let Some(entry) = known.iter_mut().find(|(known_id, _)| *known_id == id) {
+            if entry.1.is_none() {
+                entry.1 = display_name(user);
+            }
+        } else {
+            known.push((id, display_name(user)));
+        }
+    }
+
+    let mut labels = HashMap::new();
+    let mut anonymous = 0usize;
+    for (id, name) in known {
+        let label = match name {
+            Some(name) => name,
+            None if Some(id.as_str()) == me_id => "You".to_string(),
+            None => {
+                anonymous += 1;
+                format!("Collaborator {anonymous}")
+            }
+        };
+        labels.insert(id, label);
+    }
+    labels
 }
 
 /// Convert an rspotify `FullTrack` into the UI's `Track`.
@@ -72,21 +114,27 @@ fn track_from_playable(item: &PlayableItem) -> Option<Track> {
     }
 }
 
-/// Playlist items carry the user who added them; attach that to the track so
-/// the UI can show per-song attribution.
-fn track_from_playlist_item(item: &PlaylistItem) -> Option<Track> {
+/// Playlist items carry the user who added them; attach a readable label to
+/// the track so the UI can show per-song attribution.
+fn track_from_playlist_item(
+    item: &PlaylistItem,
+    labels: &HashMap<String, String>,
+) -> Option<Track> {
     let mut track = track_from_playable(item.item.as_ref()?)?;
-    track.added_by = item.added_by.as_ref().map(user_name);
+    track.added_by = item
+        .added_by
+        .as_ref()
+        .and_then(|user| labels.get(user.id.id()).cloned());
     Some(track)
 }
 
-fn playlist_from_simplified(playlist: &SimplifiedPlaylist) -> Playlist {
+fn playlist_from_simplified(playlist: &SimplifiedPlaylist, me_id: Option<&str>) -> Playlist {
     Playlist {
         id: playlist.id.id().to_string(),
         name: playlist.name.clone(),
         description: String::new(), // not present on simplified playlists
         track_count: Some(playlist.items.total),
-        owner: Some(user_name(&playlist.owner)),
+        owner: Some(label_for_user(&playlist.owner, me_id, "Unknown user")),
         collaborative: playlist.collaborative,
         is_public: playlist.public,
         contributors: Vec::new(), // filled in when the playlist is opened
@@ -94,13 +142,17 @@ fn playlist_from_simplified(playlist: &SimplifiedPlaylist) -> Playlist {
     }
 }
 
-fn playlist_from_full(playlist: &FullPlaylist, contributors: Vec<String>) -> Playlist {
+fn playlist_from_full(
+    playlist: &FullPlaylist,
+    contributors: Vec<String>,
+    me_id: Option<&str>,
+) -> Playlist {
     Playlist {
         id: playlist.id.id().to_string(),
         name: playlist.name.clone(),
         description: playlist.description.clone().unwrap_or_default(),
         track_count: Some(playlist.items.total),
-        owner: Some(user_name(&playlist.owner)),
+        owner: Some(label_for_user(&playlist.owner, me_id, "Unknown user")),
         collaborative: playlist.collaborative,
         is_public: playlist.public,
         contributors,
@@ -121,8 +173,13 @@ pub async fn search_tracks(client: &AuthCodePkceSpotify, query: &str) -> Result<
     }
 }
 
+async fn current_user_id(client: &AuthCodePkceSpotify) -> Option<String> {
+    client.me().await.ok().map(|user| user.id.id().to_string())
+}
+
 /// Fetch the current user's playlists (first page, up to 50).
 pub async fn current_user_playlists(client: &AuthCodePkceSpotify) -> Result<Vec<Playlist>> {
+    let me_id = current_user_id(client).await;
     let page = client
         .current_user_playlists_manual(Some(50), None)
         .await
@@ -131,7 +188,7 @@ pub async fn current_user_playlists(client: &AuthCodePkceSpotify) -> Result<Vec<
     Ok(page
         .items
         .iter()
-        .map(playlist_from_simplified)
+        .map(|playlist| playlist_from_simplified(playlist, me_id.as_deref()))
         .collect())
 }
 
@@ -150,20 +207,26 @@ pub async fn playlist_details(
         .map_err(map_spotify_error)
         .context("fetching playlist failed")?;
 
+    let me_id = current_user_id(client).await;
+    let labels = build_user_labels(&full, me_id.as_deref());
     let mut contributors: Vec<String> = Vec::new();
     let mut tracks = Vec::new();
     for item in &full.items.items {
         if let Some(user) = &item.added_by {
-            let name = user_name(user);
-            if !contributors.contains(&name) {
-                contributors.push(name);
+            if let Some(label) = labels.get(user.id.id()) {
+                if !contributors.contains(label) {
+                    contributors.push(label.clone());
+                }
             }
         }
-        if let Some(track) = track_from_playlist_item(item) {
+        if let Some(track) = track_from_playlist_item(item, &labels) {
             tracks.push(track);
         }
     }
-    Ok((playlist_from_full(&full, contributors), tracks))
+    Ok((
+        playlist_from_full(&full, contributors, me_id.as_deref()),
+        tracks,
+    ))
 }
 
 /// Fetch the current user's liked songs (first page, up to 50).
@@ -182,13 +245,14 @@ pub async fn liked_songs(client: &AuthCodePkceSpotify) -> Result<Vec<Track>> {
 
 /// Create a private (non-collaborative) playlist and return its details.
 pub async fn create_playlist(client: &AuthCodePkceSpotify, name: &str) -> Result<Playlist> {
+    let me_id = current_user_id(client).await;
     let user = client.me().await.map_err(map_spotify_error)?;
     let full = client
         .user_playlist_create(user.id, name, Some(false), Some(false), None)
         .await
         .map_err(map_spotify_error)
         .context("creating playlist failed")?;
-    Ok(playlist_from_full(&full, Vec::new()))
+    Ok(playlist_from_full(&full, Vec::new(), me_id.as_deref()))
 }
 
 /// Rename a playlist. Only the fields we pass are changed by Spotify.
@@ -208,12 +272,11 @@ pub async fn rename_playlist(
 }
 
 fn playable_track_id(uri: &str) -> Result<PlayableId<'_>> {
-    let id = TrackId::from_uri(uri)
-        .with_context(|| format!("invalid track URI: {uri}"))?;
+    let id = TrackId::from_uri(uri).with_context(|| format!("invalid track URI: {uri}"))?;
     Ok(PlayableId::Track(id))
 }
 
-/// Append a track to a playlist.
+/// Append a track to a playlist (used when the target is not currently open).
 pub async fn add_playlist_track(
     client: &AuthCodePkceSpotify,
     playlist_id: &str,
@@ -230,59 +293,234 @@ pub async fn add_playlist_track(
     Ok(())
 }
 
-/// Remove every occurrence of a track from a playlist.
-pub async fn remove_playlist_track(
-    client: &AuthCodePkceSpotify,
-    playlist_id: &str,
-    track_uri: &str,
-) -> Result<()> {
-    let playlist = PlaylistId::from_id_or_uri(playlist_id)
-        .with_context(|| format!("invalid playlist ID/URI: {playlist_id}"))?;
-    let track = playable_track_id(track_uri)?;
-    client
-        .playlist_remove_all_occurrences_of_items(playlist, [track], None)
-        .await
-        .map_err(map_spotify_error)
-        .context("removing track from playlist failed")?;
-    Ok(())
-}
-
-/// Compute Spotify's `range_start`/`insert_before` pair for swapping a track
-/// with its neighbour. `insert_before` is an index in the *original* list, so
-/// moving down needs one extra position after the removal.
+/// Compute Spotify's `range_start`/`insert_before` pair for moving one item.
+/// `insert_before` is an index in the *original* list, so moving down needs one
+/// extra position after the removal.
 pub fn reorder_positions(from: usize, to: usize) -> (i32, i32) {
     let insert_before = if to > from { to + 1 } else { to };
     (from as i32, insert_before as i32)
 }
 
-/// Move one playlist track from `from` to `to` (both zero-based final indices).
-pub async fn move_playlist_track(
+/// A minimal set of Web API calls that turns `original` into `current`.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct PlaylistChangePlan {
+    /// Unique URIs whose count changed; all occurrences are removed before re-adding.
+    pub remove: Vec<String>,
+    /// URIs to append after removals, in their final relative order.
+    pub add: Vec<String>,
+    /// (from, to) moves to apply after removals/additions.
+    pub moves: Vec<(usize, usize)>,
+}
+
+/// Server indices whose values form the longest strictly increasing sequence.
+/// Tracks outside this set are the smallest group that must be moved.
+fn longest_increasing_subset(values: &[usize]) -> Vec<bool> {
+    let mut tails: Vec<usize> = Vec::new();
+    let mut previous: Vec<Option<usize>> = vec![None; values.len()];
+    for (index, &value) in values.iter().enumerate() {
+        match tails.binary_search_by(|&tail| values[tail].cmp(&value)) {
+            Ok(_) => {} // equal values cannot extend a strictly increasing run
+            Err(position) => {
+                if position > 0 {
+                    previous[index] = tails.get(position - 1).copied();
+                }
+                if position == tails.len() {
+                    tails.push(index);
+                } else {
+                    tails[position] = index;
+                }
+            }
+        }
+    }
+    let mut keep = vec![false; values.len()];
+    if let Some(&last) = tails.last() {
+        let mut cursor = Some(last);
+        while let Some(index) = cursor {
+            keep[index] = true;
+            cursor = previous[index];
+        }
+    }
+    keep
+}
+
+/// Plan a batch playlist edit. Reorders collapse into the minimal number of
+/// moves: a track dragged repeatedly through the local draft still costs one
+/// Spotify call at save time.
+pub fn plan_playlist_changes(original: &[String], current: &[String]) -> PlaylistChangePlan {
+    let mut original_counts: HashMap<&str, usize> = HashMap::new();
+    for uri in original {
+        *original_counts.entry(uri.as_str()).or_insert(0) += 1;
+    }
+    let mut current_counts: HashMap<&str, usize> = HashMap::new();
+    for uri in current {
+        *current_counts.entry(uri.as_str()).or_insert(0) += 1;
+    }
+
+    let changed: HashSet<&str> = original_counts
+        .keys()
+        .chain(current_counts.keys())
+        .filter(|&&uri| {
+            original_counts.get(uri).copied().unwrap_or(0)
+                != current_counts.get(uri).copied().unwrap_or(0)
+        })
+        .copied()
+        .collect();
+
+    let mut plan = PlaylistChangePlan::default();
+    let mut seen_remove = HashSet::new();
+    for uri in original {
+        if changed.contains(uri.as_str()) && seen_remove.insert(uri.as_str()) {
+            plan.remove.push(uri.clone());
+        }
+    }
+    let mut add_remaining: HashMap<&str, usize> = changed
+        .iter()
+        .map(|uri| (*uri, current_counts.get(*uri).copied().unwrap_or(0)))
+        .collect();
+    for uri in current {
+        if let Some(remaining) = add_remaining.get_mut(uri.as_str()) {
+            if *remaining > 0 {
+                plan.add.push(uri.clone());
+                *remaining -= 1;
+            }
+        }
+    }
+
+    // State of the playlist on Spotify after removals and additions.
+    let mut server: Vec<String> = original
+        .iter()
+        .filter(|uri| !changed.contains(uri.as_str()))
+        .cloned()
+        .collect();
+    server.extend(plan.add.iter().cloned());
+
+    // Match each server occurrence to its position in the final order. The
+    // longest increasing run can stay put; only the other tracks need moves.
+    let mut current_positions: HashMap<&str, VecDeque<usize>> = HashMap::new();
+    for (index, uri) in current.iter().enumerate() {
+        current_positions
+            .entry(uri.as_str())
+            .or_default()
+            .push_back(index);
+    }
+    let mut server_to_current = Vec::with_capacity(server.len());
+    for uri in &server {
+        let position = current_positions
+            .get_mut(uri.as_str())
+            .and_then(VecDeque::pop_front)
+            .expect("playlist change plan: unmatched URI");
+        server_to_current.push(position);
+    }
+    let mut current_to_server = vec![0usize; current.len()];
+    for (server_index, &current_index) in server_to_current.iter().enumerate() {
+        current_to_server[current_index] = server_index;
+    }
+
+    let keep = longest_increasing_subset(&server_to_current);
+    let mut order: Vec<usize> = (0..server.len()).collect();
+    for (target, &desired) in current_to_server.iter().enumerate() {
+        if keep[desired] {
+            continue;
+        }
+        let from = order
+            .iter()
+            .position(|&index| index == desired)
+            .expect("playlist change plan: missing item");
+        if from == target {
+            continue;
+        }
+        plan.moves.push((from, target));
+        let moved = order.remove(from);
+        order.insert(target, moved);
+    }
+    debug_assert_eq!(
+        order
+            .iter()
+            .map(|&index| server[index].as_str())
+            .collect::<Vec<_>>(),
+        current.iter().map(String::as_str).collect::<Vec<_>>()
+    );
+    plan
+}
+
+/// Save a batch of staged playlist edits: rename, add/remove tracks and apply
+/// the minimal reorder sequence computed by `plan_playlist_changes`.
+pub async fn save_playlist(
     client: &AuthCodePkceSpotify,
     playlist_id: &str,
-    snapshot_id: &str,
-    from: usize,
-    to: usize,
+    original_name: &str,
+    name: &str,
+    original: &[String],
+    current: &[String],
 ) -> Result<()> {
-    let playlist = PlaylistId::from_id_or_uri(playlist_id)
-        .with_context(|| format!("invalid playlist ID/URI: {playlist_id}"))?;
-    let (range_start, insert_before) = reorder_positions(from, to);
-    client
-        .playlist_reorder_items(
-            playlist,
-            Some(range_start),
-            Some(insert_before),
-            Some(1),
-            Some(snapshot_id),
-        )
-        .await
-        .map_err(map_spotify_error)
-        .context("reordering playlist track failed")?;
+    if name != original_name {
+        let id = PlaylistId::from_id_or_uri(playlist_id)
+            .with_context(|| format!("invalid playlist ID/URI: {playlist_id}"))?;
+        client
+            .playlist_change_detail(id, Some(name), None, None, None)
+            .await
+            .map_err(map_spotify_error)
+            .context("renaming playlist failed")?;
+    }
+
+    let plan = plan_playlist_changes(original, current);
+
+    if !plan.remove.is_empty() {
+        let items = plan
+            .remove
+            .iter()
+            .map(|uri| playable_track_id(uri))
+            .collect::<Result<Vec<_>>>()?;
+        let id = PlaylistId::from_id_or_uri(playlist_id)?;
+        client
+            .playlist_remove_all_occurrences_of_items(id, items, None)
+            .await
+            .map_err(map_spotify_error)
+            .context("removing playlist tracks failed")?;
+    }
+
+    if !plan.add.is_empty() {
+        let items = plan
+            .add
+            .iter()
+            .map(|uri| playable_track_id(uri))
+            .collect::<Result<Vec<_>>>()?;
+        let id = PlaylistId::from_id_or_uri(playlist_id)?;
+        client
+            .playlist_add_items(id, items, None)
+            .await
+            .map_err(map_spotify_error)
+            .context("adding playlist tracks failed")?;
+    }
+
+    for (from, to) in plan.moves {
+        let (range_start, insert_before) = reorder_positions(from, to);
+        let id = PlaylistId::from_id_or_uri(playlist_id)?;
+        client
+            .playlist_reorder_items(id, Some(range_start), Some(insert_before), Some(1), None)
+            .await
+            .map_err(map_spotify_error)
+            .context("reordering playlist tracks failed")?;
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rspotify::model::UserId;
+
+    #[allow(deprecated)]
+    fn user(id: &str, display_name: Option<&str>) -> PublicUser {
+        PublicUser {
+            display_name: display_name.map(str::to_string),
+            external_urls: HashMap::new(),
+            followers: None,
+            href: String::new(),
+            id: UserId::from_id(id.to_string()).unwrap(),
+            images: Vec::new(),
+        }
+    }
 
     fn image(width: u32, url: &str) -> SpotifyImage {
         SpotifyImage {
@@ -290,6 +528,10 @@ mod tests {
             url: url.to_string(),
             width: Some(width),
         }
+    }
+
+    fn uris(list: &[&str]) -> Vec<String> {
+        list.iter().map(|uri| (*uri).to_string()).collect()
     }
 
     #[test]
@@ -307,11 +549,66 @@ mod tests {
     }
 
     #[test]
+    fn user_labels_prefer_display_names_and_hide_opaque_ids() {
+        let alice = user("aliceid", Some("Alice"));
+        let me = user("meid", None);
+        let stranger = user("bobid", None);
+        assert_eq!(
+            label_for_user(&alice, Some("meid"), "Collaborator 1"),
+            "Alice"
+        );
+        assert_eq!(label_for_user(&me, Some("meid"), "Collaborator 1"), "You");
+        assert_eq!(
+            label_for_user(&stranger, Some("meid"), "Collaborator 1"),
+            "Collaborator 1"
+        );
+    }
+
+    #[test]
     fn playlist_reorder_translates_to_spotify_positions() {
         // Original [A, B, C, D]. B moves down: range 1, insert before D (3).
         assert_eq!(reorder_positions(1, 2), (1, 3));
         // C moves up: range 2, insert before B (1).
         assert_eq!(reorder_positions(2, 1), (2, 1));
         assert_eq!(reorder_positions(0, 0), (0, 0));
+    }
+
+    #[test]
+    fn change_plan_collapses_a_single_drag_into_one_move() {
+        let original = uris(&["a", "b", "c", "d"]);
+        let current = uris(&["a", "c", "b", "d"]);
+        let plan = plan_playlist_changes(&original, &current);
+        assert!(plan.remove.is_empty());
+        assert!(plan.add.is_empty());
+        assert_eq!(plan.moves.len(), 1);
+
+        // Several keyboard steps still produce one Spotify call at save time.
+        let current = uris(&["d", "a", "b", "c"]);
+        let plan = plan_playlist_changes(&original, &current);
+        assert_eq!(plan.moves, vec![(3, 0)]);
+
+        // Dragging the first track to the end is also a single move.
+        let current = uris(&["b", "c", "d", "a"]);
+        let plan = plan_playlist_changes(&original, &current);
+        assert_eq!(plan.moves, vec![(0, 3)]);
+    }
+
+    #[test]
+    fn change_plan_batches_additions_and_removals() {
+        let original = uris(&["a", "b", "c"]);
+        let current = uris(&["a", "c", "x", "y"]);
+        let plan = plan_playlist_changes(&original, &current);
+        assert_eq!(plan.remove, uris(&["b"]));
+        assert_eq!(plan.add, uris(&["x", "y"]));
+        // After removing b and appending x/y the order already matches.
+        assert!(plan.moves.is_empty());
+
+        let original = uris(&["a", "a", "b"]);
+        let current = uris(&["a", "b"]);
+        let plan = plan_playlist_changes(&original, &current);
+        assert_eq!(plan.remove, uris(&["a"]));
+        assert_eq!(plan.add, uris(&["a"]));
+        // The surviving copy is appended after b, so b moves to the end.
+        assert_eq!(plan.moves, vec![(0, 1)]);
     }
 }

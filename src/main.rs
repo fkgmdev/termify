@@ -119,11 +119,13 @@ async fn run_tui(
     use crossterm::execute;
     use crossterm::terminal::{
         EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+        is_raw_mode_enabled,
     };
     use ratatui::Terminal;
     use ratatui::backend::CrosstermBackend;
     use ratatui_image::picker::Picker;
     use std::io::IsTerminal;
+    use std::time::Duration;
 
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -150,10 +152,17 @@ async fn run_tui(
         Picker::halfblocks()
     };
 
-    // `Picker::from_query_stdio` enables raw mode while probing and then
-    // disables it before returning. On Windows that restores processed input,
-    // so Windows Terminal swallows ↑/↓ (and other navigation keys) instead of
-    // delivering them to crossterm. Re-enter raw mode after the probe.
+    // `Picker::from_query_stdio` enables raw mode while probing and signals
+    // completion from a background thread *before* that thread disables raw
+    // mode again. Re-enabling immediately can therefore be undone a moment
+    // later, leaving Windows Terminal / Kitty in cooked mode where ↑/↓ are
+    // swallowed. Wait for the probe thread to finish restoring the terminal.
+    for _ in 0..10 {
+        if !is_raw_mode_enabled()? {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
     enable_raw_mode()?;
 
     let backend = CrosstermBackend::new(stdout);

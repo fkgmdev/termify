@@ -124,10 +124,13 @@ termify --relogin       # force re-login for both Web API and playback
 | `J` / `K` | Move selected queue track down / up (Queue tab only) |
 | `L` | Load liked songs |
 | `N` | Create a new private playlist (Playlists tab) |
-| `R` | Rename the selected playlist (Playlists tab) |
-| `A` | Add the selected track to a playlist (choose from the popup) |
-| `X` | Remove the selected track from the currently open playlist |
-| `[` / `]` | Move the selected playlist track up / down |
+| `R` | Rename the selected playlist (staged when it is currently open) |
+| `A` | Add the selected track to a playlist (staged when the target is open) |
+| `X` | Remove the selected track from the currently open playlist (staged) |
+| `J` / `K` | Move the selected track down / up in the currently open playlist (staged) |
+| `[` / `]` | Same as `J` / `K` for playlist reordering |
+| `S` | Save all staged playlist changes in one batch |
+| `D` | Discard staged playlist changes |
 | `s` | Shuffle on / off (affects next/prev and auto-advance) |
 | `c` | Show / hide cover art (no effect when the terminal blocks images) |
 | `a` | Lyrics follow playback on / off (re-syncs the selected line when re-enabled) |
@@ -147,19 +150,34 @@ playing. The active playback line stays marked with `▶`.
 
 ## Playlists and collaborators
 
-Opening a playlist with `Enter` shows its owner, visibility, collaborative flag
-and the distinct contributors Spotify reports through the tracks' `added_by`
-field; each track in the Details pane also shows who added it. Spotify's Web
-API no longer exposes a full collaborator list, so the contributor list is
-built from those per-track attributions (older items may be attributed to the
-owner or omitted).
+Opening a playlist with `Enter` shows its owner, visibility, collaborative state
+and the distinct contributors inferred from the tracks' `added_by` field; each
+track in the Details pane also shows who added it. Spotify's Web API no longer
+exposes a full collaborator list, so the contributor list is built from those
+per-track attributions (older items may be attributed to the owner or omitted).
 
-On the Playlists tab, `N` creates a private playlist and `R` renames the
-selected one; both open a small text prompt. With tracks loaded, `A` opens a
-playlist picker to add the selected track. `X` removes the selected track from
-the playlist you currently have open, and `[`/`]` move it toward the start/end
-of that playlist. Changes are sent to Spotify immediately and the playlist is
-reloaded so the displayed attribution and track order stay in sync.
+Spotify does not always set the `collaborative` flag even when several people
+have added tracks. termify treats more than one distinct contributor as a shared
+playlist and labels the Details pane `Collaborative: Yes (inferred)`. Anonymous
+user IDs are never shown: names come from `display_name` when available, the
+signed-in user is shown as `You`, and other anonymous IDs become
+`Collaborator 1`, `Collaborator 2`, and so on.
+
+On the Playlists tab, `N` creates a private playlist immediately. `R` renames
+the selected playlist, but when that playlist is currently open the rename is
+staged instead. With tracks loaded, `A` opens a playlist picker: choosing the
+open playlist stages the addition (attributed to `You`), while other playlists
+are updated immediately. `X` removes the selected track from the currently open
+playlist, and `J`/`K` or `[`/`]` move it toward the end/start with the cursor
+following it. Renaming, adding, removing and reordering the open playlist are
+all local until you press `S`; `D` discards them. Reopening a playlist with
+staged edits restores the local draft.
+
+`S` sends one batch: the rename only when the name actually changed, one remove
+call for changed URIs, one add call for added URIs, and the minimal sequence of
+reorder calls needed for the final order. Repeated keyboard reorders therefore
+cost one request at save time instead of one per keystroke, and retained tracks
+keep their original `added_by` attribution.
 
 Playlist edits need the `playlist-modify-private` and `playlist-modify-public`
 scopes. Cached Web API tokens without them are rejected at startup and termify
@@ -250,10 +268,11 @@ clock anchored on a 250 ms tick.
   resolves to an incompatible `vergen 9.1.0`. `Cargo.lock` pins `vergen 9.0.6`.
   Do not delete `Cargo.lock` without re-applying `cargo update -p vergen --precise 9.0.6`.
 - **Token file permissions**: both token caches are written with mode `0600`.
-- **Arrow keys in Windows Terminal**: termify re-enters raw mode after the
-  cover-art terminal probe (the probe temporarily disables it) and also
-  reassembles `ESC [ A/B/C/D` fragments, so `↑`/`↓` navigate lists and lyrics
-  in Windows Terminal and ConPTY hosts without VT input processing.
+- **Arrow keys in Kitty / Windows Terminal**: the cover-art probe signals
+  completion before its background thread has restored the terminal, so termify
+  waits for raw mode to be disabled before re-entering it. It also reassembles
+  `ESC [ A/B/C/D` fragments, so `↑`/`↓` navigate lists and lyrics in Kitty,
+  Windows Terminal and ConPTY hosts without VT input processing.
 - **Lyrics**: LRCLIB is a free third-party service with no API key; availability
   may vary. If its exact-match lookup returns a translated entry for a non-Latin
   track, termify searches LRCLIB for the original-language entry (verified with
