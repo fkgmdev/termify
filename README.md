@@ -401,6 +401,11 @@ on a 250 ms tick; offline progress comes from the rodio sink.
   keeps two tokens: your Client ID (PKCE) for the Web API, and Spotify's desktop
   client ID (device pairing) for local playback. If you have an old single token,
   re-run `termify auth`.
+- **`http error: status code 400 Bad Request` at startup**: a cached token can no
+  longer be refreshed, usually because it was issued to a different Client ID or
+  redirect URI. termify now ignores that cache and starts a fresh login. If it
+  repeats, confirm your Client ID and that the redirect URI is exactly
+  `http://127.0.0.1:8989/callback`, then run `termify --relogin`.
 - **`429 API rate limit exceeded`**: the Web API uses your own Client ID to avoid
   sharing Spotify's heavily rate-limited desktop client. If it still happens,
   wait for `Retry-After` and retry; the TUI status bar now shows this clearly.

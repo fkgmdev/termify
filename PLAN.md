@@ -136,6 +136,9 @@ streaming tracks and from the rodio sink for downloaded files.
       on startup and no network request for cached tracks
 - [x] Token refresh persistence verified in practice (expired cache refreshed,
       playback succeeded, new token cached with `0600`)
+- [x] Failed token refresh no longer aborts startup: an invalid/stale cache now
+      falls through to the PKCE or device-pairing login, with startup errors
+      labelled as Web API vs local playback authentication
 - [x] MPRIS D-Bus player: track metadata, playback status, position, volume,
       shuffle and repeat (`Loop_Status`) published to the DE; play/pause,
       next/previous, seek/set-position, volume, shuffle, loop status and OpenUri

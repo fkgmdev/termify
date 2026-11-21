@@ -91,7 +91,16 @@ async fn client_from_cache(
         .is_some_and(|t| t.is_expired())
     {
         tracing::info!("Access token expired; refreshing {}", path.display());
-        client.refresh_token().await?;
+        if let Err(err) = client.refresh_token().await {
+            // Invalid/stale refresh tokens (including the 400 Spotify returns
+            // when the cached token belongs to a different app or redirect URI)
+            // must not abort startup. Fall through to a fresh login instead.
+            tracing::warn!(
+                "Could not refresh cached token ({}): {err}; starting a new login",
+                path.display()
+            );
+            return Ok(None);
+        }
         let refreshed = client
             .token
             .lock()
@@ -150,7 +159,7 @@ pub async fn authenticated(
         {
             return Ok(client);
         }
-        println!("Re-authorizing with Spotify to enable playlist editing...");
+        println!("Re-authorizing with Spotify...");
     }
     web_login(config, paths).await
 }
@@ -225,7 +234,10 @@ async fn web_login(config: &Config, paths: &Paths) -> Result<AuthCodePkceSpotify
     let code = client
         .parse_response_code(&callback_url)
         .context("authorization callback did not contain a code")?;
-    client.request_token(&code).await?;
+    client
+        .request_token(&code)
+        .await
+        .context("exchanging the authorization code (check Client ID and redirect URI)")?;
 
     let token = client
         .token

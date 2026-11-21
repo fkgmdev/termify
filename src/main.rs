@@ -9,7 +9,7 @@ mod os_media;
 mod player;
 mod ui;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tokio::sync::mpsc;
 
@@ -66,16 +66,22 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Some(Command::Auth) => {
-            auth::authenticated(&config, &paths, true).await?;
+            auth::authenticated(&config, &paths, true)
+                .await
+                .context("authenticating with Spotify Web API")?;
             println!("Web API token cached at {}", paths.token_file.display());
-            auth::playback_access_token(&paths, false).await?;
+            auth::playback_access_token(&paths, false)
+                .await
+                .context("authenticating for local playback")?;
             println!(
                 "Playback token cached at {}",
                 paths.playback_token_file.display()
             );
         }
         Some(Command::Play { uri }) => {
-            let access_token = auth::playback_access_token(&paths, cli.relogin).await?;
+            let access_token = auth::playback_access_token(&paths, cli.relogin)
+                .await
+                .context("authenticating for local playback")?;
 
             println!("Connecting to Spotify for local playback...");
             let local = player::LocalPlayer::connect(&access_token, &config, &paths).await?;
@@ -84,7 +90,9 @@ async fn main() -> Result<()> {
             tokio::signal::ctrl_c().await?;
         }
         Some(Command::Search { query }) => {
-            let spotify = auth::authenticated(&config, &paths, cli.relogin).await?;
+            let spotify = auth::authenticated(&config, &paths, cli.relogin)
+                .await
+                .context("authenticating with Spotify Web API")?;
             let tracks = api::search_tracks(&spotify, &query).await?;
             if tracks.is_empty() {
                 println!("No tracks found for '{query}'");
@@ -100,8 +108,12 @@ async fn main() -> Result<()> {
             } else if cli.offline {
                 run_tui(None, None, &paths, false, true).await?;
             } else {
-                let spotify = auth::authenticated(&config, &paths, cli.relogin).await?;
-                let access_token = auth::playback_access_token(&paths, cli.relogin).await?;
+                let spotify = auth::authenticated(&config, &paths, cli.relogin)
+                    .await
+                    .context("authenticating with Spotify Web API")?;
+                let access_token = auth::playback_access_token(&paths, cli.relogin)
+                    .await
+                    .context("authenticating for local playback")?;
 
                 let player = match player::LocalPlayer::connect(&access_token, &config, &paths).await
                 {
