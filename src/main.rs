@@ -1,4 +1,5 @@
 mod api;
+mod art;
 mod auth;
 mod config;
 mod lyrics;
@@ -121,15 +122,40 @@ async fn run_tui(
     };
     use ratatui::Terminal;
     use ratatui::backend::CrosstermBackend;
+    use ratatui_image::picker::Picker;
+    use std::io::IsTerminal;
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
+
+    // Probe the terminal for graphics support after entering the alternate
+    // screen but before starting the crossterm event stream, as ratatui-image
+    // briefly writes to and reads from stdio while querying capabilities.
+    let art_blocked_reason = if std::env::var_os("TERMIFY_NO_ART").is_some() {
+        Some("TERMIFY_NO_ART is set".to_string())
+    } else if std::env::var("TERM").as_deref() == Ok("dumb") {
+        Some("TERM=dumb".to_string())
+    } else {
+        None
+    };
+    let can_query = art_blocked_reason.is_none()
+        && std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal();
+    let picker = if can_query {
+        Picker::from_query_stdio().unwrap_or_else(|err| {
+            tracing::warn!("Terminal image query failed, using halfblocks: {err}");
+            Picker::halfblocks()
+        })
+    } else {
+        Picker::halfblocks()
+    };
+
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let (tx, mut rx) = mpsc::channel(64);
-    let mut app = ui::App::new(tx.clone());
+    let mut app = ui::App::new(tx.clone(), picker, art_blocked_reason);
 
     if let Some(client) = spotify {
         app.api_client = Some(std::sync::Arc::new(client));

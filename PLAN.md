@@ -17,7 +17,8 @@ or decisions change.
 | Runtime | `tokio` (multi-thread), single `mpsc` Action channel into `App` |
 | Audio backend | librespot-playback with rodio/ALSA (`SoftMixer` for volume) |
 | Lyrics | LRCLIB (line-synced, no key) primary, original-language entry preferred; English translation via Google's public endpoint on demand. Cached in-memory by track URI. Genius unsynced fallback deferred to polish |
-| Config/cache | `~/.config/termify/config.toml`, `~/.cache/termify/` (`token.json` for Web API, `playback_token.json` for playback, audio cache) |
+| Cover art | Album images from the Web API, rendered with `ratatui-image` 11.1.0 (Kitty/iTerm2/Sixel with halfblocks fallback); fetch/decode failures degrade to text placeholders; `TERMIFY_NO_ART`/`TERM=dumb` disable art. URL also published as MPRIS `mpris:artUrl` |
+| Config/cache | Platform-specific `#[cfg]` blocks: Linux XDG (`~/.config/termify`, `~/.cache/termify`), macOS (`~/Library/Application Support/termify`, `~/Library/Caches/termify`), Windows (`%APPDATA%\termify`, `%LOCALAPPDATA%\termify\cache`) |
 | Redirect URI | `http://127.0.0.1:8989/callback` for PKCE; device pairing uses `https://spotify.com/pair` |
 | Desktop integration | MPRIS via `mpris-server` 0.11 (`Player` builder); media keys are routed by the DE, not grabbed directly |
 
@@ -31,7 +32,8 @@ key) and is best-effort; failures keep the original lyrics visible.
 ```
 src/
   main.rs            # CLI, tokio runtime, TUI wiring, shutdown
-  config.rs          # config.toml (client id, redirect URI, volume, backend)
+  config.rs          # config.toml (client id, redirect URI, volume, backend), platform paths
+  art.rs             # cover-art state, fetch/decode, terminal protocol helpers
   auth.rs            # PKCE + device-pairing flows, token caches + refresh
   api.rs             # rspotify wrapper (search, playlists, liked songs)
   player.rs          # librespot Session + Player, playback controls, events
@@ -45,7 +47,7 @@ src/
 ```
 
 Key events, MPRIS controls and background tasks (API calls, player events, lyrics
-fetches) all push `Action`s into one channel. The main loop owns `App`, applies
+and cover-art fetches) all push `Action`s into one channel. The main loop owns `App`, applies
 actions, publishes an MPRIS state snapshot and redraws. The MPRIS `Player` is
 `!Send`, so it runs on a dedicated thread with a current-thread runtime.
 Playback progress is derived from a local clock anchored on a 250 ms tick.
@@ -74,7 +76,7 @@ Playback progress is derived from a local clock anchored on a 250 ms tick.
 
 ### M1 — TUI shell (done)
 - [x] Layout: header with tabs, list pane, detail pane, now-playing footer
-- [x] Keybindings: `j/k`, `g/G`, `PgUp/PgDn`, `Enter`, `/`, `Space`, `n/p`, `←/→`, `+/-`, `l`, `Q`, `J/K`, `L`, `s`, `a`, `t`, `Tab`, `?`, `q`, `Ctrl-C`
+- [x] Keybindings: `j/k`, `g/G`, `PgUp/PgDn`, `Enter`, `/`, `Space`, `n/p`, `←/→`, `+/-`, `l`, `Q`, `J/K`, `L`, `s`, `c`, `a`, `t`, `Tab`, `?`, `q`, `Ctrl-C`
       (Tab/Shift+Tab use crossterm's `Tab`/`BackTab` codes)
 - [x] Config loading (client ID, redirect URI, volume, audio backend)
 - [x] Single `mpsc` Action channel with crossterm event stream + 250 ms tick
@@ -106,7 +108,7 @@ Playback progress is derived from a local clock anchored on a 250 ms tick.
 - [x] Plain-lyrics fallback, "no lyrics" state, in-memory cache by track URI
 - [x] Unit tests for LRC parsing, active-line tracking, scroll offsets, script
       detection, translation parsing, queue reordering, lyric-line seek/key
-      handling and MPRIS state/action handling (18 passing)
+      handling and MPRIS state/action handling (28 passing after M5 art work)
 - [x] Fixed LRCLIB camelCase field mapping (`syncedLyrics`/`plainLyrics`) that
       made every lookup report "no lyrics"; verified with "Knee Socks"
 - [x] Prefer original-language LRCLIB entry when `/api/get` returns a translation
@@ -133,13 +135,22 @@ Playback progress is derived from a local clock anchored on a 250 ms tick.
       marked; `j/k` move the cursor, `J/K` swap a track with its neighbour,
       `Enter` plays it, and the cursor follows the current track. Reordering is
       reset when shuffle is toggled or a new track list is loaded (unit tested)
+- [x] Cover art: `art.rs` downloads/decodes Spotify album images off-thread,
+      builds a fixed-size `ratatui-image` protocol after terminal probing, and
+      renders it in the Details pane; `c` toggles art at runtime
+- [x] Graceful image fallbacks: Kitty/iTerm2/Sixel detected at startup, halfblocks
+      when no graphics protocol exists, text placeholders for no art/loading/
+      failure, and art disabled entirely for `TERM=dumb` or `TERMIFY_NO_ART`
+- [x] Platform-specific config/cache `#[cfg]` blocks for Linux (XDG), macOS and
+      Windows with absolute-path validation and a fallback for other targets
+- [x] MPRIS `mpris:artUrl` now populated from the current track's album image
 - [ ] Repeat mode
 - [ ] Integration tests with a mock HTTP layer
 
 ## Deferred (not in v1)
 
-Spotify Connect device registration, cover art (`mpris:artUrl`), daemon mode,
-CLI scripting, audio visualization, desktop notifications.
+Spotify Connect device registration, daemon mode, CLI scripting, audio
+visualization, desktop notifications.
 
 ## User-provided credentials needed
 

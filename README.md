@@ -4,8 +4,8 @@ A terminal Spotify client written in Rust that **plays audio locally** through
 librespot — it does not control the official Spotify app. Browse and search your
 library, play music, and read synced lyrics, all from the terminal.
 
-> Status: early development (milestones M0–M4 implemented). See [PLAN.md](PLAN.md)
-> for the full roadmap and current progress.
+> Status: early development (milestones M0–M4 implemented, M5 polish underway).
+> See [PLAN.md](PLAN.md) for the full roadmap and current progress.
 
 ## Features (v1 scope)
 
@@ -24,12 +24,14 @@ library, play music, and read synced lyrics, all from the terminal.
 - Original-language lyrics preferred over translated LRCLIB entries; optional
   English translation (`t`), cached per track
 - Ratatui TUI with a single async action loop and `--demo` mode
+- Album cover art in the Details pane using Kitty/iTerm2/Sixel when available,
+  with Unicode halfblocks and text placeholders as fallbacks; the same URL is
+  published as MPRIS `mpris:artUrl` for desktop players
 - MPRIS integration: the current track appears in the desktop media player, and
   global XF86 audio keys (play/pause, next, previous, volume, seek) work
   anywhere on the desktop through the window manager's MPRIS media-key routing
 
-Not in v1: Spotify Connect, cover art, daemon mode, repeat mode, audio
-visualization.
+Not in v1: Spotify Connect, daemon mode, repeat mode, audio visualization.
 
 ## Requirements
 
@@ -50,8 +52,14 @@ visualization.
    http://127.0.0.1:8989/callback
    ```
 
-2. Configure the Client ID via `SPOTIFY_CLIENT_ID` or in
-   `~/.config/termify/config.toml` (created on first run):
+2. Configure the Client ID via `SPOTIFY_CLIENT_ID` or in `config.toml` (created
+   on first run). The config and cache roots are platform-specific:
+
+   | OS | Config file | Cache directory |
+   | --- | --- | --- |
+   | Linux | `$XDG_CONFIG_HOME/termify/config.toml` (default `~/.config/termify/config.toml`) | `$XDG_CACHE_HOME/termify` (default `~/.cache/termify`) |
+   | macOS | `~/Library/Application Support/termify/config.toml` | `~/Library/Caches/termify` |
+   | Windows | `%APPDATA%\termify\config.toml` | `%LOCALAPPDATA%\termify\cache` |
 
    ```toml
    client_id = "your-client-id-here"
@@ -67,10 +75,10 @@ visualization.
    ```
 
    This runs two flows:
-   - PKCE in your browser for the Web API; token cached at
-     `~/.cache/termify/token.json`.
+   - PKCE in your browser for the Web API; token cached as `token.json` in the
+     cache directory above.
    - Device pairing at https://spotify.com/pair for local playback; token cached
-     at `~/.cache/termify/playback_token.json`.
+     as `playback_token.json` in the same directory.
 
    Both caches are written with `0600` permissions.
 
@@ -111,6 +119,7 @@ termify --relogin       # force re-login for both Web API and playback
 | `J` / `K` | Move selected queue track down / up |
 | `L` | Load liked songs |
 | `s` | Shuffle on / off (affects next/prev and auto-advance) |
+| `c` | Show / hide cover art (no effect when the terminal blocks images) |
 | `a` | Lyrics follow playback on / off (re-syncs the selected line when re-enabled) |
 | `t` | Translate lyrics to English (on the Lyrics tab) |
 | `?` | Help overlay |
@@ -125,6 +134,19 @@ On the Lyrics tab, `j`/`k` (and `g`/`G`, `PgUp`/`PgDn`) select a line with `»`,
 which disables follow mode. `Enter` seeks playback to that line's timestamp and
 re-enables following; `a` manually re-syncs the selection to the line currently
 playing. The active playback line stays marked with `▶`.
+
+## Cover art
+
+When a track has album art, termify downloads the 300px Spotify image in the
+background and draws it above the track metadata in the Details pane. It uses
+the best terminal graphics protocol available (Kitty, iTerm2 or Sixel) and falls
+back to Unicode halfblocks when the terminal has no graphics protocol. Fetch,
+decode and protocol errors never interrupt playback: the pane simply shows a
+text placeholder such as `Loading cover art...` or `Cover art unavailable`.
+
+Set `TERMIFY_NO_ART=1` (or use `TERM=dumb`) to disable art entirely and reclaim
+the space for metadata. `c` toggles art at runtime; the same album-art URL is
+also published to the desktop through MPRIS.
 
 ## Desktop media player / global media keys
 
@@ -158,7 +180,8 @@ Single binary, modular source:
 ```
 src/
   main.rs     # CLI + tokio runtime, TUI wiring, shutdown
-  config.rs   # config.toml, paths, env overrides
+  config.rs   # config.toml, platform-specific paths, env overrides
+  art.rs      # cover-art state, fetch/decode, terminal protocol helpers
   auth.rs     # PKCE + device-pairing flows, token caches + refresh
   api.rs      # rspotify wrapper (search, playlists, liked songs)
   player.rs   # librespot session, Player, mixer, playback controls
@@ -171,7 +194,7 @@ src/
 ```
 
 Events from the keyboard, MPRIS and background tasks (API calls, player events,
-lyrics) all flow into one `mpsc` channel. `App` owns all state, applies actions
+lyrics, cover art) all flow into one `mpsc` channel. `App` owns all state, applies actions
 and redraws. After each action it publishes a state snapshot to the MPRIS thread,
 which runs on its own current-thread Tokio runtime because `mpris-server`'s
 `Player` is `Rc`-based and not `Send`. Playback progress is derived from a local
@@ -204,3 +227,7 @@ clock anchored on a 250 ms tick.
   (unofficial, no API key) and is cached per track for the session. If the
   service is unavailable the status bar shows the error and original lyrics stay
   visible.
+- **Cover art**: if your terminal cannot show images you will see Unicode
+  halfblocks or a text placeholder instead; nothing is written to disk. Set
+  `TERMIFY_NO_ART=1` to skip terminal probing and disable art completely. A
+  missing or failed art fetch only affects the placeholder text.

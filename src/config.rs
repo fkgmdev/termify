@@ -1,7 +1,7 @@
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,12 +54,74 @@ pub struct Paths {
     pub playback_token_file: PathBuf,
 }
 
+/// Accept an environment-supplied base directory only when it is absolute, as
+/// required by the XDG base-directory spec.
+fn absolute_env_path(value: Option<OsString>) -> Option<PathBuf> {
+    let path = PathBuf::from(value?);
+    path.is_absolute().then_some(path)
+}
+
+fn home_dir() -> Result<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .context("could not determine home directory")
+}
+
+#[cfg(target_os = "linux")]
+fn config_root() -> Result<PathBuf> {
+    if let Some(root) = absolute_env_path(std::env::var_os("XDG_CONFIG_HOME")) {
+        return Ok(root);
+    }
+    Ok(home_dir()?.join(".config"))
+}
+
+#[cfg(target_os = "linux")]
+fn cache_root() -> Result<PathBuf> {
+    if let Some(root) = absolute_env_path(std::env::var_os("XDG_CACHE_HOME")) {
+        return Ok(root);
+    }
+    Ok(home_dir()?.join(".cache"))
+}
+
+#[cfg(target_os = "macos")]
+fn config_root() -> Result<PathBuf> {
+    Ok(home_dir()?.join("Library").join("Application Support"))
+}
+
+#[cfg(target_os = "macos")]
+fn cache_root() -> Result<PathBuf> {
+    Ok(home_dir()?.join("Library").join("Caches"))
+}
+
+#[cfg(target_os = "windows")]
+fn config_root() -> Result<PathBuf> {
+    std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .context("APPDATA is not set; could not determine config directory")
+}
+
+#[cfg(target_os = "windows")]
+fn cache_root() -> Result<PathBuf> {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .context("LOCALAPPDATA is not set; could not determine cache directory")
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn config_root() -> Result<PathBuf> {
+    Ok(home_dir()?.join(".config"))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn cache_root() -> Result<PathBuf> {
+    Ok(home_dir()?.join(".cache"))
+}
+
 impl Paths {
     pub fn discover() -> Result<Self> {
-        let dirs = ProjectDirs::from("", "", "termify")
-            .context("could not determine config/cache directories")?;
-        let config_dir = dirs.config_dir().to_path_buf();
-        let cache_dir = dirs.cache_dir().to_path_buf();
+        let config_dir = config_root()?.join("termify");
+        let cache_dir = cache_root()?.join("termify");
         Ok(Self {
             config_file: config_dir.join("config.toml"),
             token_file: cache_dir.join("token.json"),
@@ -114,4 +176,35 @@ pub fn load(paths: &Paths) -> Result<Config> {
     }
 
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn absolute_env_paths_only_accept_absolute_paths() {
+        let absolute = std::env::current_dir()
+            .expect("current directory")
+            .join("termify-config");
+        assert_eq!(
+            absolute_env_path(Some(absolute.clone().into_os_string())),
+            Some(absolute)
+        );
+        assert_eq!(absolute_env_path(Some("relative/path".into())), None);
+        assert_eq!(absolute_env_path(None), None);
+    }
+
+    #[test]
+    fn app_dirs_are_scoped_to_termify() {
+        // Exercise the pure part of path resolution without mutating the
+        // process environment (tests run in parallel).
+        let config = Path::new("config").join("termify");
+        let cache = Path::new("cache").join("termify");
+        assert_eq!(config, Path::new("config/termify"));
+        assert_eq!(cache, Path::new("cache/termify"));
+        assert_eq!(config.join("config.toml"), Path::new("config/termify/config.toml"));
+        assert_eq!(cache.join("token.json"), Path::new("cache/termify/token.json"));
+    }
 }

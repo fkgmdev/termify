@@ -9,12 +9,13 @@ license = "MIT"
 anyhow = "1"
 chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
-directories = "6"
 futures = "0.3"
+image = { version = "=0.25.6", default-features = false, features = ["jpeg", "png"] }
 librespot-core = "0.8"
 librespot-playback = "0.8"
 mpris-server = { version = "0.11", features = ["tokio"] }
 ratatui = "0.30"
+ratatui-image = { version = "11.1.0", default-features = false, features = ["crossterm"] }
 rand = "0.8"
 crossterm = { version = "0.29", features = ["event-stream"] }
 reqwest = { version = "0.12", features = ["json"] }

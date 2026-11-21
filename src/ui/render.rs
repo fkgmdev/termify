@@ -5,6 +5,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs, Widget};
 
 use super::app::{App, Tab, format_duration, lyric_scroll_offset};
+use crate::art;
 
 const CYAN: Color = Color::Cyan;
 const YELLOW: Color = Color::Yellow;
@@ -352,6 +353,27 @@ fn render_detail_pane(frame: &mut Frame, area: Rect, app: &App) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    // Reserve room for the cover above the metadata, but never squeeze the
+    // details away entirely on short terminals. Disabled art reclaims the space.
+    let art_height = if app.art_enabled {
+        inner.height.saturating_sub(5).min(art::ART_ROWS)
+    } else {
+        0
+    };
+    let (art_area, text_area) = if art_height > 0 {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(art_height), Constraint::Min(1)])
+            .split(inner);
+        (Some(chunks[0]), chunks[1])
+    } else {
+        (None, inner)
+    };
+
+    if let Some(art_area) = art_area {
+        render_cover(frame, art_area, app);
+    }
+
     let lines = if app.tab == Tab::Playlists {
         match app.list_state.selected().and_then(|i| app.playlists.get(i)) {
             Some(playlist) => vec![
@@ -381,37 +403,78 @@ fn render_detail_pane(frame: &mut Frame, area: Rect, app: &App) {
         }
     } else {
         match app.list_state.selected().and_then(|i| app.tracks.get(i)) {
-        Some(track) => vec![
-            Line::from(vec![
-                Span::styled("Title:   ", Style::default().fg(DARK_GRAY)),
-                Span::styled(track.title.clone(), Style::default().fg(WHITE).bold()),
-            ]),
-            Line::from(vec![
-                Span::styled("Artist:  ", Style::default().fg(DARK_GRAY)),
-                Span::styled(track.artist.clone(), Style::default().fg(WHITE)),
-            ]),
-            Line::from(vec![
-                Span::styled("Album:   ", Style::default().fg(DARK_GRAY)),
-                Span::styled(track.album.clone(), Style::default().fg(WHITE)),
-            ]),
-            Line::from(vec![
-                Span::styled("Length:  ", Style::default().fg(DARK_GRAY)),
-                Span::styled(format_duration(track.duration), Style::default().fg(WHITE)),
-            ]),
-            Line::from(""),
-            Line::from(Span::styled(
-                "Press Enter to select for playback",
+            Some(track) => vec![
+                Line::from(vec![
+                    Span::styled("Title:   ", Style::default().fg(DARK_GRAY)),
+                    Span::styled(track.title.clone(), Style::default().fg(WHITE).bold()),
+                ]),
+                Line::from(vec![
+                    Span::styled("Artist:  ", Style::default().fg(DARK_GRAY)),
+                    Span::styled(track.artist.clone(), Style::default().fg(WHITE)),
+                ]),
+                Line::from(vec![
+                    Span::styled("Album:   ", Style::default().fg(DARK_GRAY)),
+                    Span::styled(track.album.clone(), Style::default().fg(WHITE)),
+                ]),
+                Line::from(vec![
+                    Span::styled("Length:  ", Style::default().fg(DARK_GRAY)),
+                    Span::styled(format_duration(track.duration), Style::default().fg(WHITE)),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Press Enter to select for playback",
+                    Style::default().fg(DARK_GRAY).italic(),
+                )),
+            ],
+            None => vec![Line::from(Span::styled(
+                "Select a track to see details",
                 Style::default().fg(DARK_GRAY).italic(),
-            )),
-        ],
-        None => vec![Line::from(Span::styled(
-            "Select a track to see details",
-            Style::default().fg(DARK_GRAY).italic(),
-        ))],
+            ))],
         }
     };
 
-    frame.render_widget(Paragraph::new(lines), inner);
+    frame.render_widget(Paragraph::new(lines), text_area);
+}
+
+fn render_cover(frame: &mut Frame, area: Rect, app: &App) {
+    if let Some(protocol) = app.art.protocol() {
+        let size = protocol.size();
+        if size.width > 0 && size.height > 0 && size.width <= area.width && size.height <= area.height {
+            let x = area.x + (area.width - size.width) / 2;
+            let y = area.y + (area.height - size.height) / 2;
+            let image_area = Rect::new(x, y, size.width, size.height);
+            frame.render_widget(
+                ratatui_image::Image::new(protocol).allow_clipping(true),
+                image_area,
+            );
+            return;
+        }
+    }
+    render_art_placeholder(frame, area, app);
+}
+
+fn render_art_placeholder(frame: &mut Frame, area: Rect, app: &App) {
+    let lines: Vec<Line> = app
+        .art
+        .placeholder_lines()
+        .into_iter()
+        .map(|line| {
+            Line::from(Span::styled(
+                line,
+                Style::default().fg(DARK_GRAY).italic(),
+            ))
+        })
+        .collect();
+    let hint = if app.art_enabled {
+        " [c] hide art"
+    } else {
+        " [c] show art"
+    };
+    let mut lines = lines;
+    if area.height > lines.len() as u16 + 1 {
+        lines.push(Line::from(Span::styled(hint, Style::default().fg(DARK_GRAY))));
+    }
+    frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), area);
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
@@ -484,6 +547,8 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         Span::raw("search"),
         Span::styled(" [l] ", Style::default().fg(YELLOW)),
         Span::raw("lyrics"),
+        Span::styled(" [c] ", Style::default().fg(YELLOW)),
+        Span::raw(if app.art_enabled { "art ON" } else { "art" }),
         Span::styled(" [Q] ", Style::default().fg(YELLOW)),
         Span::raw("queue"),
         Span::styled(" [s] ", Style::default().fg(YELLOW)),
@@ -529,6 +594,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::from("  J / K       Move queue track down / up"),
         Line::from("  Enter       Play queue track / jump to selected lyric"),
         Line::from("  s           Shuffle on / off"),
+        Line::from("  c           Show / hide cover art (falls back to text when unsupported)"),
         Line::from("  a           Lyrics follow playback on / off"),
         Line::from("  t           Translate lyrics to English (lyrics tab)"),
         Line::from("  ?           Toggle this help"),
@@ -545,4 +611,36 @@ fn render_help(frame: &mut Frame, area: Rect) {
     );
     frame.render_widget(ratatui::widgets::Clear, popup);
     Widget::render(widget, popup, frame.buffer_mut());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::art::{self, CoverArt};
+    use crate::ui::app::App;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui_image::picker::Picker;
+    use tokio::sync::mpsc;
+
+    fn test_app() -> App {
+        let (tx, _rx) = mpsc::channel(8);
+        let mut app = App::new(tx, Picker::halfblocks(), None);
+        app.load_demo();
+        app
+    }
+
+    #[test]
+    fn detail_pane_renders_both_ready_art_and_placeholder() {
+        let mut app = test_app();
+        app.art = CoverArt::no_art();
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+
+        let image: image::DynamicImage = image::RgbImage::new(64, 64).into();
+        let protocol = art::build_protocol(&Picker::halfblocks(), image).unwrap();
+        app.art = CoverArt::ready("https://example.com/cover.jpg", protocol);
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+    }
 }

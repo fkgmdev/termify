@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use rspotify::{AuthCodePkceSpotify, ClientError};
 use rspotify::clients::{BaseClient, OAuthClient};
-use rspotify::model::{FullTrack, PlayableItem, PlaylistId, SearchResult, SearchType};
+use rspotify::model::{FullTrack, Image as SpotifyImage, PlayableItem, PlaylistId, SearchResult, SearchType};
 use rspotify::prelude::*;
 
 use crate::ui::{Playlist, Track};
@@ -18,6 +18,18 @@ fn map_spotify_error(err: ClientError) -> anyhow::Error {
     } else {
         anyhow!(err)
     }
+}
+
+/// Choose the most useful album-art URL: the 300px variant when Spotify
+/// supplies one, otherwise the largest available image.
+fn pick_art_url(images: &[SpotifyImage]) -> Option<String> {
+    if let Some(image) = images.iter().find(|image| image.width == Some(300)) {
+        return Some(image.url.clone());
+    }
+    images
+        .iter()
+        .max_by_key(|image| image.width.unwrap_or(0))
+        .map(|image| image.url.clone())
 }
 
 /// Convert an rspotify `FullTrack` into the UI's `Track`.
@@ -34,6 +46,7 @@ pub fn track_from_full(track: &FullTrack) -> Option<Track> {
         album: track.album.name.clone(),
         duration: track.duration.to_std().unwrap_or(Duration::ZERO),
         uri: format!("spotify:track:{}", id.id()),
+        art_url: pick_art_url(&track.album.images),
     })
 }
 
@@ -104,6 +117,33 @@ pub async fn liked_songs(client: &AuthCodePkceSpotify) -> Result<Vec<Track>> {
         .iter()
         .filter_map(|item| track_from_full(&item.track))
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn image(width: u32, url: &str) -> SpotifyImage {
+        SpotifyImage {
+            height: Some(width),
+            url: url.to_string(),
+            width: Some(width),
+        }
+    }
+
+    #[test]
+    fn prefers_300px_art_and_falls_back_to_largest() {
+        let images = vec![
+            image(64, "small"),
+            image(640, "large"),
+            image(300, "preferred"),
+        ];
+        assert_eq!(pick_art_url(&images).as_deref(), Some("preferred"));
+
+        let images = vec![image(64, "small"), image(640, "large")];
+        assert_eq!(pick_art_url(&images).as_deref(), Some("large"));
+        assert_eq!(pick_art_url(&[]), None);
+    }
 }
 
 

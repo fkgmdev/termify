@@ -3,7 +3,10 @@ use std::time::Duration;
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::ListState;
+use ratatui_image::picker::Picker;
 use tokio::sync::mpsc::Sender;
+
+use crate::art::{self, ArtStatus, CoverArt};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -51,6 +54,8 @@ pub struct Track {
     pub album: String,
     pub duration: Duration,
     pub uri: String,
+    /// Album-cover URL from the Web API, used for TUI and MPRIS artwork.
+    pub art_url: Option<String>,
 }
 
 impl Track {
@@ -107,6 +112,12 @@ pub enum Action {
         uri: String,
         result: Result<Vec<String>, String>,
     },
+    /// Cover art downloaded and decoded off the UI thread. `url` keeps stale
+    /// responses from replacing the image for a different track.
+    CoverArtLoaded {
+        url: String,
+        result: Result<image::DynamicImage, String>,
+    },
     // Controls coming from MPRIS (desktop media player / global media keys).
     MprisPlayPause,
     MprisPlay,
@@ -153,13 +164,25 @@ pub struct App {
     pub play_order: Vec<usize>,
     /// Selected row on the Queue tab, as a position in `play_order`.
     pub queue_cursor: usize,
+    /// Current cover-art state (image protocol or text placeholder).
+    pub art: CoverArt,
+    /// User-facing art toggle. Forced off when the terminal cannot show images.
+    pub art_enabled: bool,
+    art_blocked_reason: Option<String>,
+    picker: Picker,
+    http_client: reqwest::Client,
     tx: Sender<Action>,
 }
 
 impl App {
-    pub fn new(tx: Sender<Action>) -> Self {
+    pub fn new(tx: Sender<Action>, picker: Picker, art_blocked_reason: Option<String>) -> Self {
         let mut list_state = ListState::default();
         list_state.select(Some(0));
+        let art = match &art_blocked_reason {
+            Some(reason) => CoverArt::disabled(reason.clone()),
+            None => CoverArt::no_art(),
+        };
+        let art_enabled = art_blocked_reason.is_none();
         Self {
             running: true,
             tab: Tab::Search,
@@ -185,6 +208,11 @@ impl App {
             shuffle: false,
             play_order: Vec::new(),
             queue_cursor: 0,
+            art,
+            art_enabled,
+            art_blocked_reason,
+            picker,
+            http_client: reqwest::Client::new(),
             tx,
         }
     }
@@ -199,6 +227,7 @@ impl App {
                 album: "A Night at the Opera".into(),
                 duration: Duration::from_secs(354),
                 uri: "spotify:track:demo1".into(),
+                art_url: None,
             },
             Track {
                 title: "Stairway to Heaven".into(),
@@ -206,6 +235,7 @@ impl App {
                 album: "Led Zeppelin IV".into(),
                 duration: Duration::from_secs(482),
                 uri: "spotify:track:demo2".into(),
+                art_url: None,
             },
             Track {
                 title: "Imagine".into(),
@@ -213,6 +243,7 @@ impl App {
                 album: "Imagine".into(),
                 duration: Duration::from_secs(183),
                 uri: "spotify:track:demo3".into(),
+                art_url: None,
             },
             Track {
                 title: "Hotel California".into(),
@@ -220,6 +251,7 @@ impl App {
                 album: "Hotel California".into(),
                 duration: Duration::from_secs(391),
                 uri: "spotify:track:demo4".into(),
+                art_url: None,
             },
             Track {
                 title: "Sweet Child O' Mine".into(),
@@ -227,6 +259,7 @@ impl App {
                 album: "Appetite for Destruction".into(),
                 duration: Duration::from_secs(356),
                 uri: "spotify:track:demo5".into(),
+                art_url: None,
             },
         ];
         self.build_play_order();
@@ -248,7 +281,7 @@ impl App {
                 title: np.track.title.clone(),
                 artist: np.track.artist.clone(),
                 album: np.track.album.clone(),
-                art_url: None,
+                art_url: np.track.art_url.clone(),
                 duration: np.track.duration,
             }),
             position: now_playing.map_or(Duration::ZERO, |np| np.position),
@@ -363,6 +396,25 @@ impl App {
                         self.set_error(format!("Translation failed: {err}"));
                     }
                 }
+            }
+            Action::CoverArtLoaded { url, result } => {
+                if !self.art_enabled {
+                    return Ok(());
+                }
+                let current = self
+                    .now_playing
+                    .as_ref()
+                    .and_then(|np| np.track.art_url.as_deref());
+                if current != Some(url.as_str()) {
+                    return Ok(()); // stale response for a previous track
+                }
+                self.art = match result {
+                    Ok(image) => match art::build_protocol(&self.picker, image) {
+                        Ok(protocol) => CoverArt::ready(url, protocol),
+                        Err(err) => CoverArt::failed(url, format!("{err:#}")),
+                    },
+                    Err(err) => CoverArt::failed(url, err),
+                };
             }
             Action::MprisPlayPause => self.toggle_play(),
             Action::MprisPlay => self.set_playing(true),
@@ -523,6 +575,7 @@ impl App {
                 self.status = "Queue — J/K to move tracks".to_string();
             }
             KeyCode::Char('s') => self.toggle_shuffle(),
+            KeyCode::Char('c') => self.toggle_art(),
             KeyCode::Char('a') => self.toggle_auto_scroll(),
             KeyCode::Char('t') => self.toggle_translation(),
             KeyCode::Char('L') => {
@@ -716,6 +769,54 @@ impl App {
         }
     }
 
+    fn toggle_art(&mut self) {
+        if let Some(reason) = &self.art_blocked_reason {
+            self.status = format!("Cover art unavailable ({reason})");
+            return;
+        }
+        self.art_enabled = !self.art_enabled;
+        if self.art_enabled {
+            self.status = "Cover art on".to_string();
+            if let Some(track) = self.now_playing.as_ref().map(|np| np.track.clone()) {
+                self.load_cover_art(&track);
+            } else {
+                self.art = CoverArt::no_art();
+            }
+        } else {
+            self.art = CoverArt::disabled("press c to show");
+            self.status = "Cover art hidden".to_string();
+        }
+    }
+
+    /// Start a background fetch for the selected track's cover art. Repeated
+    /// selections of the same track do not restart a load or replace a ready
+    /// image.
+    fn load_cover_art(&mut self, track: &Track) {
+        if !self.art_enabled {
+            return;
+        }
+        let Some(url) = track.art_url.clone() else {
+            self.art = CoverArt::no_art();
+            return;
+        };
+        if self.art.url() == Some(url.as_str())
+            && matches!(self.art.status(), ArtStatus::Ready | ArtStatus::Loading)
+        {
+            return;
+        }
+
+        self.art = CoverArt::loading(url.clone());
+        let tx = self.tx.clone();
+        let client = self.http_client.clone();
+        let fetch_url = url.clone();
+        tokio::spawn(async move {
+            let result = art::fetch_image(&client, &fetch_url)
+                .await
+                .map_err(|err| format!("{err:#}"));
+            let _ = tx.send(Action::CoverArtLoaded { url, result }).await;
+        });
+    }
+
     fn select_current(&mut self) {
         let index = self.list_state.selected();
 
@@ -753,6 +854,7 @@ impl App {
         }
 
         self.fetch_lyrics(&track);
+        self.load_cover_art(&track);
     }
 
     fn toggle_play(&mut self) {
@@ -1001,7 +1103,7 @@ mod tests {
 
     fn test_app() -> App {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        App::new(tx)
+        App::new(tx, Picker::halfblocks(), None)
     }
 
     fn demo_tracks() -> Vec<Track> {
@@ -1012,6 +1114,7 @@ mod tests {
                 album: "Album".into(),
                 duration: Duration::from_secs(120),
                 uri: format!("spotify:track:test{i}"),
+                art_url: None,
             })
             .collect()
     }
@@ -1329,5 +1432,85 @@ mod tests {
 
         app.handle_action(Action::MprisQuit).unwrap();
         assert!(!app.running);
+    }
+
+    #[test]
+    fn mpris_state_includes_cover_art_url() {
+        let mut app = test_app();
+        let mut track = demo_tracks()[0].clone();
+        track.art_url = Some("https://example.com/cover.jpg".to_string());
+        app.now_playing = Some(NowPlaying {
+            track,
+            position: Duration::ZERO,
+            playing: false,
+            volume: 60,
+        });
+
+        let state = app.mpris_state();
+        assert_eq!(
+            state.track.unwrap().art_url.as_deref(),
+            Some("https://example.com/cover.jpg")
+        );
+    }
+
+    #[test]
+    fn cover_art_toggle_disables_and_restores() {
+        let mut app = test_app();
+        app.set_tracks(demo_tracks());
+        app.now_playing = Some(NowPlaying {
+            track: app.tracks[0].clone(),
+            position: Duration::ZERO,
+            playing: false,
+            volume: 60,
+        });
+
+        let c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE);
+        app.handle_key(c.clone()).unwrap();
+        assert!(!app.art_enabled);
+        assert_eq!(app.art.status(), ArtStatus::Disabled);
+        assert!(app.status.contains("hidden"));
+
+        app.handle_key(c).unwrap();
+        assert!(app.art_enabled);
+        assert_eq!(app.art.status(), ArtStatus::NoArt);
+    }
+
+    #[test]
+    fn cover_art_failure_shows_placeholder_without_erroring() {
+        let mut app = test_app();
+        let mut track = demo_tracks()[0].clone();
+        track.art_url = Some("https://example.com/cover.jpg".to_string());
+        app.now_playing = Some(NowPlaying {
+            track,
+            position: Duration::ZERO,
+            playing: false,
+            volume: 60,
+        });
+
+        app.handle_action(Action::CoverArtLoaded {
+            url: "https://example.com/cover.jpg".to_string(),
+            result: Result::<image::DynamicImage, String>::Err("offline".to_string()),
+        })
+        .unwrap();
+
+        assert_eq!(app.art.status(), ArtStatus::Failed);
+        assert!(app.art.placeholder_lines()[1].contains("offline"));
+        assert!(app.error.is_none());
+    }
+
+    #[test]
+    fn blocked_terminal_cannot_enable_art() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut app = App::new(
+            tx,
+            Picker::halfblocks(),
+            Some("TERM=dumb".to_string()),
+        );
+        assert!(!app.art_enabled);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(!app.art_enabled);
+        assert!(app.status.contains("TERM=dumb"));
     }
 }
