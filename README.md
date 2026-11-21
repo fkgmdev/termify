@@ -211,7 +211,7 @@ touching your other audio files.
 Online streaming uses librespot's default premium bitrate: **Ogg Vorbis at
 160 kbps**, decoded to 16-bit PCM for the audio device. Downloads request the
 best file Spotify offers for each track, in this order:
-`OGG_VORBIS_320` → `MP3_320` → `OGG_VORBIS_160` → `MP3_160` →
+`OGG_VORBIS_320` → `MP3_320` → `MP3_256` → `OGG_VORBIS_160` → `MP3_160` →
 `OGG_VORBIS_96` → `MP3_96`. They are stored as-is after decryption (Spotify's
 extra 167-byte Ogg header is stripped); termify does not transcode or lower the
 quality. A track only gets 320 kbps if Spotify has that format for it.
@@ -233,10 +233,12 @@ When local playback is connected, select any track and press `d`. termify fetche
 the audio through the authenticated librespot session, decrypts it and writes a
 `.part` file that is renamed only after a complete copy. Audio-key requests are
 spaced out and retried with backoff on transient failures such as
-`Service unavailable` / rate limits; termify never assumes a failed key means
-the file is unencrypted. Files whose container header is invalid are deleted
-instead of being indexed, which prevents the old "skipping junk" / corrupt audio
-playback.
+`Service unavailable` / rate limits; permanent key refusals are reported
+immediately instead of being retried. termify never assumes a failed key means
+the file is unencrypted. The key is requested before the CDN stream is opened so
+failed attempts cannot leave a download task running, and each file is checked
+with the same decoder used for playback before it is indexed — not just a magic
+header. This prevents the old "skipping junk" / corrupt audio playback.
 
 If the preferred format fails, termify now tries the remaining supported
 formats before giving up, so a key rejection or bad variant for one file does
@@ -420,15 +422,16 @@ on a 250 ms tick; offline progress comes from the rodio sink.
   wait for `Retry-After` and retry; the TUI status bar now shows this clearly.
 - **Audio key errors (`0 1`, `0 2`, `Service unavailable`, `no audio key`)**: a
   missing key means the downloaded bytes are still encrypted, so termify no
-  longer writes them. Key requests are now spaced out, retried up to four times
-  with exponential backoff, and verified by container header before indexing.
-  termify also falls back to lower-quality formats before reporting failure.
-  If every track fails, check that the Spotify account is Premium and that
-  `termify play spotify:track:<id>` streams normally; the desktop pairing token
+  longer writes them. Transient failures are spaced out and retried with
+  exponential backoff; permanent refusals (`audio key error 0 1`, `invalid_grant`)
+  are reported immediately because retrying cannot help. Files are verified with
+  the playback decoder before indexing, and termify falls back to lower-quality
+  formats. If every track fails, check that the account is Premium and that
+  `termify play spotify:track:<id>` streams normally; a 2026 Spotify DRM change
+  means accounts created after a cutoff cannot obtain keys for librespot at all
+  (a known upstream limitation with no workaround). The desktop pairing token
   must be refreshed with `termify --relogin` after switching accounts. Run
   `termify download spotify:track:<id>` to print the exact failing stage.
-  Existing files with invalid headers are dropped from the Offline tab on the
-  next launch.
 - **vergen pin**: `librespot-core 0.8.0` depends on `vergen-gitcl 1.0.8`, which
   resolves to an incompatible `vergen 9.1.0`. `Cargo.lock` pins `vergen 9.0.6`.
   Do not delete `Cargo.lock` without re-applying `cargo update -p vergen --precise 9.0.6`.

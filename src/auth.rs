@@ -33,8 +33,9 @@ const WEB_SCOPES: &[&str] = &[
 ];
 const PLAYBACK_SCOPES: &str = "streaming";
 
-/// Persist a token with owner-only permissions; refresh tokens rotate, so the
-/// whole token must be rewritten after every refresh.
+/// Persist a token with owner-only permissions. The whole token is rewritten
+/// after every refresh, preserving the previous refresh token when Spotify does
+/// not issue a new one.
 pub fn save_token(path: &std::path::Path, token: &Token) -> Result<()> {
     use std::io::Write;
     #[cfg(unix)]
@@ -82,14 +83,18 @@ async fn client_from_cache(
         oauth,
         rspotify::Config::default(),
     );
-    if client
-        .token
-        .lock()
-        .await
-        .map_err(|_| anyhow::anyhow!("token mutex lock failed"))?
-        .as_ref()
-        .is_some_and(|t| t.is_expired())
-    {
+    let (expired, previous_refresh_token) = {
+        let guard = client
+            .token
+            .lock()
+            .await
+            .map_err(|_| anyhow::anyhow!("token mutex lock failed"))?;
+        let Some(existing) = guard.as_ref() else {
+            return Ok(None);
+        };
+        (existing.is_expired(), existing.refresh_token.clone())
+    };
+    if expired {
         tracing::info!("Access token expired; refreshing {}", path.display());
         if let Err(err) = client.refresh_token().await {
             // Invalid/stale refresh tokens (including the 400 Spotify returns
@@ -101,13 +106,30 @@ async fn client_from_cache(
             );
             return Ok(None);
         }
-        let refreshed = client
+        let mut refreshed = client
             .token
             .lock()
             .await
             .map_err(|_| anyhow::anyhow!("token mutex lock failed"))?
             .clone()
             .context("no token after refresh")?;
+        // Spotify may omit `refresh_token` from a refresh response. rspotify
+        // replaces the whole token, so restore the old refresh token instead of
+        // losing the ability to renew on the next launch.
+        if refreshed.refresh_token.is_none() {
+            if previous_refresh_token.is_some() {
+                tracing::info!("Refresh response omitted refresh token; reusing cached one");
+            }
+            refreshed.refresh_token = previous_refresh_token;
+        }
+        {
+            let mut guard = client
+                .token
+                .lock()
+                .await
+                .map_err(|_| anyhow::anyhow!("token mutex lock failed"))?;
+            *guard = Some(refreshed.clone());
+        }
         save_token(path, &refreshed)?;
     }
     Ok(Some(client))
@@ -272,7 +294,7 @@ pub async fn playback_access_token(paths: &Paths, force_login: bool) -> Result<S
             &paths.playback_token_file,
             playback_credentials(),
             playback_oauth(),
-            &HashSet::new(),
+            &scope_set(&[PLAYBACK_SCOPES]),
         )
         .await?
         {
@@ -344,12 +366,13 @@ async fn device_login(paths: &Paths) -> Result<AuthCodePkceSpotify> {
             .send()
             .await
             .context("polling Spotify for a device token")?;
+        let status = response.status();
         let body: serde_json::Value = response
             .json()
             .await
             .context("parsing the Spotify device token response")?;
 
-        if body.get("access_token").is_some() {
+        if status.is_success() && body.get("access_token").is_some() {
             let token = token_from_device_response(&body)?;
             save_token(&paths.playback_token_file, &token)?;
             return Ok(AuthCodePkceSpotify::from_token_with_config(
@@ -360,15 +383,17 @@ async fn device_login(paths: &Paths) -> Result<AuthCodePkceSpotify> {
             ));
         }
 
-        let error: DeviceError = serde_json::from_value(body.clone())
-            .context("unexpected response while polling for a device token")?;
+        let error: DeviceError = match serde_json::from_value(body) {
+            Ok(error) => error,
+            Err(_) => bail!("Spotify device token request failed with HTTP {status}"),
+        };
         match error.error.as_str() {
             "authorization_pending" => {}
             "slow_down" => interval += 5,
             "access_denied" => bail!("Spotify authorization was denied"),
             "expired_token" => bail!("Spotify device authorization expired"),
             other => bail!(
-                "Spotify device token exchange failed: {other}{}",
+                "Spotify device token exchange failed with HTTP {status}: {other}{}",
                 error
                     .error_description
                     .map(|d| format!(" ({d})"))
@@ -383,13 +408,18 @@ fn token_from_device_response(body: &serde_json::Value) -> Result<Token> {
         .as_str()
         .context("device token response has no access_token")?
         .to_string();
-    let refresh_token = body["refresh_token"]
-        .as_str()
-        .context("device token response has no refresh_token")?
-        .to_string();
+    // Spotify does not promise a refresh token on every grant. Keep the access
+    // token usable and fall back to a fresh device login when it expires.
+    let refresh_token = body["refresh_token"].as_str().map(str::to_string);
     let scope = body["scope"]
         .as_str()
         .context("device token response has no scope")?;
+    let scopes: HashSet<String> = scope.split_whitespace().map(str::to_string).collect();
+    // Without `streaming` the session may connect but all audio/CDN/key calls
+    // fail later, which looks like a download bug instead of an auth problem.
+    if !scopes.contains(PLAYBACK_SCOPES) {
+        bail!("Spotify device token is missing the '{PLAYBACK_SCOPES}' scope");
+    }
     let expires_in = body["expires_in"]
         .as_u64()
         .context("device token response has no valid expires_in")? as i64;
@@ -398,7 +428,7 @@ fn token_from_device_response(body: &serde_json::Value) -> Result<Token> {
         access_token,
         expires_in: ChronoDuration::seconds(expires_in),
         expires_at: Some(Utc::now() + ChronoDuration::seconds(expires_in)),
-        refresh_token: Some(refresh_token),
-        scopes: scope.split_whitespace().map(str::to_string).collect(),
+        refresh_token,
+        scopes,
     })
 }

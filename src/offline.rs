@@ -340,6 +340,16 @@ fn audio_file_header_valid(path: &Path) -> bool {
     header[0..3] == [b'I', b'D', b'3'][..] || (header[0] == 0xff && header[1] & 0xe0 == 0xe0)
 }
 
+/// Ask the same decoder used for offline playback to initialise the file. A
+/// four-byte magic check alone lets roughly 1 in 2048 random wrong-key buffers
+/// through for MP3, so verify the container before indexing it.
+fn audio_file_decodes(path: &Path) -> bool {
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    Decoder::new(BufReader::new(file)).is_ok()
+}
+
 /// Playback backend for downloaded files. The output stream is kept alive for
 /// as long as the player exists; `Sink` handles decode, volume and seeking.
 pub struct OfflinePlayer {
@@ -410,9 +420,10 @@ impl OfflinePlayer {
 }
 
 /// Formats we can store and play back locally, in descending quality order.
-const PREFERRED_FORMATS: [AudioFileFormat; 6] = [
+const PREFERRED_FORMATS: [AudioFileFormat; 7] = [
     AudioFileFormat::OGG_VORBIS_320,
     AudioFileFormat::MP3_320,
+    AudioFileFormat::MP3_256,
     AudioFileFormat::OGG_VORBIS_160,
     AudioFileFormat::MP3_160,
     AudioFileFormat::OGG_VORBIS_96,
@@ -426,6 +437,15 @@ fn bytes_per_second(format: AudioFileFormat) -> usize {
         AudioFileFormat::MP3_256 => 32 * 1024,
         _ => 40 * 1024,
     }
+}
+
+/// True for key-service replies that are entitlement/compatibility failures
+/// rather than transient rate limits. Retrying these only burns time.
+fn audio_key_error_is_permanent(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("audio key error")
+        || lower.contains("no audio key")
+        || lower.contains("invalid_grant")
 }
 
 /// Request an audio key with spacing and exponential backoff. Spotify's key
@@ -443,8 +463,9 @@ async fn request_audio_key(
         match session.audio_key().request(track_id, file_id).await {
             Ok(key) => return Ok(key),
             Err(err) => {
-                last_error = Some(err.to_string());
-                if attempt == KEY_REQUEST_ATTEMPTS {
+                let message = err.to_string();
+                last_error = Some(message.clone());
+                if attempt == KEY_REQUEST_ATTEMPTS || audio_key_error_is_permanent(&message) {
                     break;
                 }
                 let backoff = KEY_REQUEST_DELAY.saturating_mul(attempt);
@@ -456,10 +477,18 @@ async fn request_audio_key(
             }
         }
     }
-    Err(anyhow!(
-        "could not get audio key for {uri} after {KEY_REQUEST_ATTEMPTS} attempts: {}",
-        last_error.unwrap_or_else(|| "unknown error".to_string())
-    ))
+    let detail = last_error.unwrap_or_else(|| "unknown error".to_string());
+    if audio_key_error_is_permanent(&detail) {
+        Err(anyhow!(
+            "Spotify refused the audio key for {uri}: {detail}. This is a known \
+             Spotify/librespot account restriction (Premium required; accounts created \
+             after the 2026 DRM change may be ineligible) and cannot be fixed by retrying"
+        ))
+    } else {
+        Err(anyhow!(
+            "could not get audio key for {uri} after {KEY_REQUEST_ATTEMPTS} attempts: {detail}"
+        ))
+    }
 }
 
 /// Path of the append-only download failure log.
@@ -500,6 +529,16 @@ async fn download_format(
     dir: &Path,
 ) -> Result<DownloadEntry> {
     let label = format!("{format:?}");
+    // Ask for the key before opening the CDN stream. A failed key request would
+    // otherwise leave a random-access stream loader running until session drop.
+    let key = request_audio_key(session, track_id, file_id, &track.uri)
+        .await
+        .with_context(|| format!("requesting {label} audio key"))?;
+
+    // A missing key means the bytes we would write are still encrypted. The
+    // old fallback treated them as unencrypted audio, which produced files full
+    // of junk that decoders could not play. Retry transient key-service failures
+    // instead and never index an unverifiable file.
     let encrypted = AudioFile::open(session, file_id, bytes_per_second(format))
         .await
         .with_context(|| format!("opening {label} audio"))?;
@@ -507,14 +546,6 @@ async fn download_format(
         .get_stream_loader_controller()
         .context("starting audio download")?;
     controller.set_random_access_mode();
-
-    // A missing key means the bytes we would write are still encrypted. The
-    // old fallback treated them as unencrypted audio, which produced files full
-    // of junk that decoders could not play. Retry transient key-service failures
-    // instead and never index an unverifiable file.
-    let key = request_audio_key(session, track_id, file_id, &track.uri)
-        .await
-        .with_context(|| format!("requesting {label} audio key"))?;
     let mut decrypted = AudioDecrypt::new(Some(key), encrypted);
     if AudioFiles::is_ogg_vorbis(format) {
         // Read rather than seek so the AES-CTR stream stays aligned even if a
@@ -572,11 +603,12 @@ async fn download_format(
         return Err(anyhow!("downloaded audio was empty"));
     }
     // A wrong key produces bytes that look like audio to the file system but
-    // not to a decoder. Verify the container magic before indexing the file.
-    if !audio_file_header_valid(&tmp_path) {
+    // not to a decoder. Verify both the magic and the container structure before
+    // indexing the file.
+    if !audio_file_header_valid(&tmp_path) || !audio_file_decodes(&tmp_path) {
         let _ = std::fs::remove_file(&tmp_path);
         return Err(anyhow!(
-            "downloaded audio failed integrity check; audio key may be unavailable"
+            "downloaded audio failed integrity/decode check; audio key may be unavailable"
         ));
     }
     if let Err(err) = std::fs::rename(&tmp_path, &final_path) {
@@ -621,7 +653,12 @@ pub async fn download_track(session: &Session, track: &Track, dir: &Path) -> Res
         .map_err(|err| anyhow!("invalid track ID: {err}"))?;
     let item = AudioItem::get_file(session, uri.clone())
         .await
-        .context("track is not available for download")?;
+        .context("could not read track metadata for download")?;
+    if let Err(reason) = &item.availability {
+        let error = anyhow!("track is not available for download: {reason}");
+        record_download_failure(dir, track, &error);
+        return Err(error);
+    }
     // Metadata may resolve an alternative track ID; that is the ID the key
     // service expects, not necessarily the URI the client started with.
     let track_id: SpotifyId = (&item.track_id).try_into().unwrap_or(requested_id);
@@ -801,6 +838,30 @@ mod tests {
         assert!(contents.contains("inner failure"));
         assert!(contents.contains("outer failure"));
         assert!(!contents.contains("access_token"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn permanent_audio_key_errors_are_recognised() {
+        assert!(audio_key_error_is_permanent("audio key error 0 1"));
+        assert!(audio_key_error_is_permanent(
+            "Service unavailable { audio key error }"
+        ));
+        assert!(audio_key_error_is_permanent("no audio key available"));
+        assert!(audio_key_error_is_permanent("invalid_grant"));
+        assert!(!audio_key_error_is_permanent("audio key response timeout"));
+        assert!(!audio_key_error_is_permanent("channel disconnected"));
+    }
+
+    #[test]
+    fn decode_check_rejects_random_bytes_that_pass_the_magic_check() {
+        let dir = temp_dir("decode-check");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let bogus_mp3 = dir.join("bogus.mp3");
+        // This passes the 4-byte MP3 frame magic but is not decodable audio.
+        std::fs::write(&bogus_mp3, [0xff, 0xfb, 0x90, 0x00]).expect("write bogus mp3");
+        assert!(audio_file_header_valid(&bogus_mp3));
+        assert!(!audio_file_decodes(&bogus_mp3));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
