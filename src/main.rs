@@ -90,7 +90,7 @@ async fn main() -> Result<()> {
         }
         None => {
             if cli.demo {
-                run_tui(None, None).await?;
+                run_tui(None, None, &paths).await?;
             } else {
                 let spotify = auth::authenticated(&config, &paths, cli.relogin).await?;
                 let access_token = auth::playback_access_token(&paths, cli.relogin).await?;
@@ -104,7 +104,7 @@ async fn main() -> Result<()> {
                         None
                     }
                 };
-                run_tui(Some(spotify), player).await?;
+                run_tui(Some(spotify), player, &paths).await?;
             }
         }
     }
@@ -115,6 +115,7 @@ async fn main() -> Result<()> {
 async fn run_tui(
     spotify: Option<rspotify::AuthCodePkceSpotify>,
     local_player: Option<player::LocalPlayer>,
+    paths: &config::Paths,
 ) -> Result<()> {
     use crossterm::execute;
     use crossterm::terminal::{
@@ -167,9 +168,18 @@ async fn run_tui(
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+    let terminal_size = terminal
+        .size()
+        .unwrap_or(ratatui::layout::Size::new(100, 30));
 
     let (tx, mut rx) = mpsc::channel(64);
-    let mut app = ui::App::new(tx.clone(), picker, art_blocked_reason);
+    let mut app = ui::App::new_with_paths(
+        tx.clone(),
+        picker,
+        art_blocked_reason,
+        Some(paths.lyrics_cache_file.clone()),
+    );
+    app.set_terminal_size(terminal_size.width, terminal_size.height);
 
     if let Some(client) = spotify {
         app.api_client = Some(std::sync::Arc::new(client));

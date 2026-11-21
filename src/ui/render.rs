@@ -4,7 +4,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs, Widget};
 
-use super::app::{App, Tab, format_duration, lyric_scroll_offset};
+use super::app::{App, RepeatMode, Tab, format_duration, lyric_scroll_offset};
 use crate::art;
 
 const CYAN: Color = Color::Cyan;
@@ -17,9 +17,9 @@ pub fn render(frame: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // header
-            Constraint::Min(5),    // main area
-            Constraint::Length(5), // now playing footer
+            Constraint::Length(art::HEADER_ROWS),
+            Constraint::Min(5),
+            Constraint::Length(art::FOOTER_ROWS),
         ])
         .split(frame.area());
 
@@ -361,10 +361,10 @@ fn render_detail_pane(frame: &mut Frame, area: Rect, app: &App) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Reserve room for the cover above the metadata, but never squeeze the
-    // details away entirely on short terminals. Disabled art reclaims the space.
+    // Cover grows with the terminal (up to 44x22 cells) while always leaving
+    // enough rows for metadata and hints. Disabled art reclaims the space.
     let art_height = if app.art_enabled {
-        inner.height.saturating_sub(5).min(art::ART_ROWS)
+        art::cover_size(frame.area()).height.min(inner.height)
     } else {
         0
     };
@@ -619,6 +619,12 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         Span::raw("queue"),
         Span::styled(" [s] ", Style::default().fg(YELLOW)),
         Span::raw(if app.shuffle { "shuffle ON" } else { "shuffle" }),
+        Span::styled(" [r] ", Style::default().fg(YELLOW)),
+        Span::raw(match app.repeat {
+            RepeatMode::Off => "repeat",
+            RepeatMode::All => "repeat ALL",
+            RepeatMode::One => "repeat ONE",
+        }),
         Span::styled(" [t] ", Style::default().fg(YELLOW)),
         Span::raw(if app.translate_lyrics {
             "translate ON"
@@ -770,6 +776,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::from("  S           Save all staged playlist changes at once"),
         Line::from("  D           Discard staged playlist changes"),
         Line::from("  s           Shuffle on / off"),
+        Line::from("  r           Repeat off / all / one (also MPRIS Loop Status)"),
         Line::from("  c           Show / hide cover art (falls back to text when unsupported)"),
         Line::from("  a           Lyrics follow playback on / off"),
         Line::from("  t           Translate lyrics to English (lyrics tab)"),
@@ -828,8 +835,13 @@ mod tests {
         terminal.draw(|frame| render(frame, &app)).unwrap();
 
         let image: image::DynamicImage = image::RgbImage::new(64, 64).into();
-        let protocol = art::build_protocol(&Picker::halfblocks(), image).unwrap();
-        app.art = CoverArt::ready("https://example.com/cover.jpg", protocol);
+        let protocol = art::build_protocol(
+            &Picker::halfblocks(),
+            image.clone(),
+            ratatui::layout::Size::new(14, 7),
+        )
+        .unwrap();
+        app.art = CoverArt::ready("https://example.com/cover.jpg", image, protocol);
         terminal.draw(|frame| render(frame, &app)).unwrap();
     }
 

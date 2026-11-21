@@ -17,11 +17,11 @@ or decisions change.
 | UI | `ratatui` 0.30 + `crossterm` 0.29 |
 | Runtime | `tokio` (multi-thread), single `mpsc` Action channel into `App` |
 | Audio backend | librespot-playback with rodio/ALSA (`SoftMixer` for volume) |
-| Lyrics | LRCLIB (line-synced, no key) primary, original-language entry preferred; English translation via Google's public endpoint on demand. Cached in-memory by track URI. Genius unsynced fallback deferred to polish |
-| Cover art | Album images from the Web API, rendered with `ratatui-image` 11.1.0 (Kitty/iTerm2/Sixel with halfblocks fallback); fetch/decode failures degrade to text placeholders; `TERMIFY_NO_ART`/`TERM=dumb` disable art. URL also published as MPRIS `mpris:artUrl` |
+| Lyrics | LRCLIB (line-synced, no key) primary, original-language entry preferred; English translation via Google's public endpoint on demand. Cached in-memory by track URI and persisted to `lyrics.json` (including "no lyrics" results). Genius unsynced fallback deferred to polish |
+| Cover art | Album images from the Web API, rendered with `ratatui-image` 11.1.0 (Kitty/iTerm2/Sixel with halfblocks fallback); cover scales with the terminal up to 44x22 cells while reserving metadata rows, and rebuilds its protocol on resize without refetching; fetch/decode failures degrade to text placeholders; `TERMIFY_NO_ART`/`TERM=dumb` disable art. URL also published as MPRIS `mpris:artUrl` |
 | Config/cache | Platform-specific `#[cfg]` blocks: Linux XDG (`~/.config/termify`, `~/.cache/termify`), macOS (`~/Library/Application Support/termify`, `~/Library/Caches/termify`), Windows (`%APPDATA%\termify`, `%LOCALAPPDATA%\termify\cache`) |
 | Redirect URI | `http://127.0.0.1:8989/callback` for PKCE; device pairing uses `https://spotify.com/pair` |
-| Desktop integration | MPRIS via `mpris-server` 0.11 (`Player` builder); media keys are routed by the DE, not grabbed directly |
+| Desktop integration | MPRIS via `mpris-server` 0.11 (`Player` builder); media keys are routed by the DE, not grabbed directly. Shuffle and repeat (`Loop_Status`) are published and controllable from the DE |
 
 Lyrics note: Spotify's Web API has **no** lyrics endpoint. The internal `color-lyrics`
 endpoint is deliberately out of scope for v1 (unofficial, needs an account cookie).
@@ -38,7 +38,7 @@ src/
   auth.rs            # PKCE + device-pairing flows, token caches + refresh
   api.rs             # rspotify wrapper (search, playlist details/edits, liked songs)
   player.rs          # librespot Session + Player, playback controls, events
-  lyrics.rs          # LRCLIB client, LRC parser, language preference, translation
+  lyrics.rs          # LRCLIB client, LRC parser, language preference, translation, disk cache
   mpris.rs           # MPRIS D-Bus server: state snapshots + media-key Action callbacks
   ui/
     mod.rs
@@ -77,7 +77,7 @@ Playback progress is derived from a local clock anchored on a 250 ms tick.
 
 ### M1 — TUI shell (done)
 - [x] Layout: header with tabs, list pane, detail pane, now-playing footer
-- [x] Keybindings: `j/k`, `g/G`, `PgUp/PgDn`, `Enter`, `/`, `Space`, `n/p`, `←/→`, `+/-`, `l`, `Q`, `J/K`, `L`, `s`, `c`, `a`, `t`, `Tab`, `?`, `q`, `Ctrl-C`
+- [x] Keybindings: `j/k`, `g/G`, `PgUp/PgDn`, `Enter`, `/`, `Space`, `n/p`, `←/→`, `+/-`, `l`, `Q`, `J/K`, `L`, `s`, `r`, `c`, `a`, `t`, `Tab`, `?`, `q`, `Ctrl-C`
       (Tab/Shift+Tab use crossterm's `Tab`/`BackTab` codes)
 - [x] Config loading (client ID, redirect URI, volume, audio backend)
 - [x] Single `mpsc` Action channel with crossterm event stream + 250 ms tick
@@ -106,11 +106,11 @@ Playback progress is derived from a local clock anchored on a 250 ms tick.
 - [x] Jump to selected lyric line: `Enter` seeks playback to that line's
       timestamp and re-enables follow mode; `g/G` and `PgUp/PgDn` also move the
       selection, and the current playback line stays marked with `▶`
-- [x] Plain-lyrics fallback, "no lyrics" state, in-memory cache by track URI
+- [x] Plain-lyrics fallback, "no lyrics" state, in-memory and disk cache by track URI
 - [x] Unit tests for LRC parsing, active-line tracking, scroll offsets, script
-      detection, translation parsing, queue reordering, lyric-line seek/key
-      handling, MPRIS state/action handling, playlist edit prompts/picker and
-      arrow-fragment normalization (40 passing)
+      detection, translation parsing, cache round-trips, queue reordering,
+      lyric-line seek/key handling, MPRIS state/action handling, playlist edit
+      prompts/picker and arrow-fragment normalization (49 passing)
 - [x] Fixed LRCLIB camelCase field mapping (`syncedLyrics`/`plainLyrics`) that
       made every lookup report "no lyrics"; verified with "Knee Socks"
 - [x] Prefer original-language LRCLIB entry when `/api/get` returns a translation
@@ -122,14 +122,17 @@ Playback progress is derived from a local clock anchored on a 250 ms tick.
 
 ### M5 — Polish (in progress)
 - [ ] Genius unsynced fallback (needs optional free API token)
-- [ ] Disk-persisted lyrics cache
+- [x] Disk-persisted lyrics cache: `lyrics.json` in the platform cache directory,
+      written atomically, with both successful lookups and known misses restored
+      on startup and no network request for cached tracks
 - [x] Token refresh persistence verified in practice (expired cache refreshed,
       playback succeeded, new token cached with `0600`)
-- [x] MPRIS D-Bus player: track metadata, playback status, position, volume and
-      shuffle published to the DE; play/pause, next/previous, seek/set-position,
-      volume, shuffle and OpenUri forwarded into the `Action` channel. Verified
-      live with `playerctl` on the session bus (metadata, status, next/prev,
-      seek, volume and shuffle all round-trip through the app)
+- [x] MPRIS D-Bus player: track metadata, playback status, position, volume,
+      shuffle and repeat (`Loop_Status`) published to the DE; play/pause,
+      next/previous, seek/set-position, volume, shuffle, loop status and OpenUri
+      forwarded into the `Action` channel. Verified live with `playerctl` on the
+      session bus (metadata, status, next/prev, seek, volume and shuffle all
+      round-trip through the app; loop status is unit-tested)
 - [x] Playlist shuffling (`s`): Fisher-Yates playback order, current track first,
       applied to `n/p` and end-of-track auto-advance; next/prev wrap and visit
       every track exactly once per cycle (unit tested)
@@ -138,8 +141,9 @@ Playback progress is derived from a local clock anchored on a 250 ms tick.
       `Enter` plays it, and the cursor follows the current track. Reordering is
       reset when shuffle is toggled or a new track list is loaded (unit tested)
 - [x] Cover art: `art.rs` downloads/decodes Spotify album images off-thread,
-      builds a fixed-size `ratatui-image` protocol after terminal probing, and
-      renders it in the Details pane; `c` toggles art at runtime
+      builds a `ratatui-image` protocol sized to the terminal (up to 44x22 cells)
+      after probing, and renders it in the Details pane; `c` toggles art at
+      runtime and resizes rebuild the protocol without a refetch
 - [x] Graceful image fallbacks: Kitty/iTerm2/Sixel detected at startup, halfblocks
       when no graphics protocol exists, text placeholders for no art/loading/
       failure, and art disabled entirely for `TERM=dumb` or `TERMIFY_NO_ART`
@@ -160,7 +164,12 @@ Playback progress is derived from a local clock anchored on a 250 ms tick.
 - [x] Windows Terminal / Kitty navigation: wait for the image probe thread to
       restore raw mode before re-entering it, and normalize `ESC [ A/B/C/D` key
       fragments
-- [ ] Repeat mode
+- [x] Repeat mode (`r`): off → all → one, with end-of-track behaviour for each
+      mode (stop at the end, wrap to the first track, or restart the current
+      track) and the same state exposed through MPRIS `Loop_Status`
+- [x] Larger adaptive cover art: scales with terminal size while reserving seven
+      metadata rows, uses `Resize::Scale` so the 300px source does not cap the
+      drawn size, and re-encodes on `Action::Resize`
 - [ ] Integration tests with a mock HTTP layer
 
 ## Deferred (not in v1)

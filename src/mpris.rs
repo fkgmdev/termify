@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use mpris_server::{LoopStatus, Metadata, PlaybackStatus, Player, Time, TrackId};
 use tokio::sync::{mpsc, watch};
 
-use crate::ui::Action;
+use crate::ui::{Action, RepeatMode};
 
 /// Deterministic MPRIS object path for a Spotify URI. D-Bus object paths cannot
 /// contain `:`, so a stable FNV-1a hash keeps the id valid and comparable.
@@ -46,6 +46,7 @@ pub struct MprisState {
     /// 0.0..=1.0, as required by the MPRIS spec.
     pub volume: f64,
     pub shuffle: bool,
+    pub repeat: RepeatMode,
 }
 
 impl MprisState {
@@ -56,7 +57,26 @@ impl MprisState {
             playing: false,
             volume: 1.0,
             shuffle: false,
+            repeat: RepeatMode::Off,
         }
+    }
+}
+
+/// Map termify's repeat mode to the MPRIS `Loop_Status` property.
+pub fn loop_status(repeat: RepeatMode) -> LoopStatus {
+    match repeat {
+        RepeatMode::Off => LoopStatus::None,
+        RepeatMode::All => LoopStatus::Playlist,
+        RepeatMode::One => LoopStatus::Track,
+    }
+}
+
+/// Map an MPRIS `Loop_Status` change back into an app action.
+pub fn repeat_mode(status: LoopStatus) -> RepeatMode {
+    match status {
+        LoopStatus::None => RepeatMode::Off,
+        LoopStatus::Playlist => RepeatMode::All,
+        LoopStatus::Track => RepeatMode::One,
     }
 }
 
@@ -205,6 +225,10 @@ async fn build_player(action_tx: mpsc::Sender<Action>) -> Result<Player> {
         let _ = tx.try_send(Action::MprisSetShuffle(shuffle));
     });
     let tx = action_tx.clone();
+    player.connect_set_loop_status(move |_, status| {
+        let _ = tx.try_send(Action::MprisSetRepeat(repeat_mode(status)));
+    });
+    let tx = action_tx.clone();
     player.connect_open_uri(move |_, uri| {
         let _ = tx.try_send(Action::MprisOpenUri(uri.to_string()));
     });
@@ -250,6 +274,7 @@ async fn apply_state(player: &Player, state: &MprisState, last: Option<&MprisSta
     };
     let _ = player.set_playback_status(status).await;
     let _ = player.set_shuffle(state.shuffle).await;
+    let _ = player.set_loop_status(loop_status(state.repeat)).await;
     let _ = player.set_volume(state.volume.clamp(0.0, 1.0)).await;
 
     let position = position_time(state.position);
@@ -288,5 +313,15 @@ mod tests {
         assert!(!state.playing);
         assert_eq!(state.position, Duration::ZERO);
         assert_eq!(state.volume, 1.0);
+        assert_eq!(state.repeat, RepeatMode::Off);
+    }
+
+    #[test]
+    fn repeat_maps_to_mpris_loop_status_and_back() {
+        for mode in [RepeatMode::Off, RepeatMode::All, RepeatMode::One] {
+            assert_eq!(repeat_mode(loop_status(mode)), mode);
+        }
+        assert_eq!(loop_status(RepeatMode::One), LoopStatus::Track);
+        assert_eq!(loop_status(RepeatMode::All), LoopStatus::Playlist);
     }
 }

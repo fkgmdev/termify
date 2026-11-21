@@ -20,6 +20,7 @@ library, play music, and read synced lyrics, all from the terminal.
 - Playlist details: owner, public/collaborative status, contributors and the
   user who added each track (from Spotify's per-item `added_by` field)
 - Playback controls: play/pause, next/prev, seek, volume, end-of-track auto-advance
+- Repeat modes (`r`): off, all and one, also exposed as MPRIS `Loop_Status`
 - Playlist shuffling with a saved playback order (`s`)
 - Queue tab showing the playback order, with track reordering (`J`/`K`) and
   play-from-queue (`Enter`)
@@ -28,15 +29,18 @@ library, play music, and read synced lyrics, all from the terminal.
   resume following playback
 - Original-language lyrics preferred over translated LRCLIB entries; optional
   English translation (`t`), cached per track
+- Lyrics cached in memory and in `lyrics.json`, including known misses, so a
+  restart does not repeat LRCLIB requests
 - Ratatui TUI with a single async action loop and `--demo` mode
-- Album cover art in the Details pane using Kitty/iTerm2/Sixel when available,
-  with Unicode halfblocks and text placeholders as fallbacks; the same URL is
-  published as MPRIS `mpris:artUrl` for desktop players
+- Large, adaptive album cover art in the Details pane (up to 44x22 cells) using
+  Kitty/iTerm2/Sixel when available, with Unicode halfblocks and text
+  placeholders as fallbacks; resizing rebuilds the image without a refetch, and
+  the same URL is published as MPRIS `mpris:artUrl` for desktop players
 - MPRIS integration: the current track appears in the desktop media player, and
   global XF86 audio keys (play/pause, next, previous, volume, seek) work
   anywhere on the desktop through the window manager's MPRIS media-key routing
 
-Not in v1: Spotify Connect, daemon mode, repeat mode, audio visualization.
+Not in v1: Spotify Connect, daemon mode, audio visualization.
 
 ## Requirements
 
@@ -132,6 +136,7 @@ termify --relogin       # force re-login for both Web API and playback
 | `S` | Save all staged playlist changes in one batch |
 | `D` | Discard staged playlist changes |
 | `s` | Shuffle on / off (affects next/prev and auto-advance) |
+| `r` | Repeat off / all / one (also MPRIS Loop Status) |
 | `c` | Show / hide cover art (no effect when the terminal blocks images) |
 | `a` | Lyrics follow playback on / off (re-syncs the selected line when re-enabled) |
 | `t` | Translate lyrics to English (on the Lyrics tab) |
@@ -143,10 +148,22 @@ selected track with its neighbour and the cursor follows it; `Enter` starts that
 track. Toggling shuffle or loading a new track list rebuilds the order, so manual
 reordering is reset in those cases.
 
+`r` cycles repeat through off → all → one. Repeat-all wraps from the last track
+to the first, repeat-one reloads the current track from the beginning, and with
+repeat off the player stops at the end of the queue. Manual `n`/`p` still wrap
+regardless of the repeat mode. The current mode also appears in the footer and
+is the MPRIS `Loop_Status` property.
+
 On the Lyrics tab, `j`/`k` (and `g`/`G`, `PgUp`/`PgDn`) select a line with `»`,
 which disables follow mode. `Enter` seeks playback to that line's timestamp and
 re-enables following; `a` manually re-syncs the selection to the line currently
 playing. The active playback line stays marked with `▶`.
+
+Fetched lyrics are stored in `lyrics.json` in the cache directory listed under
+Setup. Both successful results and tracks with no lyrics are cached; a corrupt
+or outdated cache is ignored and rewritten after the next successful lookup.
+English translations are still regenerated per session because the translation
+service can change its output.
 
 ## Playlists and collaborators
 
@@ -187,8 +204,12 @@ reopens the browser login (refresh tokens cannot add scopes). Run
 ## Cover art
 
 When a track has album art, termify downloads the 300px Spotify image in the
-background and draws it above the track metadata in the Details pane. It uses
-the best terminal graphics protocol available (Kitty, iTerm2 or Sixel) and falls
+background and draws it above the track metadata in the Details pane. The cover
+grows with the terminal up to 44x22 cells (about 88x22 pixels at the usual 1:2
+cell ratio) while always leaving seven rows for metadata and hints; on a 24-row
+terminal it stays compact instead of squeezing the details away. Resizing the
+terminal re-encodes the already-downloaded image at the new size. It uses the
+best terminal graphics protocol available (Kitty, iTerm2 or Sixel) and falls
 back to Unicode halfblocks when the terminal has no graphics protocol. Fetch,
 decode and protocol errors never interrupt playback: the pane simply shows a
 text placeholder such as `Loading cover art...` or `Cover art unavailable`.
@@ -234,10 +255,10 @@ src/
   auth.rs     # PKCE + device-pairing flows, token caches + refresh
   api.rs      # rspotify wrapper (search, playlists, liked songs)
   player.rs   # librespot session, Player, mixer, playback controls
-  lyrics.rs   # LRCLIB client, LRC parser, language preference, translation
+  lyrics.rs   # LRCLIB client, LRC parser, language preference, translation, disk cache
   mpris.rs    # MPRIS D-Bus player: publishes state, forwards media-key controls
   ui/
-    app.rs    # App state, Action enum, key handling, queue/shuffle/lyric-seek/translation
+    app.rs    # App state, Action enum, keys, queue/shuffle/repeat/lyrics/cover
     event.rs  # crossterm stream + tick -> Action channel
     render.rs # ratatui layout and widgets
 ```

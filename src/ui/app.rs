@@ -1,8 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::layout::{Rect, Size};
 use ratatui::widgets::ListState;
 use ratatui_image::picker::Picker;
 use tokio::sync::mpsc::Sender;
@@ -44,6 +46,34 @@ impl Tab {
             Tab::Playlists => "Playlists",
             Tab::Queue => "Queue",
             Tab::Lyrics => "Lyrics",
+        }
+    }
+}
+
+/// Repeat behaviour at the end of a track. `r` cycles through the modes; the
+/// same three states are exposed as MPRIS `Loop_Status`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RepeatMode {
+    #[default]
+    Off,
+    All,
+    One,
+}
+
+impl RepeatMode {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Off => Self::All,
+            Self::All => Self::One,
+            Self::One => Self::Off,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::All => "all",
+            Self::One => "one",
         }
     }
 }
@@ -194,7 +224,8 @@ pub struct NowPlaying {
 #[derive(Debug)]
 pub enum Action {
     Tick,
-    Render,
+    /// Terminal resize from crossterm; used to re-encode cover art.
+    Resize(u16, u16),
     Key(KeyEvent),
     Loading(String),
     SearchResults(Result<Vec<Track>, String>),
@@ -255,6 +286,7 @@ pub enum Action {
     /// Volume in the MPRIS range 0.0..=1.0.
     MprisSetVolume(f64),
     MprisSetShuffle(bool),
+    MprisSetRepeat(RepeatMode),
     MprisOpenUri(String),
     MprisQuit,
     Error(String),
@@ -293,14 +325,21 @@ pub struct App {
     pub translate_lyrics: bool,
     pub translation_loading: bool,
     pub shuffle: bool,
+    pub repeat: RepeatMode,
     /// Playback order as indices into `tracks`; identity when shuffle is off.
     pub play_order: Vec<usize>,
     /// Selected row on the Queue tab, as a position in `play_order`.
     pub queue_cursor: usize,
+    /// Tracks known to have no lyrics, persisted with the cache to avoid
+    /// repeating failed LRCLIB lookups after a restart.
+    pub no_lyrics: HashSet<String>,
+    lyrics_cache_file: Option<PathBuf>,
     /// Current cover-art state (image protocol or text placeholder).
     pub art: CoverArt,
     /// User-facing art toggle. Forced off when the terminal cannot show images.
     pub art_enabled: bool,
+    /// Terminal size used to choose the cover dimensions and rebuild its protocol.
+    terminal_area: Rect,
     art_blocked_reason: Option<String>,
     picker: Picker,
     http_client: reqwest::Client,
@@ -308,7 +347,18 @@ pub struct App {
 }
 
 impl App {
+    #[cfg(test)]
     pub fn new(tx: Sender<Action>, picker: Picker, art_blocked_reason: Option<String>) -> Self {
+        Self::new_with_paths(tx, picker, art_blocked_reason, None)
+    }
+
+    /// Build the app, optionally restoring lyrics from the cache file.
+    pub fn new_with_paths(
+        tx: Sender<Action>,
+        picker: Picker,
+        art_blocked_reason: Option<String>,
+        lyrics_cache_file: Option<PathBuf>,
+    ) -> Self {
         let mut list_state = ListState::default();
         list_state.select(Some(0));
         let art = match &art_blocked_reason {
@@ -316,7 +366,7 @@ impl App {
             None => CoverArt::no_art(),
         };
         let art_enabled = art_blocked_reason.is_none();
-        Self {
+        let mut app = Self {
             running: true,
             tab: Tab::Search,
             show_help: false,
@@ -337,6 +387,8 @@ impl App {
             api_client: None,
             player: None,
             lyrics: std::collections::HashMap::new(),
+            no_lyrics: HashSet::new(),
+            lyrics_cache_file,
             lyrics_loading: false,
             lyric_cursor: 0,
             lyrics_auto_scroll: true,
@@ -344,14 +396,103 @@ impl App {
             translate_lyrics: false,
             translation_loading: false,
             shuffle: false,
+            repeat: RepeatMode::Off,
             play_order: Vec::new(),
             queue_cursor: 0,
             art,
             art_enabled,
+            terminal_area: Rect::new(0, 0, 100, 30),
             art_blocked_reason,
             picker,
             http_client: reqwest::Client::new(),
             tx,
+        };
+        app.load_lyrics_cache();
+        app
+    }
+
+    /// Terminal size affects the cover protocol; update it and re-encode any
+    /// ready image without refetching it.
+    pub fn set_terminal_size(&mut self, width: u16, height: u16) {
+        self.terminal_area = Rect::new(0, 0, width.max(1), height.max(1));
+        self.refresh_cover_protocol();
+    }
+
+    fn art_size(&self) -> Size {
+        art::cover_size(self.terminal_area)
+    }
+
+    fn refresh_cover_protocol(&mut self) {
+        let size = self.art_size();
+        let previous = std::mem::replace(&mut self.art, CoverArt::NoArt);
+        if size.width == 0 || size.height == 0 {
+            // Keep the decoded image so it can be encoded once the terminal is
+            // large enough again, without refetching from Spotify.
+            self.art = match previous {
+                CoverArt::Ready { url, image, .. } | CoverArt::Deferred { url, image } => {
+                    CoverArt::deferred(url, image)
+                }
+                CoverArt::Failed { url, message } => CoverArt::failed(url, message),
+                CoverArt::Disabled { reason } => CoverArt::disabled(reason),
+                CoverArt::Loading { url } => CoverArt::loading(url),
+                CoverArt::NoArt => CoverArt::NoArt,
+            };
+            return;
+        }
+        self.art = match previous {
+            CoverArt::Ready {
+                url,
+                image,
+                protocol,
+            } if protocol.size() == size => CoverArt::ready(url, image, protocol),
+            CoverArt::Ready { url, image, .. } | CoverArt::Deferred { url, image } => {
+                match art::build_protocol(&self.picker, image.clone(), size) {
+                    Ok(protocol) => CoverArt::ready(url, image, protocol),
+                    Err(err) => CoverArt::failed(url, format!("{err:#}")),
+                }
+            }
+            CoverArt::Loading { url } => CoverArt::loading(url),
+            CoverArt::Failed { url, message } => CoverArt::failed(url, message),
+            CoverArt::Disabled { reason } => CoverArt::disabled(reason),
+            CoverArt::NoArt => CoverArt::NoArt,
+        };
+    }
+
+    fn load_lyrics_cache(&mut self) {
+        let Some(path) = self.lyrics_cache_file.clone() else {
+            return;
+        };
+        match crate::lyrics::load_cache(&path) {
+            Ok(entries) => {
+                for (uri, cached) in entries {
+                    match cached {
+                        Some(lyrics) => {
+                            self.lyrics.insert(uri, lyrics);
+                        }
+                        None => {
+                            self.no_lyrics.insert(uri);
+                        }
+                    }
+                }
+            }
+            Err(err) => tracing::warn!("Ignoring lyrics cache: {err:#}"),
+        }
+    }
+
+    fn persist_lyrics_cache(&self, uri: &str, result: &Option<crate::lyrics::Lyrics>) {
+        let Some(path) = &self.lyrics_cache_file else {
+            return;
+        };
+        let mut entries: HashMap<String, Option<crate::lyrics::Lyrics>> = HashMap::new();
+        for (cached_uri, lyrics) in &self.lyrics {
+            entries.insert(cached_uri.clone(), Some(lyrics.clone()));
+        }
+        for cached_uri in &self.no_lyrics {
+            entries.insert(cached_uri.clone(), None);
+        }
+        entries.insert(uri.to_string(), result.clone());
+        if let Err(err) = crate::lyrics::save_cache(path, &entries) {
+            tracing::warn!("Could not save lyrics cache: {err:#}");
         }
     }
 
@@ -431,25 +572,28 @@ impl App {
             playing: now_playing.is_some_and(|np| np.playing),
             volume: now_playing.map_or(1.0, |np| f64::from(np.volume) / 100.0),
             shuffle: self.shuffle,
+            repeat: self.repeat,
         }
     }
 
     pub fn handle_action(&mut self, action: Action) -> Result<()> {
         match action {
             Action::Tick => {
+                let mut ended = false;
                 if let Some(np) = &mut self.now_playing {
                     if np.playing {
                         np.position += Duration::from_millis(250);
                         if let Some(track) = self.tracks.iter().find(|t| t.uri == np.track.uri) {
-                            if np.position >= track.duration {
-                                self.next_track();
-                            }
+                            ended = np.position >= track.duration;
                         }
                     }
                 }
+                if ended {
+                    self.handle_track_end();
+                }
                 self.sync_lyric_cursor();
             }
-            Action::Render => {}
+            Action::Resize(width, height) => self.set_terminal_size(width, height),
             Action::Key(key) => self.handle_key(key)?,
             Action::Loading(message) => {
                 self.loading = true;
@@ -598,9 +742,7 @@ impl App {
                     Err(err) => self.set_error(err),
                 }
             }
-            Action::PlayerEndOfTrack => {
-                self.next_track();
-            }
+            Action::PlayerEndOfTrack => self.handle_track_end(),
             Action::PlayerPlaying(position_ms) => {
                 if let Some(np) = &mut self.now_playing {
                     np.playing = true;
@@ -617,6 +759,8 @@ impl App {
                 self.lyrics_loading = false;
                 match result {
                     Ok(Some(lyrics)) => {
+                        self.no_lyrics.remove(&uri);
+                        self.persist_lyrics_cache(&uri, &Some(lyrics.clone()));
                         self.lyrics.insert(uri.clone(), lyrics);
                         self.status = "Lyrics loaded".to_string();
                         self.sync_lyric_cursor();
@@ -624,7 +768,11 @@ impl App {
                             self.fetch_translation(&uri);
                         }
                     }
-                    Ok(None) => self.status = "No lyrics found for this track".to_string(),
+                    Ok(None) => {
+                        self.no_lyrics.insert(uri.clone());
+                        self.persist_lyrics_cache(&uri, &None);
+                        self.status = "No lyrics found for this track".to_string();
+                    }
                     Err(err) => self.status = format!("Lyrics unavailable: {err}"),
                 }
             }
@@ -652,9 +800,13 @@ impl App {
                 if current != Some(url.as_str()) {
                     return Ok(()); // stale response for a previous track
                 }
+                let size = self.art_size();
                 self.art = match result {
-                    Ok(image) => match art::build_protocol(&self.picker, image) {
-                        Ok(protocol) => CoverArt::ready(url, protocol),
+                    Ok(image) if size.width == 0 || size.height == 0 => {
+                        CoverArt::deferred(url, image)
+                    }
+                    Ok(image) => match art::build_protocol(&self.picker, image.clone(), size) {
+                        Ok(protocol) => CoverArt::ready(url, image, protocol),
                         Err(err) => CoverArt::failed(url, format!("{err:#}")),
                     },
                     Err(err) => CoverArt::failed(url, err),
@@ -685,6 +837,7 @@ impl App {
                     self.toggle_shuffle();
                 }
             }
+            Action::MprisSetRepeat(repeat) => self.set_repeat(repeat),
             Action::MprisOpenUri(uri) => self.play_uri(&uri),
             Action::MprisQuit => self.running = false,
             Action::Error(message) => self.set_error(message),
@@ -916,6 +1069,7 @@ impl App {
                 self.status = "Queue — J/K to move tracks".to_string();
             }
             KeyCode::Char('s') => self.toggle_shuffle(),
+            KeyCode::Char('r') => self.toggle_repeat(),
             KeyCode::Char('c') => self.toggle_art(),
             KeyCode::Char('a') => self.toggle_auto_scroll(),
             KeyCode::Char('t') => self.toggle_translation(),
@@ -1467,6 +1621,57 @@ impl App {
         };
     }
 
+    fn toggle_repeat(&mut self) {
+        self.set_repeat(self.repeat.next());
+    }
+
+    fn set_repeat(&mut self, repeat: RepeatMode) {
+        self.repeat = repeat;
+        self.status = format!("Repeat {}", repeat.label());
+    }
+
+    /// End-of-track behaviour, distinct from manual `n`: repeat-one restarts the
+    /// track, repeat-all wraps, and repeat-off stops at the end of the queue.
+    fn handle_track_end(&mut self) {
+        if self.repeat == RepeatMode::One {
+            self.restart_track();
+            return;
+        }
+        let at_last = self.play_position() + 1 >= self.play_order.len().max(1);
+        if at_last && self.repeat == RepeatMode::Off {
+            self.set_playing(false);
+            self.status = "End of queue — press n or enable repeat with r".to_string();
+            return;
+        }
+        let was_playing = self.now_playing.as_ref().is_some_and(|np| np.playing);
+        self.next_track();
+        if was_playing {
+            self.set_playing(true);
+        }
+    }
+
+    /// Reload the current URI from the start so librespot really restarts it.
+    fn restart_track(&mut self) {
+        let (uri, title) = {
+            let Some(np) = &mut self.now_playing else {
+                return;
+            };
+            np.position = Duration::ZERO;
+            np.playing = true;
+            (np.track.uri.clone(), np.track.title.clone())
+        };
+        self.lyrics_auto_scroll = true;
+        self.lyric_cursor = 0;
+        self.sync_lyric_cursor();
+        if let Some(player) = &self.player
+            && let Err(err) = player.play_uri(&uri)
+        {
+            self.set_error(format!("Could not repeat track: {err}"));
+            return;
+        }
+        self.status = format!("Repeating {title}");
+    }
+
     fn toggle_auto_scroll(&mut self) {
         self.lyrics_auto_scroll = !self.lyrics_auto_scroll;
         if self.lyrics_auto_scroll {
@@ -1532,7 +1737,8 @@ impl App {
             return;
         };
         if self.art.url() == Some(url.as_str())
-            && matches!(self.art.status(), ArtStatus::Ready | ArtStatus::Loading)
+            && (matches!(self.art.status(), ArtStatus::Ready | ArtStatus::Loading)
+                || matches!(self.art, CoverArt::Deferred { .. }))
         {
             return;
         }
@@ -1563,10 +1769,13 @@ impl App {
         let Some(track) = track else { return };
 
         let volume = self.now_playing.as_ref().map_or(60, |np| np.volume);
+        // `play_uri` starts librespot immediately; demo mode has no player and
+        // stays paused until Space is pressed.
+        let playing = self.player.is_some();
         self.now_playing = Some(NowPlaying {
             track: track.clone(),
             position: Duration::ZERO,
-            playing: false,
+            playing,
             volume,
         });
         // A new track starts with lyrics following playback again.
@@ -1775,6 +1984,10 @@ impl App {
             }
             return;
         }
+        if self.no_lyrics.contains(&track.uri) {
+            self.status = "No lyrics found for this track (cached)".to_string();
+            return;
+        }
         self.lyrics_loading = true;
         self.lyric_cursor = 0;
         let tx = self.tx.clone();
@@ -1843,6 +2056,7 @@ pub fn lyric_scroll_offset(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn test_app() -> App {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
@@ -2376,5 +2590,158 @@ mod tests {
             .unwrap();
         assert!(!app.art_enabled);
         assert!(app.status.contains("TERM=dumb"));
+    }
+
+    #[test]
+    fn repeat_key_cycles_off_all_one() {
+        let mut app = test_app();
+        let r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE);
+        assert_eq!(app.repeat, RepeatMode::Off);
+
+        app.handle_key(r.clone()).unwrap();
+        assert_eq!(app.repeat, RepeatMode::All);
+        assert_eq!(app.status, "Repeat all");
+        app.handle_key(r.clone()).unwrap();
+        assert_eq!(app.repeat, RepeatMode::One);
+        app.handle_key(r).unwrap();
+        assert_eq!(app.repeat, RepeatMode::Off);
+
+        app.handle_action(Action::MprisSetRepeat(RepeatMode::One))
+            .unwrap();
+        assert_eq!(app.repeat, RepeatMode::One);
+        assert_eq!(app.mpris_state().repeat, RepeatMode::One);
+    }
+
+    fn playing_app_at(index: usize) -> App {
+        let mut app = test_app();
+        app.set_tracks(demo_tracks());
+        app.list_state.select(Some(index));
+        app.now_playing = Some(NowPlaying {
+            track: app.tracks[index].clone(),
+            position: Duration::from_secs(10),
+            playing: true,
+            volume: 60,
+        });
+        app
+    }
+
+    #[tokio::test]
+    async fn track_end_honours_repeat_mode() {
+        let mut app = playing_app_at(4);
+        app.handle_action(Action::PlayerEndOfTrack).unwrap();
+        assert!(!app.now_playing.as_ref().unwrap().playing);
+        assert_eq!(
+            app.now_playing.as_ref().unwrap().track.uri,
+            "spotify:track:test4"
+        );
+        assert!(app.status.contains("End of queue"));
+
+        let mut app = playing_app_at(4);
+        app.set_repeat(RepeatMode::All);
+        app.handle_action(Action::PlayerEndOfTrack).unwrap();
+        assert_eq!(
+            app.now_playing.as_ref().unwrap().track.uri,
+            "spotify:track:test0"
+        );
+        assert!(app.now_playing.as_ref().unwrap().playing);
+
+        let mut app = playing_app_at(2);
+        app.set_repeat(RepeatMode::One);
+        app.handle_action(Action::PlayerEndOfTrack).unwrap();
+        assert_eq!(
+            app.now_playing.as_ref().unwrap().track.uri,
+            "spotify:track:test2"
+        );
+        assert_eq!(app.now_playing.as_ref().unwrap().position, Duration::ZERO);
+        assert!(app.now_playing.as_ref().unwrap().playing);
+        assert!(app.status.contains("Repeating"));
+    }
+
+    #[test]
+    fn cover_art_rebuilds_after_terminal_resize() {
+        let mut app = test_app();
+        app.set_terminal_size(100, 30);
+        let mut track = demo_tracks()[0].clone();
+        track.art_url = Some("https://example.com/cover.jpg".to_string());
+        app.now_playing = Some(NowPlaying {
+            track,
+            position: Duration::ZERO,
+            playing: false,
+            volume: 60,
+        });
+        let image: image::DynamicImage = image::RgbImage::new(256, 256).into();
+        app.handle_action(Action::CoverArtLoaded {
+            url: "https://example.com/cover.jpg".to_string(),
+            result: Ok(image),
+        })
+        .unwrap();
+        assert_eq!(
+            app.art.protocol().unwrap().size(),
+            art::cover_size(Rect::new(0, 0, 100, 30))
+        );
+
+        app.handle_action(Action::Resize(120, 40)).unwrap();
+        assert_eq!(app.art.protocol().unwrap().size(), Size::new(44, 22));
+    }
+
+    #[tokio::test]
+    async fn cover_art_defers_when_terminal_is_too_small() {
+        let mut app = test_app();
+        app.set_terminal_size(40, 10);
+        let mut track = demo_tracks()[0].clone();
+        track.art_url = Some("https://example.com/cover.jpg".to_string());
+        app.now_playing = Some(NowPlaying {
+            track,
+            position: Duration::ZERO,
+            playing: false,
+            volume: 60,
+        });
+        let image: image::DynamicImage = image::RgbImage::new(256, 256).into();
+        app.handle_action(Action::CoverArtLoaded {
+            url: "https://example.com/cover.jpg".to_string(),
+            result: Ok(image),
+        })
+        .unwrap();
+        assert!(matches!(app.art, CoverArt::Deferred { .. }));
+
+        app.handle_action(Action::Resize(120, 40)).unwrap();
+        assert_eq!(app.art.protocol().unwrap().size(), Size::new(44, 22));
+    }
+
+    #[test]
+    fn lyrics_cache_restores_hits_and_known_misses() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "termify-app-lyrics-{}-{nanos}.json",
+            std::process::id()
+        ));
+        let mut entries = HashMap::new();
+        entries.insert(
+            "spotify:track:test0".to_string(),
+            Some(crate::lyrics::Lyrics {
+                lines: vec![crate::lyrics::LyricLine {
+                    time: Duration::from_secs(3),
+                    text: "cached".to_string(),
+                }],
+                synced: true,
+                source: "LRCLIB".to_string(),
+            }),
+        );
+        entries.insert("spotify:track:test1".to_string(), None);
+        crate::lyrics::save_cache(&path, &entries).expect("seed cache");
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut app = App::new_with_paths(tx, Picker::halfblocks(), None, Some(path.clone()));
+        assert!(app.lyrics.contains_key("spotify:track:test0"));
+        assert!(app.no_lyrics.contains("spotify:track:test1"));
+
+        let track = demo_tracks()[1].clone();
+        app.fetch_lyrics(&track);
+        assert!(app.status.contains("cached"));
+        assert!(app.lyrics_loading == false);
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -1,5 +1,6 @@
 //! Lyrics fetching via LRCLIB (free, no API key) with LRC timestamp parsing.
-//! Results are cached in-memory by track URI in `App`.
+//! Results are cached in-memory by track URI in `App` and persisted to
+//! `lyrics.json` so tracks do not need another request after a restart.
 //!
 //! LRCLIB's `/api/get` sometimes returns a translated entry instead of the
 //! original-language one (notably for DECO*27's モニタリング). When the track
@@ -8,10 +9,14 @@
 //! script. English translation on demand uses Google's public translate
 //! endpoint; it is best-effort and cached per track by `App`.
 
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
+#[cfg(test)]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::ui::Track;
 
@@ -32,6 +37,110 @@ pub struct Lyrics {
     pub lines: Vec<LyricLine>,
     pub synced: bool,
     pub source: String,
+}
+
+/// On-disk cache. `None` entries mean "this track really has no lyrics", so a
+/// missing result is remembered too and does not trigger another request next
+/// time the track is played.
+const CACHE_VERSION: u8 = 1;
+const CACHE_FILE: &str = "lyrics.json";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CachedLine {
+    time_ms: u64,
+    text: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CachedLyrics {
+    lines: Vec<CachedLine>,
+    synced: bool,
+    source: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct LyricsCacheFile {
+    version: u8,
+    #[serde(default)]
+    tracks: HashMap<String, Option<CachedLyrics>>,
+}
+
+/// Path of the lyrics cache inside the application cache directory.
+pub fn cache_file(cache_dir: &Path) -> PathBuf {
+    cache_dir.join(CACHE_FILE)
+}
+
+/// Load cached lyrics. A missing or unreadable cache is harmless: callers just
+/// fall back to a network fetch and overwrite the file on the next save.
+pub fn load_cache(path: &Path) -> Result<HashMap<String, Option<Lyrics>>> {
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("reading lyrics cache {}", path.display()))?;
+    let file: LyricsCacheFile = serde_json::from_str(&contents)
+        .with_context(|| format!("parsing lyrics cache {}", path.display()))?;
+    anyhow::ensure!(
+        file.version == CACHE_VERSION,
+        "unsupported lyrics cache version {}",
+        file.version
+    );
+    Ok(file
+        .tracks
+        .into_iter()
+        .map(|(uri, lyrics)| (uri, lyrics.map(lyrics_from_cache)))
+        .collect())
+}
+
+/// Persist lyrics atomically so a crash mid-write cannot leave a partial cache.
+pub fn save_cache(path: &Path, entries: &HashMap<String, Option<Lyrics>>) -> Result<()> {
+    let file = LyricsCacheFile {
+        version: CACHE_VERSION,
+        tracks: entries
+            .iter()
+            .map(|(uri, lyrics)| (uri.clone(), lyrics.as_ref().map(lyrics_to_cache)))
+            .collect(),
+    };
+    let json = serde_json::to_string(&file).context("encoding lyrics cache")?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, json).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("replacing lyrics cache {}", path.display()))?;
+    Ok(())
+}
+
+fn lyrics_to_cache(lyrics: &Lyrics) -> CachedLyrics {
+    CachedLyrics {
+        lines: lyrics
+            .lines
+            .iter()
+            .map(|line| CachedLine {
+                time_ms: line.time.as_millis().min(u64::MAX as u128) as u64,
+                text: line.text.clone(),
+            })
+            .collect(),
+        synced: lyrics.synced,
+        source: lyrics.source.clone(),
+    }
+}
+
+fn lyrics_from_cache(cached: CachedLyrics) -> Lyrics {
+    Lyrics {
+        lines: cached
+            .lines
+            .into_iter()
+            .map(|line| LyricLine {
+                time: Duration::from_millis(line.time_ms),
+                text: line.text,
+            })
+            .collect(),
+        synced: cached.synced,
+        source: cached.source,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -463,5 +572,50 @@ mod tests {
         assert_eq!(active_line(&lyrics, Duration::from_secs(5)), Some(0));
         assert_eq!(active_line(&lyrics, Duration::from_secs(15)), Some(1));
         assert_eq!(active_line(&lyrics, Duration::from_secs(25)), Some(2));
+    }
+
+    fn temp_cache_path() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "termify-lyrics-cache-{}-{nanos}.json",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn lyrics_cache_round_trips_hits_and_misses() {
+        let path = temp_cache_path();
+        let mut entries = HashMap::new();
+        entries.insert(
+            "spotify:track:hit".to_string(),
+            Some(Lyrics {
+                lines: vec![LyricLine {
+                    time: Duration::from_millis(12_500),
+                    text: "こんにちは".to_string(),
+                }],
+                synced: true,
+                source: "LRCLIB (original)".to_string(),
+            }),
+        );
+        entries.insert("spotify:track:miss".to_string(), None);
+
+        save_cache(&path, &entries).expect("save cache");
+        let loaded = load_cache(&path).expect("load cache");
+        let hit = loaded["spotify:track:hit"].as_ref().expect("cached hit");
+        assert_eq!(hit.lines[0].time, Duration::from_millis(12_500));
+        assert_eq!(hit.lines[0].text, "こんにちは");
+        assert!(hit.synced);
+        assert_eq!(hit.source, "LRCLIB (original)");
+        assert!(loaded["spotify:track:miss"].is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn missing_lyrics_cache_is_not_an_error() {
+        let path = temp_cache_path();
+        assert!(load_cache(&path).expect("missing cache").is_empty());
     }
 }

@@ -82,8 +82,8 @@ pub async fn run(tx: Sender<Action>) -> Result<()> {
                             break;
                         }
                     }
-                    Some(Ok(Event::Resize(_, _))) => {
-                        if tx.send(Action::Render).await.is_err() {
+                    Some(Ok(Event::Resize(width, height))) => {
+                        if tx.send(Action::Resize(width, height)).await.is_err() {
                             break;
                         }
                     }
