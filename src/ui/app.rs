@@ -312,6 +312,8 @@ pub struct NowPlaying {
 pub struct AppOptions {
     pub lyrics_cache_file: Option<PathBuf>,
     pub downloads: Option<DownloadStore>,
+    /// Whether Discord Rich Presence is configured and can be toggled.
+    pub discord_presence_available: bool,
 }
 
 #[derive(Debug)]
@@ -484,6 +486,10 @@ pub struct App {
     pub playlist_art: CoverArt,
     /// User-facing art toggle. Forced off when the terminal cannot show images.
     pub art_enabled: bool,
+    /// Whether a Discord Rich Presence session could be started this run.
+    pub discord_presence_available: bool,
+    /// Current in-app Discord Rich Presence toggle state.
+    pub discord_presence_enabled: bool,
     /// Terminal size used to choose the cover dimensions and rebuild its protocol.
     terminal_area: Rect,
     art_blocked_reason: Option<String>,
@@ -513,6 +519,7 @@ impl App {
             AppOptions {
                 lyrics_cache_file,
                 downloads: None,
+                discord_presence_available: false,
             },
         )
     }
@@ -535,6 +542,7 @@ impl App {
             None => CoverArt::no_art(),
         };
         let art_enabled = art_blocked_reason.is_none();
+        let discord_presence_available = options.discord_presence_available;
         let mut app = Self {
             running: true,
             tab: Tab::Search,
@@ -581,6 +589,8 @@ impl App {
             art,
             playlist_art,
             art_enabled,
+            discord_presence_available,
+            discord_presence_enabled: discord_presence_available,
             terminal_area: Rect::new(0, 0, 100, 30),
             art_blocked_reason,
             picker,
@@ -691,9 +701,7 @@ impl App {
             return;
         };
         let translation = self.translations.get(uri).map(|lines| lines.as_slice());
-        if let Err(err) =
-            crate::lyrics::save_downloaded(path, uri, result.as_ref(), translation)
-        {
+        if let Err(err) = crate::lyrics::save_downloaded(path, uri, result.as_ref(), translation) {
             tracing::warn!("Could not save lyrics cache: {err:#}");
         }
     }
@@ -802,7 +810,10 @@ impl App {
                 }
                 let count = tracks.len();
                 self.set_tracks(tracks);
-                self.offline_queue = Some(OfflineQueue::Playlist { id, name: name.clone() });
+                self.offline_queue = Some(OfflineQueue::Playlist {
+                    id,
+                    name: name.clone(),
+                });
                 self.offline_track_index = 0;
                 self.list_state.select(Some(index));
                 self.status = format!("Playing offline playlist '{name}' — {count} tracks");
@@ -842,11 +853,9 @@ impl App {
     /// Keep the Downloads list selection on the row representing `uri` while
     /// still tracking the track inside the playback queue separately.
     fn select_downloads_row_for_uri(&mut self, uri: &str) {
-        if let Some(row) = self
-            .offline_items
-            .iter()
-            .position(|item| matches!(item, OfflineItem::Track { uri: item_uri } if item_uri == uri))
-        {
+        if let Some(row) = self.offline_items.iter().position(
+            |item| matches!(item, OfflineItem::Track { uri: item_uri } if item_uri == uri),
+        ) {
             self.list_state.select(Some(row));
         }
     }
@@ -1406,7 +1415,11 @@ impl App {
                             let audio_path = self.downloads.audio_path(&entry);
                             let cover = entry.cover_file.clone();
                             if let Err(err) = self.downloads.insert(entry) {
-                                Self::discard_download(&self.downloads, cover.as_deref(), &audio_path);
+                                Self::discard_download(
+                                    &self.downloads,
+                                    cover.as_deref(),
+                                    &audio_path,
+                                );
                                 progress.failed += 1;
                                 failure = Some(format!("Could not index download: {err:#}"));
                             } else {
@@ -1442,7 +1455,11 @@ impl App {
                             let audio_path = self.downloads.audio_path(&entry);
                             let cover = entry.cover_file.clone();
                             if let Err(err) = self.downloads.insert(entry) {
-                                Self::discard_download(&self.downloads, cover.as_deref(), &audio_path);
+                                Self::discard_download(
+                                    &self.downloads,
+                                    cover.as_deref(),
+                                    &audio_path,
+                                );
                                 self.record_download_failure(
                                     label,
                                     format!("Could not index download: {err:#}"),
@@ -1940,6 +1957,7 @@ impl App {
             KeyCode::Char('s') => self.toggle_shuffle(),
             KeyCode::Char('r') => self.toggle_repeat(),
             KeyCode::Char('c') => self.toggle_art(),
+            KeyCode::Char('P') => self.toggle_discord_presence(),
             KeyCode::Char('a') => self.toggle_auto_scroll(),
             KeyCode::Char('t') => self.toggle_translation(),
             KeyCode::Char('L') => {
@@ -2659,6 +2677,19 @@ impl App {
         }
     }
 
+    fn toggle_discord_presence(&mut self) {
+        if !self.discord_presence_available {
+            self.status = "Discord Rich Presence unavailable (set discord_client_id)".to_string();
+            return;
+        }
+        self.discord_presence_enabled = !self.discord_presence_enabled;
+        self.status = if self.discord_presence_enabled {
+            "Discord Rich Presence on".to_string()
+        } else {
+            "Discord Rich Presence off".to_string()
+        };
+    }
+
     /// Start a background fetch for the selected track's cover art. Repeated
     /// selections of the same track do not restart a load or replace a ready
     /// image.
@@ -2772,12 +2803,13 @@ impl App {
             let result = art::fetch_image(&client, &fetch_url)
                 .await
                 .map_err(|err| format!("{err:#}"));
-            let _ = tx.send(Action::CoverArtLoaded {
-                target,
-                url,
-                result,
-            })
-            .await;
+            let _ = tx
+                .send(Action::CoverArtLoaded {
+                    target,
+                    url,
+                    result,
+                })
+                .await;
         });
     }
 
@@ -3470,6 +3502,23 @@ mod tests {
         assert!(state.shuffle);
     }
 
+    #[test]
+    fn discord_presence_toggle_reports_availability() {
+        let mut app = test_app();
+        app.handle_key(KeyEvent::from(KeyCode::Char('P'))).unwrap();
+        assert!(!app.discord_presence_enabled);
+        assert!(app.status.contains("unavailable"));
+
+        app.discord_presence_available = true;
+        app.discord_presence_enabled = true;
+        app.handle_key(KeyEvent::from(KeyCode::Char('P'))).unwrap();
+        assert!(!app.discord_presence_enabled);
+        assert_eq!(app.status, "Discord Rich Presence off");
+        app.handle_key(KeyEvent::from(KeyCode::Char('P'))).unwrap();
+        assert!(app.discord_presence_enabled);
+        assert_eq!(app.status, "Discord Rich Presence on");
+    }
+
     #[tokio::test]
     async fn mpris_controls_drive_playback() {
         let mut app = test_app();
@@ -3977,6 +4026,7 @@ mod tests {
             AppOptions {
                 lyrics_cache_file: None,
                 downloads: Some(store),
+                discord_presence_available: false,
             },
         );
         (app, dir)
@@ -4206,7 +4256,11 @@ mod tests {
     async fn offline_playlist_row_loads_saved_tracks_as_a_playable_queue() {
         let (mut app, dir) = offline_test_app("playlist-playback");
         let tracks = demo_tracks();
-        let uris: Vec<String> = tracks.iter().take(3).map(|track| track.uri.clone()).collect();
+        let uris: Vec<String> = tracks
+            .iter()
+            .take(3)
+            .map(|track| track.uri.clone())
+            .collect();
         for (index, track) in tracks.iter().take(3).enumerate() {
             let file = format!("000000000000000{index}.ogg");
             std::fs::write(dir.join(&file), b"OggS").expect("write audio");

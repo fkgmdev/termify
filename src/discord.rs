@@ -26,12 +26,18 @@ const BUTTON_LABEL_LIMIT: usize = 32;
 const BUTTON_URL_LIMIT: usize = 512;
 const ASSET_URL_LIMIT: usize = 512;
 
+#[derive(Debug, Clone)]
+enum DiscordUpdate {
+    State(MprisState),
+    Enabled(bool),
+}
+
 /// Owner of the Discord presence thread. Dropping it closes the state channel
 /// and waits for the thread to clear the activity, so Rich Presence never
 /// outlives the TUI.
 #[derive(Debug)]
 pub struct DiscordHandle {
-    tx: Option<watch::Sender<MprisState>>,
+    tx: Option<watch::Sender<DiscordUpdate>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -40,7 +46,15 @@ impl DiscordHandle {
     pub fn publish(&self, state: MprisState) {
         if let Some(tx) = &self.tx {
             // A closed receiver only means the presence thread already exited.
-            let _ = tx.send(state);
+            let _ = tx.send(DiscordUpdate::State(state));
+        }
+    }
+
+    /// Enable or disable presence at runtime. Disabling clears the current
+    /// activity immediately; enabling reconnects on the next state snapshot.
+    pub fn set_enabled(&self, enabled: bool) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(DiscordUpdate::Enabled(enabled));
         }
     }
 }
@@ -70,7 +84,7 @@ pub fn spawn(config: &Config) -> anyhow::Result<Option<DiscordHandle>> {
         return Ok(None);
     };
 
-    let (tx, rx) = watch::channel(MprisState::empty());
+    let (tx, rx) = watch::channel(DiscordUpdate::State(MprisState::empty()));
     let thread = thread::Builder::new()
         .name("termify-discord".to_string())
         .spawn(move || run(client_id, rx))
@@ -109,13 +123,14 @@ fn valid_client_id(id: &str) -> bool {
     (15..=25).contains(&id.len()) && id.bytes().all(|byte| byte.is_ascii_digit())
 }
 
-fn run(client_id: String, mut state_rx: watch::Receiver<MprisState>) {
+fn run(client_id: String, mut update_rx: watch::Receiver<DiscordUpdate>) {
     let mut client: Option<DiscordIpcClient> = None;
     let mut next_attempt = Instant::now();
     let mut warned_about_connection = false;
+    let mut enabled = true;
 
     loop {
-        let changed = match state_rx.has_changed() {
+        let changed = match update_rx.has_changed() {
             Ok(changed) => changed,
             Err(_) => {
                 clear_and_close(&mut client);
@@ -125,14 +140,26 @@ fn run(client_id: String, mut state_rx: watch::Receiver<MprisState>) {
         };
 
         if changed {
-            let state = state_rx.borrow_and_update().clone();
-            apply_state(
-                &mut client,
-                &client_id,
-                &mut next_attempt,
-                &mut warned_about_connection,
-                &state,
-            );
+            match update_rx.borrow_and_update().clone() {
+                DiscordUpdate::Enabled(new_enabled) => {
+                    enabled = new_enabled;
+                    if enabled {
+                        next_attempt = Instant::now();
+                    } else {
+                        clear_and_close(&mut client);
+                    }
+                }
+                DiscordUpdate::State(state) if enabled => {
+                    apply_state(
+                        &mut client,
+                        &client_id,
+                        &mut next_attempt,
+                        &mut warned_about_connection,
+                        &state,
+                    );
+                }
+                DiscordUpdate::State(_) => {}
+            }
         }
 
         thread::sleep(POLL_INTERVAL);

@@ -203,7 +203,7 @@ streaming tracks and from the rodio sink for downloaded files.
       Windows creates a hidden message window for SMTC's required HWND. Cross-
       checked with `cargo check --target x86_64-apple-darwin` and
       `cargo check --target x86_64-pc-windows-gnu`
-- [x] Discord Rich Presence: `discord.rs` consumes the same `MprisState` snapshot on a dedicated IPC thread, shows track/artist/album/HTTP cover art/progress as a `Listening` activity, marks paused tracks without a timer, clears activity at shutdown, retries when Discord is absent, and is safely disabled via config/env. Media controls are intentionally not claimed because Discord RPC does not forward media keys to termify
+- [x] Discord Rich Presence: `discord.rs` consumes the same `MprisState` snapshot on a dedicated IPC thread, shows track/artist/album/HTTP cover art/progress as a `Listening` activity, marks paused tracks without a timer, clears activity at shutdown, retries when Discord is absent, and is safely disabled via config/env. `P` toggles presence at runtime when configured. Media controls are intentionally not claimed because Discord RPC does not forward media keys to termify
 - [ ] Integration tests with a mock HTTP layer
 
 ### M6 — Offline listening (implemented, live check pending)

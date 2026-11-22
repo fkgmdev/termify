@@ -1025,7 +1025,7 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_help(frame: &mut Frame, area: Rect) {
     let popup_width = area.width.min(64);
-    let popup_height = area.height.min(40);
+    let popup_height = area.height.min(42);
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
     let popup = Rect::new(x, y, popup_width, popup_height);
@@ -1064,6 +1064,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::from("  s           Shuffle on / off"),
         Line::from("  r           Repeat off / playlist / one (shuffle-aware; MPRIS Loop Status)"),
         Line::from("  c           Show / hide cover art (falls back to text when unsupported)"),
+        Line::from("  P           Toggle Discord Rich Presence"),
         Line::from("  a           Lyrics follow playback on / off"),
         Line::from("  t           Translate lyrics to English (lyrics tab)"),
         Line::from("  ?           Toggle this help"),

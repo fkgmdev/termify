@@ -17,7 +17,11 @@ use tokio::sync::mpsc;
 use crate::config::{Config, Paths};
 
 #[derive(Debug, Parser)]
-#[command(name = "termify", version, about = "A terminal Spotify client with local playback")]
+#[command(
+    name = "termify",
+    version,
+    about = "A terminal Spotify client with local playback"
+)]
 struct Cli {
     /// Force a fresh Spotify login even if a cached token exists.
     #[arg(long)]
@@ -112,10 +116,14 @@ async fn main() -> Result<()> {
                 art_url: None,
                 added_by: None,
             };
-            let assets =
-                offline::DownloadAssets::new(Some(paths.lyrics_cache_file.clone()));
-            match offline::download_track_with_assets(&local.session, &track, downloads.dir(), &assets)
-                .await
+            let assets = offline::DownloadAssets::new(Some(paths.lyrics_cache_file.clone()));
+            match offline::download_track_with_assets(
+                &local.session,
+                &track,
+                downloads.dir(),
+                &assets,
+            )
+            .await
             {
                 Ok(entry) => {
                     let size = entry.size;
@@ -161,15 +169,17 @@ async fn main() -> Result<()> {
                     .await
                     .context("authenticating for local playback")?;
 
-                let player = match player::LocalPlayer::connect(&access_token, &config, &paths).await
-                {
-                    Ok(p) => Some(p),
-                    Err(err) => {
-                        tracing::warn!("Local playback unavailable: {err}");
-                        eprintln!("Warning: local playback unavailable ({err}); browsing still works.");
-                        None
-                    }
-                };
+                let player =
+                    match player::LocalPlayer::connect(&access_token, &config, &paths).await {
+                        Ok(p) => Some(p),
+                        Err(err) => {
+                            tracing::warn!("Local playback unavailable: {err}");
+                            eprintln!(
+                                "Warning: local playback unavailable ({err}); browsing still works."
+                            );
+                            None
+                        }
+                    };
                 run_tui(Some(spotify), player, &paths, &config, false, false).await?;
             }
         }
@@ -250,6 +260,7 @@ async fn run_tui(
         ui::AppOptions {
             lyrics_cache_file: Some(paths.lyrics_cache_file.clone()),
             downloads: Some(downloads),
+            discord_presence_available: false,
         },
     );
     app.set_terminal_size(terminal_size.width, terminal_size.height);
@@ -318,12 +329,16 @@ async fn run_tui(
             None
         }
     };
+    app.discord_presence_available = discord.is_some();
+    app.discord_presence_enabled = discord.is_some();
     if let Some(handle) = &discord {
+        handle.set_enabled(app.discord_presence_enabled);
         handle.publish(app.mpris_state());
     }
 
     terminal.draw(|frame| ui::render::render(frame, &app))?;
 
+    let mut last_discord_enabled = app.discord_presence_enabled;
     let result = async {
         while app.running {
             if let Some(action) = rx.recv().await {
@@ -332,7 +347,13 @@ async fn run_tui(
                     handle.publish(app.mpris_state());
                 }
                 if let Some(handle) = &discord {
-                    handle.publish(app.mpris_state());
+                    if app.discord_presence_enabled != last_discord_enabled {
+                        handle.set_enabled(app.discord_presence_enabled);
+                        last_discord_enabled = app.discord_presence_enabled;
+                    }
+                    if app.discord_presence_enabled {
+                        handle.publish(app.mpris_state());
+                    }
                 }
                 terminal.draw(|frame| ui::render::render(frame, &app))?;
             }

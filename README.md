@@ -406,7 +406,8 @@ Rich Presence is optional. Create an application in the
 **Application ID**, and set it as `discord_client_id` in `config.toml` or via
 `TERMIFY_DISCORD_CLIENT_ID` (the generic `DISCORD_CLIENT_ID` also works). Discord
 must be running locally; if it is not, termify logs one warning and retries
-without interrupting playback. Set `TERMIFY_NO_DISCORD=1` to disable it entirely.
+without interrupting playback. Set `TERMIFY_NO_DISCORD=1` to disable it entirely. Press `P` in the TUI to toggle
+it on or off for the current session.
 
 Discord's local RPC API does not forward media keys to termify, so use the
 desktop media controls above for play/pause/next/previous. The presence card's
