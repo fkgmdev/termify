@@ -259,6 +259,10 @@ streaming tracks and from the rodio sink for downloaded files.
       metadata is enriched from librespot's `AudioItem`, asset failures are
       best-effort, deletion removes the saved cover, and offline playback loads
       saved covers/translations from disk
+- [x] Fixed a playlist download that could sit at `0/n`: optional cover/lyrics
+      work now runs in bounded background tasks (separate client timeouts, a 25 s
+      cap and four concurrent requests) after `DownloadFinished` is reported, so
+      audio progress advances independently and cache writes are serialized
 - [ ] Verify one real Premium download and `--offline` playback with user credentials
 
 ## Deferred (not in v1)

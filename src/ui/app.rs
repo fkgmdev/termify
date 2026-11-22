@@ -351,6 +351,12 @@ pub enum Action {
         uri: String,
         result: Result<DownloadEntry, String>,
     },
+    /// Optional cover/lyrics for a downloaded track finished in the background.
+    /// Audio progress is reported by `DownloadFinished` independently.
+    DownloadAssetsFinished {
+        uri: String,
+        cover_file: Option<String>,
+    },
     /// Playlist tracks were fetched and queued for offline download. `members`
     /// is the full playlist so already-saved tracks can join the offline queue.
     PlaylistDownloadStarted {
@@ -695,10 +701,9 @@ impl App {
     /// Configuration for headless asset downloads (cover art, lyrics, and
     /// translations) used by both single-track and playlist downloads.
     fn download_assets(&self) -> offline::DownloadAssets {
-        offline::DownloadAssets {
-            http_client: Some(self.http_client.clone()),
-            lyrics_cache_file: self.lyrics_cache_file.clone(),
-        }
+        // A dedicated client with short timeouts keeps a stalled CDN or
+        // translation endpoint from freezing playlist download progress.
+        offline::DownloadAssets::new(self.lyrics_cache_file.clone())
     }
 
     /// Remove audio and cover when indexing a completed download fails.
@@ -882,15 +887,33 @@ impl App {
         let title = track.title.clone();
         self.status = format!("Downloading '{title}'...");
         tokio::spawn(async move {
-            let result = offline::download_track_with_assets(&player.session, &track, &dir, &assets)
+            // Report audio progress first; optional assets run in their own task.
+            let result = offline::download_track(&player.session, &track, &dir)
                 .await
                 .map_err(|err| format!("{err:#}"));
+            let saved = result.is_ok();
+            let asset_uri = download_uri.clone();
             let _ = tx
                 .send(Action::DownloadFinished {
                     uri: download_uri,
                     result,
                 })
                 .await;
+            if saved {
+                let asset_tx = tx.clone();
+                let asset_dir = dir.clone();
+                let asset_track = track.clone();
+                tokio::spawn(async move {
+                    let cover_file =
+                        offline::download_assets_for(&asset_track, &asset_dir, &assets).await;
+                    let _ = asset_tx
+                        .send(Action::DownloadAssetsFinished {
+                            uri: asset_uri,
+                            cover_file,
+                        })
+                        .await;
+                });
+            }
         });
     }
 
@@ -986,19 +1009,37 @@ impl App {
                 if index > 0 {
                     tokio::time::sleep(Duration::from_millis(400)).await;
                 }
-                let result =
-                    offline::download_track_with_assets(&player.session, &track, &dir, &assets)
-                        .await
-                        .map_err(|err| format!("{err:#}"));
+                let result = offline::download_track(&player.session, &track, &dir)
+                    .await
+                    .map_err(|err| format!("{err:#}"));
                 if result.is_err() {
                     failed += 1;
                 }
+                let saved = result.is_ok();
+                let asset_uri = track.uri.clone();
                 let _ = tx
                     .send(Action::DownloadFinished {
-                        uri: track.uri.clone(),
+                        uri: asset_uri.clone(),
                         result,
                     })
                     .await;
+                if saved {
+                    let asset_tx = tx.clone();
+                    let asset_dir = dir.clone();
+                    let asset_track = track.clone();
+                    let asset_assets = assets.clone();
+                    tokio::spawn(async move {
+                        let cover_file =
+                            offline::download_assets_for(&asset_track, &asset_dir, &asset_assets)
+                                .await;
+                        let _ = asset_tx
+                            .send(Action::DownloadAssetsFinished {
+                                uri: asset_uri,
+                                cover_file,
+                            })
+                            .await;
+                    });
+                }
             }
             let _ = tx
                 .send(Action::PlaylistDownloadFinished {
@@ -1423,6 +1464,15 @@ impl App {
                     // task; make them visible in this session too.
                     self.load_lyrics_cache();
                 }
+            }
+            Action::DownloadAssetsFinished { uri, cover_file } => {
+                if let Some(cover) = cover_file {
+                    if let Err(err) = self.downloads.set_cover(&uri, cover) {
+                        tracing::warn!("Could not attach saved cover for {uri}: {err:#}");
+                    }
+                }
+                // The asset task also wrote lyrics/translations to disk.
+                self.load_lyrics_cache();
             }
             Action::PlaylistDownloadStarted {
                 id,

@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
@@ -20,6 +21,7 @@ use librespot_core::{FileId, Session, SpotifyId, SpotifyUri};
 use librespot_metadata::audio::{AudioFileFormat, AudioFiles, AudioItem};
 use rodio::{Decoder, OutputStream, OutputStreamBuilder, Sink};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 use tokio::time::sleep;
 
 use crate::ui::Track;
@@ -62,6 +64,35 @@ pub struct DownloadEntry {
 pub struct DownloadAssets {
     pub http_client: Option<reqwest::Client>,
     pub lyrics_cache_file: Option<PathBuf>,
+}
+
+/// Each optional asset request is bounded. A stalled CDN or translation
+/// endpoint must never keep a playlist download from reporting progress.
+const ASSET_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const ASSET_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const ASSET_TOTAL_TIMEOUT: Duration = Duration::from_secs(25);
+/// Bound parallel optional requests during bulk downloads so LRCLIB and the
+/// translation service are not hammered by a whole playlist at once.
+const MAX_PARALLEL_ASSET_TASKS: usize = 4;
+static ASSET_SEMAPHORE: OnceLock<Semaphore> = OnceLock::new();
+
+fn asset_semaphore() -> &'static Semaphore {
+    ASSET_SEMAPHORE.get_or_init(|| Semaphore::new(MAX_PARALLEL_ASSET_TASKS))
+}
+
+impl DownloadAssets {
+    /// Client with explicit timeouts for optional cover/lyrics requests.
+    pub fn new(lyrics_cache_file: Option<PathBuf>) -> Self {
+        let http_client = reqwest::Client::builder()
+            .connect_timeout(ASSET_CONNECT_TIMEOUT)
+            .timeout(ASSET_REQUEST_TIMEOUT)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self {
+            http_client: Some(http_client),
+            lyrics_cache_file,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -228,6 +259,19 @@ impl DownloadStore {
     pub fn insert(&mut self, entry: DownloadEntry) -> Result<()> {
         self.entries.insert(entry.track.uri.clone(), entry);
         self.save()
+    }
+
+    /// Attach a cover saved after the audio download finished. Used by the
+    /// background asset task so playlist progress never waits on the network.
+    pub fn set_cover(&mut self, uri: &str, cover_file: String) -> Result<()> {
+        if !safe_cover_file_name(&cover_file) {
+            return Ok(());
+        }
+        if let Some(entry) = self.entries.get_mut(uri) {
+            entry.cover_file = Some(cover_file);
+            self.save()?;
+        }
+        Ok(())
     }
 
     /// Remove a download from the index and delete its audio file. A missing
@@ -807,8 +851,32 @@ async fn save_cover(client: &reqwest::Client, uri: &str, url: &str, dir: &Path) 
 
 /// Fetch cover art and lyrics for a downloaded track. Both are best-effort: a
 /// missing cover or an unavailable translation service must never turn a
-/// successful audio download into a failure.
-async fn download_assets(track: &Track, dir: &Path, assets: &DownloadAssets) -> Option<String> {
+/// successful audio download into a failure. The whole asset pass is bounded so
+/// a stalled endpoint cannot hold up bulk download progress.
+pub async fn download_assets_for(
+    track: &Track,
+    dir: &Path,
+    assets: &DownloadAssets,
+) -> Option<String> {
+    match tokio::time::timeout(
+        ASSET_TOTAL_TIMEOUT,
+        download_assets_inner(track, dir, assets),
+    )
+    .await
+    {
+        Ok(cover) => cover,
+        Err(_) => {
+            tracing::warn!(
+                "Timed out saving optional assets for {}; keeping the audio download",
+                track.uri
+            );
+            None
+        }
+    }
+}
+
+async fn download_assets_inner(track: &Track, dir: &Path, assets: &DownloadAssets) -> Option<String> {
+    let _permit = asset_semaphore().acquire().await.ok();
     let cover = async {
         let (Some(client), Some(url)) = (&assets.http_client, track.art_url.as_deref()) else {
             return None;
@@ -922,7 +990,7 @@ pub async fn download_track_with_assets(
         }
         match format_result.expect("download loop always produces a result") {
             Ok(mut entry) => {
-                if let Some(cover) = download_assets(&track, dir, assets).await {
+                if let Some(cover) = download_assets_for(&track, dir, assets).await {
                     entry.cover_file = Some(cover);
                 }
                 return Ok(entry);
@@ -1050,6 +1118,28 @@ mod tests {
         reopened.remove(&saved.track.uri).expect("remove");
         assert!(!dir.join(saved.file).exists());
         assert!(!dir.join(saved.cover_file.as_ref().unwrap()).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cover_can_be_attached_after_indexing() {
+        let dir = temp_dir("late-cover");
+        let mut store = DownloadStore::open(&dir).expect("open store");
+        let saved = entry("spotify:track:late", "ogg");
+        std::fs::write(dir.join(&saved.file), b"OggS").expect("write audio");
+        store.insert(saved.clone()).expect("insert");
+        let name = cover_file_name(&saved.track.uri);
+        std::fs::write(dir.join(&name), b"\xff\xd8\xff").expect("write cover");
+        store
+            .set_cover(&saved.track.uri, name.clone())
+            .expect("attach cover");
+        assert_eq!(
+            DownloadStore::open(&dir)
+                .expect("reopen")
+                .get(&saved.track.uri)
+                .and_then(|entry| entry.cover_file.clone()),
+            Some(name)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

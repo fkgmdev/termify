@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Duration;
 #[cfg(test)]
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -48,6 +49,14 @@ const CACHE_VERSION: u8 = 2;
 /// caches are not lost on upgrade. The next save rewrites it as v2.
 const LEGACY_CACHE_VERSION: u8 = 1;
 const CACHE_FILE: &str = "lyrics.json";
+
+/// Playlist downloads persist assets in parallel; serialize the read-modify-
+/// write cycle so concurrent tasks cannot lose each other's entries.
+static CACHE_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+fn cache_write_guard() -> std::sync::MutexGuard<'static, ()> {
+    CACHE_WRITE_LOCK.lock().unwrap_or_else(|err| err.into_inner())
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct CachedLine {
@@ -133,6 +142,7 @@ pub fn save_cache(
     entries: &HashMap<String, Option<Lyrics>>,
     translations: &HashMap<String, Vec<String>>,
 ) -> Result<()> {
+    let _guard = cache_write_guard();
     let file = LyricsCacheFile {
         version: CACHE_VERSION,
         tracks: entries
@@ -158,6 +168,7 @@ pub fn save_downloaded(
     lyrics: Option<&Lyrics>,
     translation: Option<&[String]>,
 ) -> Result<()> {
+    let _guard = cache_write_guard();
     let mut file = if path.exists() {
         let contents = std::fs::read_to_string(path)
             .with_context(|| format!("reading lyrics cache {}", path.display()))?;
@@ -267,6 +278,30 @@ fn uses_cjk_script(text: &str) -> bool {
         matches!(
             c as u32,
             0x3040..=0x30FF // kana
+                | 0x3400..=0x4DBF // CJK extension A
+                | 0x4E00..=0x9FFF // CJK unified
+                | 0xAC00..=0xD7AF // hangul
+                | 0xF900..=0xFAFF // compatibility ideographs
+        )
+    })
+}
+
+/// True when lyrics use a script that benefits from English translation.
+/// Latin text (including accented European languages) is skipped: the
+/// translation service usually returns it unchanged and the extra request is a
+/// common source of stalls during bulk downloads.
+fn uses_translatable_script(text: &str) -> bool {
+    text.chars().any(|c| {
+        matches!(
+            c as u32,
+            0x0370..=0x03FF // Greek
+                | 0x0400..=0x052F // Cyrillic
+                | 0x0530..=0x058F // Armenian
+                | 0x0590..=0x05FF // Hebrew
+                | 0x0600..=0x06FF // Arabic
+                | 0x0900..=0x097F // Devanagari
+                | 0x0E00..=0x0E7F // Thai
+                | 0x3040..=0x30FF // kana
                 | 0x3400..=0x4DBF // CJK extension A
                 | 0x4E00..=0x9FFF // CJK unified
                 | 0xAC00..=0xD7AF // hangul
@@ -461,7 +496,8 @@ fn lyrics_from_parts(
 
 /// Fetch both original lyrics and their English translation for offline use.
 /// Translation is best-effort: a translation-service failure still leaves the
-/// original lyrics saved. An unchanged translation (already-English lyrics) is
+/// original lyrics saved. Latin-script lyrics skip the request entirely (the
+/// service would return them unchanged), and an unchanged translation is
 /// reported as absent so the UI does not show a redundant toggle.
 pub async fn fetch_for_download(
     client: &reqwest::Client,
@@ -470,6 +506,9 @@ pub async fn fetch_for_download(
     let Some(lyrics) = fetch(client, track).await? else {
         return Ok((None, None));
     };
+    if !uses_translatable_script(&lyrics_text(&lyrics)) {
+        return Ok((Some(lyrics), None));
+    }
     match translate_lines(client, &lyrics.lines, "en").await {
         Ok(translated)
             if translated
@@ -667,6 +706,16 @@ mod tests {
         assert!(uses_cjk_script("モニタリング"));
         assert!(uses_cjk_script("ねえあたし知ってるよ"));
         assert!(!uses_cjk_script("Knee Socks"));
+    }
+
+    #[test]
+    fn detects_scripts_that_need_translation() {
+        assert!(uses_translatable_script("モニタリング"));
+        assert!(uses_translatable_script("Привет мир"));
+        assert!(uses_translatable_script("Γειά σου"));
+        // Latin lyrics (including accented text) do not need a translation call.
+        assert!(!uses_translatable_script("Knee Socks"));
+        assert!(!uses_translatable_script("Café déjà vu — déjà vu"));
     }
 
     #[test]

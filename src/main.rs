@@ -111,10 +111,8 @@ async fn main() -> Result<()> {
                 art_url: None,
                 added_by: None,
             };
-            let assets = offline::DownloadAssets {
-                http_client: Some(reqwest::Client::new()),
-                lyrics_cache_file: Some(paths.lyrics_cache_file.clone()),
-            };
+            let assets =
+                offline::DownloadAssets::new(Some(paths.lyrics_cache_file.clone()));
             match offline::download_track_with_assets(&local.session, &track, downloads.dir(), &assets)
                 .await
             {

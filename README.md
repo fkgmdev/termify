@@ -240,10 +240,11 @@ cache directory as you would any media library.
 
 When local playback is connected, select any track and press `d`. termify fetches
 the audio through the authenticated librespot session, decrypts it and writes a
-`.part` file that is renamed only after a complete copy. It then saves the track's
-cover image beside the audio and writes any LRCLIB lyrics plus an English
-translation to `lyrics.json`; those extras are best-effort, so a missing cover or
-a translation-service outage never fails the audio download. Audio-key requests are
+`.part` file that is renamed only after a complete copy. Cover art and lyrics are
+then fetched in a separate background task — with short network timeouts — so a
+slow CDN or translation service never stalls playlist progress. Those extras are
+best-effort, so a missing cover or a translation-service outage never fails the
+audio download. Audio-key requests are
 spaced out and retried with backoff on transient failures such as
 `Service unavailable` / rate limits; permanent key refusals are reported
 immediately instead of being retried. termify never assumes a failed key means
