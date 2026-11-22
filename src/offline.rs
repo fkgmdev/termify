@@ -553,7 +553,11 @@ fn bytes_per_second(format: AudioFileFormat) -> usize {
 /// A download error worth retrying: CDN timeouts, connection resets, and
 /// throttling. Container/permission failures will fail identically on retry.
 fn download_error_is_transient(error: &anyhow::Error) -> bool {
-    let mut chain = error.chain().map(|e| e.to_string()).collect::<Vec<_>>().join(" ");
+    let mut chain = error
+        .chain()
+        .map(|e| e.to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
     chain.make_ascii_lowercase();
     chain.contains("timeout")
         || chain.contains("timed out")
@@ -797,9 +801,7 @@ fn enriched_track(track: &Track, item: &AudioItem) -> Track {
                 .map(|artist| artist.name.clone())
                 .collect::<Vec<_>>()
                 .join(", "),
-            librespot_metadata::audio::UniqueFields::Episode { show_name, .. } => {
-                show_name.clone()
-            }
+            librespot_metadata::audio::UniqueFields::Episode { show_name, .. } => show_name.clone(),
             librespot_metadata::audio::UniqueFields::Local { artists, .. } => {
                 artists.clone().unwrap_or_default()
             }
@@ -808,9 +810,7 @@ fn enriched_track(track: &Track, item: &AudioItem) -> Track {
     if enriched.album.is_empty() {
         enriched.album = match &item.unique_fields {
             librespot_metadata::audio::UniqueFields::Track { album, .. } => album.clone(),
-            librespot_metadata::audio::UniqueFields::Episode { show_name, .. } => {
-                show_name.clone()
-            }
+            librespot_metadata::audio::UniqueFields::Episode { show_name, .. } => show_name.clone(),
             librespot_metadata::audio::UniqueFields::Local { album, .. } => {
                 album.clone().unwrap_or_default()
             }
@@ -875,7 +875,11 @@ pub async fn download_assets_for(
     }
 }
 
-async fn download_assets_inner(track: &Track, dir: &Path, assets: &DownloadAssets) -> Option<String> {
+async fn download_assets_inner(
+    track: &Track,
+    dir: &Path,
+    assets: &DownloadAssets,
+) -> Option<String> {
     let _permit = asset_semaphore().acquire().await.ok();
     let cover = async {
         let (Some(client), Some(url)) = (&assets.http_client, track.art_url.as_deref()) else {
@@ -1103,8 +1107,11 @@ mod tests {
         let mut saved = entry("spotify:track:cover", "ogg");
         saved.cover_file = Some(cover_file_name(&saved.track.uri));
         std::fs::write(dir.join(&saved.file), b"OggS").expect("write audio");
-        std::fs::write(dir.join(saved.cover_file.as_ref().unwrap()), b"\xff\xd8\xff")
-            .expect("write cover");
+        std::fs::write(
+            dir.join(saved.cover_file.as_ref().unwrap()),
+            b"\xff\xd8\xff",
+        )
+        .expect("write cover");
         store.insert(saved.clone()).expect("insert");
 
         let mut reopened = DownloadStore::open(&dir).expect("reopen store");
@@ -1215,9 +1222,7 @@ mod tests {
             )
             .expect("insert playlist");
 
-        let playlists = DownloadStore::open(&dir)
-            .expect("reopen store")
-            .playlists();
+        let playlists = DownloadStore::open(&dir).expect("reopen store").playlists();
         assert_eq!(playlists.len(), 1);
         assert_eq!(playlists[0].name, "Road Trip");
         assert_eq!(playlists[0].track_uris.len(), 2);
@@ -1343,7 +1348,8 @@ mod tests {
         store
             .insert_playlist("playlist-1", "Legacy", &[track.track.uri.clone()])
             .expect("insert playlist");
-        let contents = std::fs::read_to_string(DownloadStore::index_file(&dir)).expect("read index");
+        let contents =
+            std::fs::read_to_string(DownloadStore::index_file(&dir)).expect("read index");
         assert!(contents.contains("\"version\": 2"));
         let _ = std::fs::remove_dir_all(&dir);
     }

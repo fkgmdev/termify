@@ -246,8 +246,7 @@ fn position_time(position: Duration) -> Time {
 async fn apply_state(player: &Player, state: &MprisState, last: Option<&MprisState>) {
     let metadata = match &state.track {
         Some(track) => {
-            let id = TrackId::try_from(track_id(&track.uri).as_str())
-                .unwrap_or(TrackId::NO_TRACK);
+            let id = TrackId::try_from(track_id(&track.uri).as_str()).unwrap_or(TrackId::NO_TRACK);
             let mut builder = Metadata::builder()
                 .trackid(id)
                 .title(track.title.clone())
@@ -278,7 +277,9 @@ async fn apply_state(player: &Player, state: &MprisState, last: Option<&MprisSta
     let _ = player.set_volume(state.volume.clamp(0.0, 1.0)).await;
 
     let position = position_time(state.position);
-    let previous_uri = last.and_then(|last| last.track.as_ref()).map(|track| track.uri.as_str());
+    let previous_uri = last
+        .and_then(|last| last.track.as_ref())
+        .map(|track| track.uri.as_str());
     let current_uri = state.track.as_ref().map(|track| track.uri.as_str());
     if previous_uri.is_some() && previous_uri == current_uri {
         if let Some(last) = last {

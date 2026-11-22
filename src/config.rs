@@ -214,8 +214,14 @@ mod tests {
         let cache = Path::new("cache").join("termify");
         assert_eq!(config, Path::new("config/termify"));
         assert_eq!(cache, Path::new("cache/termify"));
-        assert_eq!(config.join("config.toml"), Path::new("config/termify/config.toml"));
-        assert_eq!(cache.join("token.json"), Path::new("cache/termify/token.json"));
+        assert_eq!(
+            config.join("config.toml"),
+            Path::new("config/termify/config.toml")
+        );
+        assert_eq!(
+            cache.join("token.json"),
+            Path::new("cache/termify/token.json")
+        );
         assert_eq!(
             cache.join("lyrics.json"),
             Path::new("cache/termify/lyrics.json")

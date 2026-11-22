@@ -14,6 +14,7 @@ use discord_rich_presence::{
     DiscordIpc, DiscordIpcClient,
     activity::{Activity, ActivityType, Assets, Button, StatusDisplayType, Timestamps},
 };
+use serde_json::Value;
 use tokio::sync::watch;
 
 use crate::config::Config;
@@ -177,13 +178,15 @@ fn apply_state(
         let Some(active) = client.as_mut() else {
             return false;
         };
-        if let Err(err) = active.clear_activity() {
-            tracing::debug!("Could not clear Discord activity: {err}");
-            close_client(client);
-            *next_attempt = Instant::now() + RETRY_INTERVAL;
-            return false;
+        match clear_activity_checked(active) {
+            Ok(()) => return true,
+            Err(err) => {
+                tracing::debug!("Could not clear Discord activity: {err}");
+                close_client(client);
+                *next_attempt = Instant::now() + RETRY_INTERVAL;
+                return false;
+            }
         }
-        return true;
     }
 
     if !ensure_connected(client, client_id, next_attempt, warned_about_connection) {
@@ -194,13 +197,15 @@ fn apply_state(
     let Some(active) = client.as_mut() else {
         return false;
     };
-    if let Err(err) = active.set_activity(activity) {
-        tracing::warn!("Discord Rich Presence update failed: {err}");
-        close_client(client);
-        *next_attempt = Instant::now() + RETRY_INTERVAL;
-        return false;
+    match set_activity_checked(active, activity) {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!("Discord Rich Presence update failed: {err}");
+            close_client(client);
+            *next_attempt = Instant::now() + RETRY_INTERVAL;
+            false
+        }
     }
-    true
 }
 
 fn ensure_connected(
@@ -244,11 +249,75 @@ fn close_client(client: &mut Option<DiscordIpcClient>) {
 
 fn clear_and_close(client: &mut Option<DiscordIpcClient>) {
     if let Some(active) = client.as_mut() {
-        if let Err(err) = active.clear_activity() {
+        if let Err(err) = clear_activity_checked(active) {
             tracing::debug!("Could not clear Discord activity: {err}");
         }
     }
     close_client(client);
+}
+
+fn set_activity_checked(
+    client: &mut DiscordIpcClient,
+    activity: Activity<'static>,
+) -> Result<(), String> {
+    let payload = serde_json::json!({
+        "cmd": "SET_ACTIVITY",
+        "args": {
+            "pid": std::process::id(),
+            "activity": activity
+        },
+        "nonce": uuid_v4()
+    });
+    client
+        .send(payload, 1)
+        .map_err(|err| err.to_string())?;
+    check_rpc_response(client, "set_activity")
+}
+
+fn clear_activity_checked(client: &mut DiscordIpcClient) -> Result<(), String> {
+    let payload = serde_json::json!({
+        "cmd": "SET_ACTIVITY",
+        "args": {
+            "pid": std::process::id(),
+            "activity": Value::Null
+        },
+        "nonce": uuid_v4()
+    });
+    client
+        .send(payload, 1)
+        .map_err(|err| err.to_string())?;
+    check_rpc_response(client, "clear_activity")
+}
+
+fn check_rpc_response(client: &mut DiscordIpcClient, command: &str) -> Result<(), String> {
+    let (_op, response) = client.recv().map_err(|err| err.to_string())?;
+    let evt = response.get("evt").and_then(Value::as_str);
+    if evt == Some("ERROR") {
+        let code = response
+            .get("data")
+            .and_then(|d| d.get("code"))
+            .and_then(Value::as_i64);
+        let message = response
+            .get("data")
+            .and_then(|d| d.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown Discord RPC error");
+        return Err(match code {
+            Some(code) => format!("{command} rejected by Discord RPC ({code}): {message}"),
+            None => format!("{command} rejected by Discord RPC: {message}"),
+        });
+    }
+    Ok(())
+}
+
+fn uuid_v4() -> String {
+    // Discord RPC only needs a unique nonce; avoid adding a uuid dependency.
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("termify-{}-{nanos}", std::process::id())
 }
 
 /// Build the Rich Presence payload for one playback snapshot.

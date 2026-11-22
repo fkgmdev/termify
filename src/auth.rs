@@ -67,7 +67,10 @@ async fn client_from_cache(
     let token = match Token::from_cache(path) {
         Ok(token) => token,
         Err(err) => {
-            tracing::warn!("Ignoring unreadable token cache ({}): {err}", path.display());
+            tracing::warn!(
+                "Ignoring unreadable token cache ({}): {err}",
+                path.display()
+            );
             return Ok(None);
         }
     };
@@ -324,10 +327,7 @@ async fn device_login(paths: &Paths) -> Result<AuthCodePkceSpotify> {
     let http = reqwest::Client::new();
     let response = http
         .post(DEVICE_AUTH_URL)
-        .form(&[
-            ("client_id", DESKTOP_CLIENT_ID),
-            ("scope", PLAYBACK_SCOPES),
-        ])
+        .form(&[("client_id", DESKTOP_CLIENT_ID), ("scope", PLAYBACK_SCOPES)])
         .send()
         .await
         .context("requesting a Spotify device code")?

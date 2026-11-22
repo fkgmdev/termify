@@ -55,7 +55,9 @@ const CACHE_FILE: &str = "lyrics.json";
 static CACHE_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 fn cache_write_guard() -> std::sync::MutexGuard<'static, ()> {
-    CACHE_WRITE_LOCK.lock().unwrap_or_else(|err| err.into_inner())
+    CACHE_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -355,7 +357,9 @@ async fn fetch_get(client: &reqwest::Client, track: &Track) -> Result<Option<Lyr
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
     }
-    let response = response.error_for_status().context("LRCLIB returned an error")?;
+    let response = response
+        .error_for_status()
+        .context("LRCLIB returned an error")?;
     let body: LrclibResponse = response.json().await.context("parsing LRCLIB response")?;
 
     Ok(lyrics_from_parts(
@@ -393,17 +397,18 @@ async fn fetch_original_from_search(
     let mut best: Option<(i32, Lyrics)> = None;
     for item in items {
         let score = score_candidate(&item, track);
-        let Some(lyrics) = lyrics_from_parts(
-            item.synced_lyrics,
-            item.plain_lyrics,
-            "LRCLIB (original)",
-        ) else {
+        let Some(lyrics) =
+            lyrics_from_parts(item.synced_lyrics, item.plain_lyrics, "LRCLIB (original)")
+        else {
             continue;
         };
         if score < 0 || !wants_original_script(want_cjk, &lyrics) {
             continue;
         }
-        if best.as_ref().is_none_or(|(best_score, _)| score > *best_score) {
+        if best
+            .as_ref()
+            .is_none_or(|(best_score, _)| score > *best_score)
+        {
             best = Some((score, lyrics));
         }
     }
@@ -439,7 +444,8 @@ fn score_candidate(item: &LrclibSearchItem, track: &Track) -> i32 {
     let wanted_album = track.album.to_lowercase();
     if album == wanted_album {
         score += 30;
-    } else if !album.is_empty() && (album.contains(&wanted_album) || wanted_album.contains(&album)) {
+    } else if !album.is_empty() && (album.contains(&wanted_album) || wanted_album.contains(&album))
+    {
         score += 15;
     }
 
@@ -732,9 +738,18 @@ mod tests {
     fn active_line_follows_position() {
         let lyrics = Lyrics {
             lines: vec![
-                LyricLine { time: Duration::from_secs(0), text: "a".into() },
-                LyricLine { time: Duration::from_secs(10), text: "b".into() },
-                LyricLine { time: Duration::from_secs(20), text: "c".into() },
+                LyricLine {
+                    time: Duration::from_secs(0),
+                    text: "a".into(),
+                },
+                LyricLine {
+                    time: Duration::from_secs(10),
+                    text: "b".into(),
+                },
+                LyricLine {
+                    time: Duration::from_secs(20),
+                    text: "c".into(),
+                },
             ],
             synced: true,
             source: "test".into(),
@@ -772,10 +787,7 @@ mod tests {
         );
         entries.insert("spotify:track:miss".to_string(), None);
         let mut translations = HashMap::new();
-        translations.insert(
-            "spotify:track:hit".to_string(),
-            vec!["hello".to_string()],
-        );
+        translations.insert("spotify:track:hit".to_string(), vec!["hello".to_string()]);
 
         save_cache(&path, &entries, &translations).expect("save cache");
         let loaded = load_cache(&path).expect("load cache");
@@ -825,7 +837,10 @@ mod tests {
             loaded.translations["spotify:track:one"],
             vec!["hello".to_string()]
         );
-        assert_eq!(loaded.lyrics["spotify:track:one"].as_ref().unwrap().source, "LRCLIB");
+        assert_eq!(
+            loaded.lyrics["spotify:track:one"].as_ref().unwrap().source,
+            "LRCLIB"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -838,7 +853,9 @@ mod tests {
         )
         .expect("write legacy cache");
         let loaded = load_cache(&path).expect("load legacy cache");
-        let lyrics = loaded.lyrics["spotify:track:old"].as_ref().expect("old lyrics");
+        let lyrics = loaded.lyrics["spotify:track:old"]
+            .as_ref()
+            .expect("old lyrics");
         assert_eq!(lyrics.lines[0].text, "old");
         assert!(loaded.translations.is_empty());
         let _ = std::fs::remove_file(&path);

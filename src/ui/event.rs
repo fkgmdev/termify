@@ -37,7 +37,10 @@ impl ArrowFragmentParser {
                 }
             }
             // Not an arrow: replay the buffered '[' before the current key.
-            let events = vec![KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE), key.clone()];
+            let events = vec![
+                KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE),
+                key.clone(),
+            ];
             if key.modifiers.is_empty() && key.code == KeyCode::Esc {
                 self.after_esc = true;
             }

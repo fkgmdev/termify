@@ -257,8 +257,8 @@ pub fn decode_bytes(bytes: &[u8]) -> Result<DynamicImage> {
 /// Read a persisted cover from disk. Used during offline playback, where there
 /// is no network connection to fetch the original CDN URL.
 pub fn load_cover(path: &Path) -> Result<DynamicImage> {
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("reading saved cover {}", path.display()))?;
+    let bytes =
+        std::fs::read(path).with_context(|| format!("reading saved cover {}", path.display()))?;
     decode_bytes(&bytes).with_context(|| format!("decoding saved cover {}", path.display()))
 }
 

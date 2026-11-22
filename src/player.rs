@@ -9,8 +9,8 @@ use librespot_core::session::Session;
 use librespot_core::spotify_uri::SpotifyUri;
 use librespot_playback::audio_backend;
 use librespot_playback::config::{AudioFormat, PlayerConfig};
-use librespot_playback::mixer::{Mixer, MixerConfig};
 use librespot_playback::mixer::softmixer::SoftMixer;
+use librespot_playback::mixer::{Mixer, MixerConfig};
 use librespot_playback::player::{Player, PlayerEventChannel};
 
 use crate::config::{Config, Paths};
