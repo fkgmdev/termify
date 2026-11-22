@@ -339,9 +339,11 @@ async fn run_tui(
     terminal.draw(|frame| ui::render::render(frame, &app))?;
 
     let mut last_discord_enabled = app.discord_presence_enabled;
+    let mut last_discord_publish = std::time::Instant::now() - std::time::Duration::from_secs(15);
     let result = async {
         while app.running {
             if let Some(action) = rx.recv().await {
+                let is_tick = matches!(action, ui::Action::Tick);
                 app.handle_action(action)?;
                 if let Some(handle) = &media_controls {
                     handle.publish(app.mpris_state());
@@ -350,9 +352,17 @@ async fn run_tui(
                     if app.discord_presence_enabled != last_discord_enabled {
                         handle.set_enabled(app.discord_presence_enabled);
                         last_discord_enabled = app.discord_presence_enabled;
+                        last_discord_publish =
+                            std::time::Instant::now() - std::time::Duration::from_secs(15);
                     }
-                    if app.discord_presence_enabled {
+                    let playing = app.now_playing.as_ref().is_some_and(|np| np.playing);
+                    let publish_discord = app.discord_presence_enabled
+                        && (!playing
+                            || !is_tick
+                            || last_discord_publish.elapsed() >= std::time::Duration::from_secs(15));
+                    if publish_discord {
                         handle.publish(app.mpris_state());
+                        last_discord_publish = std::time::Instant::now();
                     }
                 }
                 terminal.draw(|frame| ui::render::render(frame, &app))?;

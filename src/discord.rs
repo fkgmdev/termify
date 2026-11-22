@@ -123,11 +123,51 @@ fn valid_client_id(id: &str) -> bool {
     (15..=25).contains(&id.len()) && id.bytes().all(|byte| byte.is_ascii_digit())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PresenceSignature {
+    track_uri: Option<String>,
+    playing: bool,
+    position_secs: u64,
+    title: String,
+    artist: String,
+    album: String,
+    art_url: Option<String>,
+    duration_secs: u64,
+}
+
+fn presence_signature(state: &MprisState) -> PresenceSignature {
+    let Some(track) = &state.track else {
+        return PresenceSignature {
+            track_uri: None,
+            playing: false,
+            position_secs: 0,
+            title: String::new(),
+            artist: String::new(),
+            album: String::new(),
+            art_url: None,
+            duration_secs: 0,
+        };
+    };
+
+    PresenceSignature {
+        track_uri: Some(track.uri.clone()),
+        playing: state.playing,
+        position_secs: state.position.as_secs(),
+        title: track.title.clone(),
+        artist: track.artist.clone(),
+        album: track.album.clone(),
+        art_url: track.art_url.clone(),
+        duration_secs: track.duration.as_secs(),
+    }
+}
+
 fn run(client_id: String, mut update_rx: watch::Receiver<DiscordUpdate>) {
     let mut client: Option<DiscordIpcClient> = None;
     let mut next_attempt = Instant::now();
     let mut warned_about_connection = false;
     let mut enabled = true;
+    let mut last_signature: Option<PresenceSignature> = None;
+    let mut last_sent_at = Instant::now() - RETRY_INTERVAL;
 
     loop {
         let changed = match update_rx.has_changed() {
@@ -143,6 +183,7 @@ fn run(client_id: String, mut update_rx: watch::Receiver<DiscordUpdate>) {
             match update_rx.borrow_and_update().clone() {
                 DiscordUpdate::Enabled(new_enabled) => {
                     enabled = new_enabled;
+                    last_signature = None;
                     if enabled {
                         next_attempt = Instant::now();
                     } else {
@@ -150,13 +191,25 @@ fn run(client_id: String, mut update_rx: watch::Receiver<DiscordUpdate>) {
                     }
                 }
                 DiscordUpdate::State(state) if enabled => {
-                    apply_state(
-                        &mut client,
-                        &client_id,
-                        &mut next_attempt,
-                        &mut warned_about_connection,
-                        &state,
-                    );
+                    let signature = presence_signature(&state);
+                    let should_send = last_signature.as_ref() != Some(&signature)
+                        || (state.playing
+                            && last_sent_at.elapsed() >= Duration::from_secs(15));
+                    if should_send {
+                        if apply_state(
+                            &mut client,
+                            &client_id,
+                            &mut next_attempt,
+                            &mut warned_about_connection,
+                            &state,
+                        ) {
+                            last_signature = Some(signature);
+                            last_sent_at = Instant::now();
+                        } else {
+                            // Keep retrying on next update/interval.
+                            last_signature = None;
+                        }
+                    }
                 }
                 DiscordUpdate::State(_) => {}
             }
