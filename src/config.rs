@@ -21,6 +21,11 @@ pub struct Config {
     /// Audio backend passed to librespot (rodio, pulseaudio, alsa, ...).
     #[serde(default = "default_backend")]
     pub audio_backend: String,
+
+    /// Discord application ID used for Rich Presence. Optional; Rich Presence
+    /// stays disabled when this is empty.
+    #[serde(default)]
+    pub discord_client_id: String,
 }
 
 fn default_redirect_uri() -> String {
@@ -42,6 +47,7 @@ impl Default for Config {
             redirect_uri: default_redirect_uri(),
             volume: default_volume(),
             audio_backend: default_backend(),
+            discord_client_id: String::new(),
         }
     }
 }

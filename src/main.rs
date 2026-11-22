@@ -2,6 +2,7 @@ mod api;
 mod art;
 mod auth;
 mod config;
+mod discord;
 mod lyrics;
 mod mpris;
 mod offline;
@@ -149,9 +150,9 @@ async fn main() -> Result<()> {
         }
         None => {
             if cli.demo {
-                run_tui(None, None, &paths, false, false).await?;
+                run_tui(None, None, &paths, &config, false, false).await?;
             } else if cli.offline {
-                run_tui(None, None, &paths, false, true).await?;
+                run_tui(None, None, &paths, &config, false, true).await?;
             } else {
                 let spotify = auth::authenticated(&config, &paths, cli.relogin)
                     .await
@@ -169,7 +170,7 @@ async fn main() -> Result<()> {
                         None
                     }
                 };
-                run_tui(Some(spotify), player, &paths, false, false).await?;
+                run_tui(Some(spotify), player, &paths, &config, false, false).await?;
             }
         }
     }
@@ -181,6 +182,7 @@ async fn run_tui(
     spotify: Option<rspotify::AuthCodePkceSpotify>,
     local_player: Option<player::LocalPlayer>,
     paths: &config::Paths,
+    config: &config::Config,
     demo: bool,
     offline: bool,
 ) -> Result<()> {
@@ -307,6 +309,19 @@ async fn run_tui(
         handle.publish(app.mpris_state());
     }
 
+    // Discord Rich Presence mirrors the same snapshot. It is optional: without
+    // an application ID or a running Discord client this is a no-op.
+    let discord = match discord::spawn(config) {
+        Ok(handle) => handle,
+        Err(err) => {
+            tracing::warn!("Could not start Discord Rich Presence: {err:#}");
+            None
+        }
+    };
+    if let Some(handle) = &discord {
+        handle.publish(app.mpris_state());
+    }
+
     terminal.draw(|frame| ui::render::render(frame, &app))?;
 
     let result = async {
@@ -314,6 +329,9 @@ async fn run_tui(
             if let Some(action) = rx.recv().await {
                 app.handle_action(action)?;
                 if let Some(handle) = &media_controls {
+                    handle.publish(app.mpris_state());
+                }
+                if let Some(handle) = &discord {
                     handle.publish(app.mpris_state());
                 }
                 terminal.draw(|frame| ui::render::render(frame, &app))?;

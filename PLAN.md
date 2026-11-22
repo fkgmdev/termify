@@ -23,6 +23,7 @@ or decisions change.
 | Config/cache | Platform-specific `#[cfg]` blocks: Linux XDG (`~/.config/termify`, `~/.cache/termify`), macOS (`~/Library/Application Support/termify`, `~/Library/Caches/termify`), Windows (`%APPDATA%\termify`, `%LOCALAPPDATA%\termify`) |
 | Redirect URI | `http://127.0.0.1:8989/callback` for PKCE; device pairing uses `https://spotify.com/pair` |
 | Desktop integration | `os_media.rs` dispatches to `mpris-server` 0.11 on Linux/BSD and `souvlaki` 0.9.3 on macOS/Windows (Now Playing / SMTC). Media keys are routed by the OS, not grabbed directly. Shuffle and repeat (`Loop_Status`) are published/controllable on supported platforms; repeat-all restarts the playlist in the current shuffle order. Windows uses a hidden Win32 message window because SMTC requires an HWND |
+| Discord Rich Presence | `discord.rs` publishes track/artist/album/art/progress as a `Listening` activity through local Discord IPC (`discord-rich-presence` 1.1.0). Optional Discord application ID from `discord_client_id` or `TERMIFY_DISCORD_CLIENT_ID`; disabled by `TERMIFY_NO_DISCORD`, missing ID, or no running Discord client. No Game SDK, OAuth, or media-key grab; activity is cleared on shutdown |
 
 Lyrics note: Spotify's Web API has **no** lyrics endpoint. The internal `color-lyrics`
 endpoint is deliberately out of scope for v1 (unofficial, needs an account cookie).
@@ -43,6 +44,7 @@ src/
   lyrics.rs          # LRCLIB client, LRC parser, language preference, translation, v2 disk cache with translations
   mpris.rs           # MPRIS D-Bus server + shared media-state/types
   os_media.rs        # native media-control dispatcher (MPRIS/Now Playing/SMTC)
+  discord.rs         # optional Discord Rich Presence over local Discord IPC
   ui/
     mod.rs
     app.rs           # App state, Action enum, key handling, async helpers
@@ -201,6 +203,7 @@ streaming tracks and from the rodio sink for downloaded files.
       Windows creates a hidden message window for SMTC's required HWND. Cross-
       checked with `cargo check --target x86_64-apple-darwin` and
       `cargo check --target x86_64-pc-windows-gnu`
+- [x] Discord Rich Presence: `discord.rs` consumes the same `MprisState` snapshot on a dedicated IPC thread, shows track/artist/album/HTTP cover art/progress as a `Listening` activity, marks paused tracks without a timer, clears activity at shutdown, retries when Discord is absent, and is safely disabled via config/env. Media controls are intentionally not claimed because Discord RPC does not forward media keys to termify
 - [ ] Integration tests with a mock HTTP layer
 
 ### M6 — Offline listening (implemented, live check pending)

@@ -9,6 +9,7 @@ license = "MIT"
 anyhow = "1"
 chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
+discord-rich-presence = "1.1.0"
 futures = "0.3"
 image = { version = "=0.25.6", default-features = false, features = ["jpeg", "png"] }
 librespot-audio = "0.8"

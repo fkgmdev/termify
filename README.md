@@ -94,6 +94,7 @@ Not in v1: Spotify Connect, daemon mode, audio visualization.
    redirect_uri = "http://127.0.0.1:8989/callback"
    volume = 60
    audio_backend = "rodio"
+   discord_client_id = "123456789012345678" # optional, for Rich Presence
    ```
 
 3. Authenticate:
@@ -392,6 +393,25 @@ open-URI events are translated into the same `Action`s used by the keyboard, so
 they also work with downloaded tracks in `--offline` mode. Shuffle is
 publishable/controllable on macOS and exposed as MPRIS `Loop_Status` on Linux.
 
+## Discord Rich Presence
+
+Rich Presence is the detailed Discord activity card ("Listening to …"), as
+opposed to a generic online status. termify publishes the current track, artist,
+album, cover art (when the URL is HTTP/HTTPS) and playback progress to the local
+Discord desktop client. Pausing keeps the track in the card but removes the
+progress bar; stopping clears the activity.
+
+Rich Presence is optional. Create an application in the
+[Discord Developer Portal](https://discord.com/developers/applications), copy its
+**Application ID**, and set it as `discord_client_id` in `config.toml` or via
+`TERMIFY_DISCORD_CLIENT_ID` (the generic `DISCORD_CLIENT_ID` also works). Discord
+must be running locally; if it is not, termify logs one warning and retries
+without interrupting playback. Set `TERMIFY_NO_DISCORD=1` to disable it entirely.
+
+Discord's local RPC API does not forward media keys to termify, so use the
+desktop media controls above for play/pause/next/previous. The presence card's
+"Open in Spotify" button opens the current track on the web.
+
 ## Architecture
 
 Single binary, modular source:
@@ -408,6 +428,7 @@ src/
   lyrics.rs   # LRCLIB client, LRC parser, language preference, translation, disk cache
   mpris.rs    # MPRIS D-Bus player and shared media-state/types
   os_media.rs # platform dispatcher: MPRIS on Linux, Now Playing/SMTC on macOS/Windows
+  discord.rs  # optional Discord Rich Presence over local Discord IPC
   ui/
     app.rs    # App state, Action enum, keys, queue/shuffle/repeat/lyrics/cover/downloads
     event.rs  # crossterm stream + tick -> Action channel
@@ -420,7 +441,8 @@ player events, downloads, lyrics, cover art) all flow into one `mpsc` channel.
 a state snapshot to the active media thread: MPRIS runs on its own current-thread
 Tokio runtime because `mpris-server`'s `Player` is `Rc`-based and not `Send`,
 while macOS/Windows use `souvlaki` on a dedicated thread (with a hidden Win32
-message window on Windows). Online progress is derived from a local clock anchored
+message window on Windows). Optional Discord Rich Presence consumes the same
+snapshot on its own IPC thread. Online progress is derived from a local clock anchored
 on a 250 ms tick; offline progress comes from the rodio sink.
 
 ## Notes / troubleshooting

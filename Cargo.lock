@@ -842,6 +842,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "discord-rich-presence"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "90c55d69cab17c19677ce3a5f8face993a9e6eaf847fecac3547f3a3ff4a2494"
+dependencies = [
+ "log",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "serde_repr",
+ "thiserror 2.0.21",
+ "uuid 0.8.2",
+]
+
+[[package]]
 name = "dispatch"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1934,7 +1949,7 @@ dependencies = [
  "tokio-tungstenite",
  "tokio-util",
  "url",
- "uuid",
+ "uuid 1.29.3",
  "vergen-gitcl",
 ]
 
@@ -1953,7 +1968,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
- "uuid",
+ "uuid 1.29.3",
 ]
 
 [[package]]
@@ -4194,6 +4209,7 @@ dependencies = [
  "chrono",
  "clap",
  "crossterm",
+ "discord-rich-presence",
  "futures",
  "image",
  "librespot-audio",
@@ -4766,6 +4782,15 @@ checksum = "3a3b425286980a367278453f3b6d28cdcb134b574e5a35824a6ff5eebad50bb6"
 
 [[package]]
 name = "uuid"
+version = "0.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc5cf98d8186244414c848017f0e2676b3fcb46807f6668a97dfe67359a3c4b7"
+dependencies = [
+ "getrandom 0.2.17",
+]
+
+[[package]]
+name = "uuid"
 version = "1.29.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3c14b15dffa2f4bd712103e857140aa04a4f2ff6e955c77d7eb8e53ee02a3b64"
@@ -4992,7 +5017,7 @@ dependencies = [
  "mac_address",
  "sha2",
  "thiserror 1.0.69",
- "uuid",
+ "uuid 1.29.3",
 ]
 
 [[package]]
@@ -5630,7 +5655,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uds_windows",
- "uuid",
+ "uuid 1.29.3",
  "windows-sys 0.61.2",
  "winnow",
  "zbus_macros",
