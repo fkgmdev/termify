@@ -6,6 +6,7 @@
 //! state instead of propagating into the main loop.
 
 use std::io::Cursor;
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use image::DynamicImage;
@@ -228,8 +229,9 @@ pub fn cover_size(terminal: Rect) -> Size {
     }
 }
 
-/// Download and decode an image into a format-agnostic buffer.
-pub async fn fetch_image(client: &reqwest::Client, url: &str) -> Result<DynamicImage> {
+/// Download raw image bytes. Used by the download pipeline to persist a copy
+/// beside the audio without needing a terminal or image protocol.
+pub async fn fetch_bytes(client: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
     let response = client
         .get(url)
         .send()
@@ -241,10 +243,28 @@ pub async fn fetch_image(client: &reqwest::Client, url: &str) -> Result<DynamicI
         .bytes()
         .await
         .context("reading cover art response")?;
+    Ok(bytes.to_vec())
+}
+
+/// Decode image bytes into a format-agnostic buffer.
+pub fn decode_bytes(bytes: &[u8]) -> Result<DynamicImage> {
     let reader = image::ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .context("detecting cover art format")?;
     reader.decode().context("decoding cover art")
+}
+
+/// Read a persisted cover from disk. Used during offline playback, where there
+/// is no network connection to fetch the original CDN URL.
+pub fn load_cover(path: &Path) -> Result<DynamicImage> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("reading saved cover {}", path.display()))?;
+    decode_bytes(&bytes).with_context(|| format!("decoding saved cover {}", path.display()))
+}
+
+/// Download and decode an image into a format-agnostic buffer.
+pub async fn fetch_image(client: &reqwest::Client, url: &str) -> Result<DynamicImage> {
+    decode_bytes(&fetch_bytes(client, url).await?)
 }
 
 /// Encode a decoded image for the detected terminal protocol at `size`. Any

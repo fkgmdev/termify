@@ -41,6 +41,9 @@ library, play music, and read synced lyrics, all from the terminal.
   resume following playback
 - Original-language lyrics preferred over translated LRCLIB entries; optional
   English translation (`t`), cached per track
+- Downloads also save cover art, lyrics and an English translation when
+  available, so downloaded tracks keep their artwork and translated lyrics in
+  `--offline` mode
 - Lyrics cached in memory and in `lyrics.json`, including known misses, so a
   restart does not repeat LRCLIB requests
 - Ratatui TUI with a single async action loop and `--demo` mode
@@ -185,8 +188,10 @@ playing. The active playback line stays marked with `▶`.
 Fetched lyrics are stored in `lyrics.json` in the cache directory listed under
 Setup. Both successful results and tracks with no lyrics are cached; a corrupt
 or outdated cache is ignored and rewritten after the next successful lookup.
-English translations are still regenerated per session because the translation
-service can change its output.
+English translations are cached with the lyrics they belong to. Downloading a
+track also writes its lyrics and translation to this file, so `t` works without
+a network connection for saved tracks; tracks fetched online without a download
+still regenerate their translation when the app restarts.
 
 ## Offline listening
 
@@ -201,8 +206,10 @@ Setup table:
 
 The v2 index is `downloads.json` inside that `downloads/` folder
 (`~/.cache/termify/downloads/downloads.json`, for example). It maps Spotify URIs
-to hashed `.ogg`/`.mp3` filenames and records which playlists each track belongs
-to. Writes are atomic, names are validated when the index is read, and stale entries
+to hashed `.ogg`/`.mp3` filenames, an optional matching `.jpg` cover file, and
+records which playlists each track belongs to. Lyrics and translations live in
+`lyrics.json` beside the `downloads/` folder, shared with online playback.
+Writes are atomic, names are validated when the index is read, and stale entries
 (missing files or invalid audio headers) disappear on the next launch without
 touching your other audio files.
 
@@ -219,19 +226,24 @@ quality. A track only gets 320 kbps if Spotify has that format for it.
 ### Is it safe to delete them?
 
 Yes. Downloaded files are **not DRM-encrypted** — they are ordinary Ogg Vorbis
-or MP3 audio files. Use `D` on the Offline tab to remove the selected track's
-file and index entry together; on a downloaded-playlist row, `D` only forgets the
-playlist grouping and keeps the audio files. You can also delete files manually:
-the next launch drops index entries whose files are gone or whose headers are
-invalid. No tokens or credentials are stored in `downloads/`; token caches stay
-in the parent cache directory with `0600` permissions, so protect the whole
+or MP3 audio files, with a plain image file for the saved cover. Use `D` on the
+Offline tab to remove the selected track's audio, cover and index entry together;
+on a downloaded-playlist row, `D` only forgets the playlist grouping and keeps
+the files. Lyrics entries in `lyrics.json` are shared with online playback and
+are not deleted with a track. You can also delete files manually: the next launch
+drops index entries whose audio is gone or whose headers are invalid, and forgets
+missing covers. No tokens or credentials are stored in `downloads/`; token caches
+stay in the parent cache directory with `0600` permissions, so protect the whole
 cache directory as you would any media library.
 
 ### Downloading and playing offline
 
 When local playback is connected, select any track and press `d`. termify fetches
 the audio through the authenticated librespot session, decrypts it and writes a
-`.part` file that is renamed only after a complete copy. Audio-key requests are
+`.part` file that is renamed only after a complete copy. It then saves the track's
+cover image beside the audio and writes any LRCLIB lyrics plus an English
+translation to `lyrics.json`; those extras are best-effort, so a missing cover or
+a translation-service outage never fails the audio download. Audio-key requests are
 spaced out and retried with backoff on transient failures such as
 `Service unavailable` / rate limits; permanent key refusals are reported
 immediately instead of being retried. termify never assumes a failed key means
@@ -271,10 +283,11 @@ cannot fetch new audio.
 
 `termify --offline` skips config validation, Web API login and the playback
 session, then starts directly in the Offline tab. It uses rodio to play only
-saved files, so it needs an audio device but no network connection. Lyrics,
-cover art and API browsing are unavailable in this mode because they need
-Spotify/Web API access; desktop media controls continue to work with the local
-player.
+saved files, so it needs an audio device but no network connection. Saved
+lyrics, translations and cover art for downloaded tracks are loaded from disk;
+tracks without saved copies fall back to text placeholders. API browsing stays
+unavailable without a login; desktop media controls continue to work with the
+local player.
 
 ## Playlists and collaborators
 
@@ -321,7 +334,9 @@ the Details pane, and the Lyrics and Queue tabs give it a dedicated area beside
 the text (or above it on narrow terminals). Press `l` for lyrics: the same album
 cover stays on screen next to the synced lines.
 
-The image is the 300px Spotify art, fetched in the background. The large cover
+The image is the 300px Spotify art, fetched in the background. Downloaded
+tracks use the cover saved next to their audio instead, which also works with
+`--offline`. The large cover
 grows with the terminal up to 44x22 cells (about 88x22 pixels at the usual 1:2
 cell ratio) while always leaving enough rows for the surrounding text; on small
 terminals it stays compact or steps aside entirely. Resizing re-encodes the
@@ -440,7 +455,8 @@ on a 250 ms tick; offline progress comes from the rodio sink.
   Do not delete `Cargo.lock` without re-applying `cargo update -p vergen --precise 9.0.6`.
 - **Token file permissions**: both token caches are written with mode `0600`.
 - **Offline downloads**: saved audio is plain, unencrypted Ogg/MP3 in the cache
-  directory's `downloads/` folder (see "Where downloads are saved" above). A
+  directory's `downloads/` folder (see "Where downloads are saved" above), with
+  an optional plain `.jpg` cover fetched from the track metadata. A
   failed download leaves no `.part` file, and an unreadable or outdated
   `downloads.json` is ignored rather than deleting audio. Failed attempts are
   appended to `download-errors.log` in the same folder and summarized in the
@@ -457,10 +473,11 @@ on a 250 ms tick; offline progress comes from the rodio sink.
   track, termify searches LRCLIB for the original-language entry (verified with
   DECO*27's モニタリング). Genius fallback is planned but not implemented yet.
 - **Translation**: English translation uses Google's public translate endpoint
-  (unofficial, no API key) and is cached per track for the session. If the
-  service is unavailable the status bar shows the error and original lyrics stay
-  visible.
+  (unofficial, no API key). It is cached per track in `lyrics.json`, including
+  for downloaded tracks so it works offline. If the service is unavailable the
+  status bar shows the error and original lyrics stay visible.
 - **Cover art**: if your terminal cannot show images you will see Unicode
-  halfblocks or a text placeholder instead; nothing is written to disk. Set
-  `TERMIFY_NO_ART=1` to skip terminal probing and disable art completely. A
-  missing or failed art fetch only affects the placeholder text.
+  halfblocks or a text placeholder instead; terminal protocols are not written
+  to disk, but downloads do save a plain `.jpg` cover. Set `TERMIFY_NO_ART=1` to
+  skip terminal probing and disable art completely. A missing or failed art
+  fetch only affects the placeholder text.

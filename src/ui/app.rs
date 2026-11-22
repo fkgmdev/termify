@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -659,8 +659,8 @@ impl App {
             return;
         };
         match crate::lyrics::load_cache(&path) {
-            Ok(entries) => {
-                for (uri, cached) in entries {
+            Ok(data) => {
+                for (uri, cached) in data.lyrics {
                     match cached {
                         Some(lyrics) => {
                             self.lyrics.insert(uri, lyrics);
@@ -670,25 +670,44 @@ impl App {
                         }
                     }
                 }
+                for (uri, lines) in data.translations {
+                    self.translations.insert(uri, lines);
+                }
             }
             Err(err) => tracing::warn!("Ignoring lyrics cache: {err:#}"),
         }
     }
 
+    /// Update one track in the persistent cache. Updating in place avoids
+    /// overwriting lyrics that the download pipeline saved concurrently.
     fn persist_lyrics_cache(&self, uri: &str, result: &Option<crate::lyrics::Lyrics>) {
         let Some(path) = &self.lyrics_cache_file else {
             return;
         };
-        let mut entries: HashMap<String, Option<crate::lyrics::Lyrics>> = HashMap::new();
-        for (cached_uri, lyrics) in &self.lyrics {
-            entries.insert(cached_uri.clone(), Some(lyrics.clone()));
-        }
-        for cached_uri in &self.no_lyrics {
-            entries.insert(cached_uri.clone(), None);
-        }
-        entries.insert(uri.to_string(), result.clone());
-        if let Err(err) = crate::lyrics::save_cache(path, &entries) {
+        let translation = self.translations.get(uri).map(|lines| lines.as_slice());
+        if let Err(err) =
+            crate::lyrics::save_downloaded(path, uri, result.as_ref(), translation)
+        {
             tracing::warn!("Could not save lyrics cache: {err:#}");
+        }
+    }
+
+    /// Configuration for headless asset downloads (cover art, lyrics, and
+    /// translations) used by both single-track and playlist downloads.
+    fn download_assets(&self) -> offline::DownloadAssets {
+        offline::DownloadAssets {
+            http_client: Some(self.http_client.clone()),
+            lyrics_cache_file: self.lyrics_cache_file.clone(),
+        }
+    }
+
+    /// Remove audio and cover when indexing a completed download fails.
+    fn discard_download(store: &DownloadStore, cover: Option<&str>, audio: &Path) {
+        let _ = std::fs::remove_file(audio);
+        if let Some(cover) = cover {
+            if let Some(name) = Path::new(cover).file_name() {
+                let _ = std::fs::remove_file(store.dir().join(name));
+            }
         }
     }
 
@@ -858,11 +877,12 @@ impl App {
         };
         let tx = self.tx.clone();
         let dir = self.downloads.dir().to_path_buf();
+        let assets = self.download_assets();
         let download_uri = track.uri.clone();
         let title = track.title.clone();
         self.status = format!("Downloading '{title}'...");
         tokio::spawn(async move {
-            let result = offline::download_track(&player.session, &track, &dir)
+            let result = offline::download_track_with_assets(&player.session, &track, &dir, &assets)
                 .await
                 .map_err(|err| format!("{err:#}"));
             let _ = tx
@@ -915,6 +935,7 @@ impl App {
 
         let tx = self.tx.clone();
         let dir = self.downloads.dir().to_path_buf();
+        let assets = self.download_assets();
         tokio::spawn(async move {
             let tracks = match crate::api::playlist_details(&client, &id).await {
                 Ok((_, tracks)) => tracks,
@@ -965,9 +986,10 @@ impl App {
                 if index > 0 {
                     tokio::time::sleep(Duration::from_millis(400)).await;
                 }
-                let result = offline::download_track(&player.session, &track, &dir)
-                    .await
-                    .map_err(|err| format!("{err:#}"));
+                let result =
+                    offline::download_track_with_assets(&player.session, &track, &dir, &assets)
+                        .await
+                        .map_err(|err| format!("{err:#}"));
                 if result.is_err() {
                     failed += 1;
                 }
@@ -1330,6 +1352,7 @@ impl App {
             Action::DownloadFinished { uri, result } => {
                 self.downloading.remove(&uri);
                 let label = self.track_label_for_uri(&uri);
+                let mut saved_assets = false;
                 let playlist = self
                     .playlist_downloads
                     .values_mut()
@@ -1340,10 +1363,13 @@ impl App {
                     match result {
                         Ok(entry) => {
                             let audio_path = self.downloads.audio_path(&entry);
+                            let cover = entry.cover_file.clone();
                             if let Err(err) = self.downloads.insert(entry) {
-                                let _ = std::fs::remove_file(audio_path);
+                                Self::discard_download(&self.downloads, cover.as_deref(), &audio_path);
                                 progress.failed += 1;
                                 failure = Some(format!("Could not index download: {err:#}"));
+                            } else {
+                                saved_assets = true;
                             }
                         }
                         Err(err) => {
@@ -1373,14 +1399,16 @@ impl App {
                         Ok(entry) => {
                             let title = entry.track.title.clone();
                             let audio_path = self.downloads.audio_path(&entry);
+                            let cover = entry.cover_file.clone();
                             if let Err(err) = self.downloads.insert(entry) {
-                                let _ = std::fs::remove_file(audio_path);
+                                Self::discard_download(&self.downloads, cover.as_deref(), &audio_path);
                                 self.record_download_failure(
                                     label,
                                     format!("Could not index download: {err:#}"),
                                 );
                                 self.set_error(format!("Could not index download: {err:#}"));
                             } else {
+                                saved_assets = true;
                                 self.status = format!("Downloaded '{title}' for offline listening");
                             }
                         }
@@ -1389,6 +1417,11 @@ impl App {
                             self.set_error(format!("Download failed: {err}"));
                         }
                     }
+                }
+                if saved_assets {
+                    // Lyrics and translations were written by the background
+                    // task; make them visible in this session too.
+                    self.load_lyrics_cache();
                 }
             }
             Action::PlaylistDownloadStarted {
@@ -1496,7 +1529,10 @@ impl App {
                 self.translation_loading = false;
                 match result {
                     Ok(lines) => {
-                        self.translations.insert(uri, lines);
+                        self.translations.insert(uri.clone(), lines);
+                        if let Some(lyrics) = self.lyrics.get(&uri).cloned() {
+                            self.persist_lyrics_cache(&uri, &Some(lyrics));
+                        }
                         self.status = "Translation on".to_string();
                     }
                     Err(err) => {
@@ -2577,12 +2613,51 @@ impl App {
     /// selections of the same track do not restart a load or replace a ready
     /// image.
     fn load_cover_art(&mut self, track: &Track) {
-        self.load_cover_art_url(
-            CoverArtTarget::Track {
-                uri: track.uri.clone(),
-            },
-            track.art_url.clone(),
-        );
+        let target = CoverArtTarget::Track {
+            uri: track.uri.clone(),
+        };
+        if self.art_enabled {
+            let saved = self
+                .downloads
+                .get(&track.uri)
+                .and_then(|entry| self.downloads.cover_path(entry));
+            if let Some(path) = saved {
+                let identity = track
+                    .art_url
+                    .clone()
+                    .unwrap_or_else(|| path.to_string_lossy().into_owned());
+                let already_loaded = {
+                    let slot = self.cover_slot(&target);
+                    slot.url() == Some(identity.as_str())
+                        && (matches!(slot.status(), ArtStatus::Ready | ArtStatus::Loading)
+                            || matches!(slot, CoverArt::Deferred { .. }))
+                };
+                if already_loaded {
+                    return;
+                }
+                match art::load_cover(&path) {
+                    Ok(image) => {
+                        let size = self.art_size();
+                        *self.cover_slot_mut(&target) = if size.width == 0 || size.height == 0 {
+                            let thumbnail = art::build_thumbnail(&self.picker, &image);
+                            CoverArt::deferred(identity, image, thumbnail)
+                        } else {
+                            match art::build_protocols(&self.picker, image.clone(), size) {
+                                Ok((protocol, thumbnail)) => {
+                                    CoverArt::ready(identity, image, protocol, thumbnail)
+                                }
+                                Err(err) => CoverArt::failed(identity, format!("{err:#}")),
+                            }
+                        };
+                        return;
+                    }
+                    Err(err) => {
+                        tracing::warn!("Could not read saved cover for {}: {err:#}", track.uri);
+                    }
+                }
+            }
+        }
+        self.load_cover_art_url(target, track.art_url.clone());
     }
 
     /// Show the selected playlist's own cover image in the Details pane.
@@ -3039,6 +3114,11 @@ impl App {
             self.status = "Lyrics are not loaded yet".to_string();
             return;
         };
+        if self.translations.contains_key(uri) {
+            // Downloaded tracks already carry a saved translation.
+            self.status = "Translation on".to_string();
+            return;
+        }
         self.translation_loading = true;
         self.status = "Translating lyrics...".to_string();
         let tx = self.tx.clone();
@@ -3815,7 +3895,7 @@ mod tests {
             }),
         );
         entries.insert("spotify:track:test1".to_string(), None);
-        crate::lyrics::save_cache(&path, &entries).expect("seed cache");
+        crate::lyrics::save_cache(&path, &entries, &HashMap::new()).expect("seed cache");
 
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let mut app = App::new_with_paths(tx, Picker::halfblocks(), None, Some(path.clone()));
@@ -3856,6 +3936,7 @@ mod tests {
         DownloadEntry {
             track: track.clone(),
             file: file.into(),
+            cover_file: None,
             size: 12,
             downloaded_at: 1,
         }

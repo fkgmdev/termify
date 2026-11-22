@@ -111,7 +111,13 @@ async fn main() -> Result<()> {
                 art_url: None,
                 added_by: None,
             };
-            match offline::download_track(&local.session, &track, downloads.dir()).await {
+            let assets = offline::DownloadAssets {
+                http_client: Some(reqwest::Client::new()),
+                lyrics_cache_file: Some(paths.lyrics_cache_file.clone()),
+            };
+            match offline::download_track_with_assets(&local.session, &track, downloads.dir(), &assets)
+                .await
+            {
                 Ok(entry) => {
                     let size = entry.size;
                     downloads.insert(entry)?;

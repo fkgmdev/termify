@@ -17,9 +17,9 @@ or decisions change.
 | UI | `ratatui` 0.30 + `crossterm` 0.29 |
 | Runtime | `tokio` (multi-thread), single `mpsc` Action channel into `App` |
 | Audio backend | librespot-playback with rodio/ALSA (`SoftMixer` for volume) |
-| Offline | Download through the authenticated librespot session (`librespot-audio`/`librespot-metadata`), store decrypted Ogg Vorbis/MP3 in `cache/downloads`, index in v2 `downloads.json` with playlist memberships; `d` saves one track or a whole playlist from the Playlists tab; Offline tab can replay a whole saved playlist, single tracks play with rodio, saved copies are preferred online, and `--offline` works with no login/network. Audio keys are retried with backoff, never assumed missing, and files are decoder-verified before indexing; lower-quality formats are tried before failure, and full error chains go to `downloads/download-errors.log` plus a short Offline-tab history. A `termify download <uri>` CLI subcommand prints the full chain without the TUI |
-| Lyrics | LRCLIB (line-synced, no key) primary, original-language entry preferred; English translation via Google's public endpoint on demand. Cached in-memory by track URI and persisted to `lyrics.json` (including "no lyrics" results). Genius unsynced fallback deferred to polish |
-| Cover art | Album and playlist images from the Web API, rendered with `ratatui-image` 11.1.0 (Kitty/iTerm2/Sixel with halfblocks fallback); the current song's cover has an 8x4 footer thumbnail on every tab and a large adaptive pane in Lyrics/Queue/Details (up to 44x22 cells), with protocols rebuilt on resize without refetching. Fetch/decode failures degrade to text placeholders; `TERMIFY_NO_ART`/`TERM=dumb` disable all art areas. Playlist-tab selection uses a separate cover state so it never replaces the current song's art; current album URL is published as MPRIS `mpris:artUrl` |
+| Offline | Download through the authenticated librespot session (`librespot-audio`/`librespot-metadata`), store decrypted Ogg Vorbis/MP3 in `cache/downloads`, index in v2 `downloads.json` with playlist memberships and an optional saved cover; `d` saves one track or a whole playlist from the Playlists tab; downloads also save cover art and lyrics/translations when available; Offline tab can replay a whole saved playlist, single tracks play with rodio, saved copies are preferred online, and `--offline` works with no login/network. Audio keys are retried with backoff, never assumed missing, and files are decoder-verified before indexing; lower-quality formats are tried before failure, and full error chains go to `downloads/download-errors.log` plus a short Offline-tab history. A `termify download <uri>` CLI subcommand prints the full chain without the TUI |
+| Lyrics | LRCLIB (line-synced, no key) primary, original-language entry preferred; English translation via Google's public endpoint on demand. Cached in-memory by track URI and persisted to v2 `lyrics.json` (including "no lyrics" results and translations saved for downloaded tracks). Genius unsynced fallback deferred to polish |
+| Cover art | Album and playlist images from the Web API, rendered with `ratatui-image` 11.1.0 (Kitty/iTerm2/Sixel with halfblocks fallback); the current song's cover has an 8x4 footer thumbnail on every tab and a large adaptive pane in Lyrics/Queue/Details (up to 44x22 cells), with protocols rebuilt on resize without refetching. Downloads save a plain `.jpg` cover beside the audio and offline playback loads it from disk. Fetch/decode failures degrade to text placeholders; `TERMIFY_NO_ART`/`TERM=dumb` disable all art areas. Playlist-tab selection uses a separate cover state so it never replaces the current song's art; current album URL is published as MPRIS `mpris:artUrl` |
 | Config/cache | Platform-specific `#[cfg]` blocks: Linux XDG (`~/.config/termify`, `~/.cache/termify`), macOS (`~/Library/Application Support/termify`, `~/Library/Caches/termify`), Windows (`%APPDATA%\termify`, `%LOCALAPPDATA%\termify`) |
 | Redirect URI | `http://127.0.0.1:8989/callback` for PKCE; device pairing uses `https://spotify.com/pair` |
 | Desktop integration | `os_media.rs` dispatches to `mpris-server` 0.11 on Linux/BSD and `souvlaki` 0.9.3 on macOS/Windows (Now Playing / SMTC). Media keys are routed by the OS, not grabbed directly. Shuffle and repeat (`Loop_Status`) are published/controllable on supported platforms; repeat-all restarts the playlist in the current shuffle order. Windows uses a hidden Win32 message window because SMTC requires an HWND |
@@ -39,8 +39,8 @@ src/
   auth.rs            # PKCE + device-pairing flows, token caches + refresh
   api.rs             # rspotify wrapper (search, playlist details/edits, liked songs)
   player.rs          # librespot Session + Player, playback controls, events
-  offline.rs         # download/decrypt audio, downloads.json index, rodio offline playback
-  lyrics.rs          # LRCLIB client, LRC parser, language preference, translation, disk cache
+  offline.rs         # download/decrypt audio + cover/lyrics assets, v2 index, rodio offline playback
+  lyrics.rs          # LRCLIB client, LRC parser, language preference, translation, v2 disk cache with translations
   mpris.rs           # MPRIS D-Bus server + shared media-state/types
   os_media.rs        # native media-control dispatcher (MPRIS/Now Playing/SMTC)
   ui/
@@ -244,8 +244,9 @@ streaming tracks and from the rodio sink for downloaded files.
       rejection, header validation, audio-key retry setup, download
       progress/errors, tab loading, offline mode, deletion, offline playlist
       playback, playlist cover selection, persistent current-track art and download
-      failure diagnostics, transient-timeout retry and explicit-format header validation
-      (75 passing)
+      failure diagnostics, transient-timeout retry, explicit-format header validation,
+      saved-cover cleanup, stale-cover pruning and translation cache round-trips
+      (79 passing)
 - [x] Fixed a real download failure where `.part` files were validated against the
       wrong container rules because their extension is `part`, not `ogg`/`mp3`;
       header validation now takes an explicit format hint and regression-tested it
@@ -253,6 +254,11 @@ streaming tracks and from the rodio sink for downloaded files.
       default fetch timeout is now replaced at startup (before any decoder locks in
       defaults) with 120 seconds, transient CDN timeouts retry the whole format,
       and stream-loader controllers close on every exit path via a drop guard
+- [x] Downloads now save cover art beside the audio and write lyrics plus an
+      English translation into v2 `lyrics.json` (v1 remains readable). Sparse CLI
+      metadata is enriched from librespot's `AudioItem`, asset failures are
+      best-effort, deletion removes the saved cover, and offline playback loads
+      saved covers/translations from disk
 - [ ] Verify one real Premium download and `--offline` playback with user credentials
 
 ## Deferred (not in v1)

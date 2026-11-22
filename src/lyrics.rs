@@ -7,7 +7,8 @@
 //! title uses a non-Latin script but the fetched lyrics do not, we fall back to
 //! `/api/search` and pick the best metadata match that keeps the original
 //! script. English translation on demand uses Google's public translate
-//! endpoint; it is best-effort and cached per track by `App`.
+//! endpoint; it is best-effort, cached per track by `App`, and written to
+//! `lyrics.json` when a track is downloaded so it also works in `--offline`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -42,7 +43,10 @@ pub struct Lyrics {
 /// On-disk cache. `None` entries mean "this track really has no lyrics", so a
 /// missing result is remembered too and does not trigger another request next
 /// time the track is played.
-const CACHE_VERSION: u8 = 1;
+const CACHE_VERSION: u8 = 2;
+/// Version 1 has no `translated_lines` field; it stays readable so existing
+/// caches are not lost on upgrade. The next save rewrites it as v2.
+const LEGACY_CACHE_VERSION: u8 = 1;
 const CACHE_FILE: &str = "lyrics.json";
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -56,6 +60,10 @@ struct CachedLyrics {
     lines: Vec<CachedLine>,
     synced: bool,
     source: String,
+    /// Pre-fetched English translation, one entry per line. Downloads persist
+    /// this so `t` works offline. Older v1 caches simply lack the field.
+    #[serde(default)]
+    translated_lines: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -65,6 +73,13 @@ struct LyricsCacheFile {
     tracks: HashMap<String, Option<CachedLyrics>>,
 }
 
+/// Everything loaded from the persistent lyrics cache.
+#[derive(Debug, Default)]
+pub struct LyricsCacheData {
+    pub lyrics: HashMap<String, Option<Lyrics>>,
+    pub translations: HashMap<String, Vec<String>>,
+}
+
 /// Path of the lyrics cache inside the application cache directory.
 pub fn cache_file(cache_dir: &Path) -> PathBuf {
     cache_dir.join(CACHE_FILE)
@@ -72,36 +87,113 @@ pub fn cache_file(cache_dir: &Path) -> PathBuf {
 
 /// Load cached lyrics. A missing or unreadable cache is harmless: callers just
 /// fall back to a network fetch and overwrite the file on the next save.
-pub fn load_cache(path: &Path) -> Result<HashMap<String, Option<Lyrics>>> {
+pub fn load_cache(path: &Path) -> Result<LyricsCacheData> {
     if !path.exists() {
-        return Ok(HashMap::new());
+        return Ok(LyricsCacheData::default());
     }
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("reading lyrics cache {}", path.display()))?;
     let file: LyricsCacheFile = serde_json::from_str(&contents)
         .with_context(|| format!("parsing lyrics cache {}", path.display()))?;
     anyhow::ensure!(
-        file.version == CACHE_VERSION,
+        matches!(file.version, CACHE_VERSION | LEGACY_CACHE_VERSION),
         "unsupported lyrics cache version {}",
         file.version
     );
-    Ok(file
-        .tracks
-        .into_iter()
-        .map(|(uri, lyrics)| (uri, lyrics.map(lyrics_from_cache)))
-        .collect())
+    let mut data = LyricsCacheData::default();
+    for (uri, cached) in file.tracks {
+        match cached {
+            None => {
+                data.no_lyrics(uri);
+            }
+            Some(cached) => {
+                if let Some(translated) = cached.translated_lines.clone() {
+                    data.translations.insert(uri.clone(), translated);
+                }
+                data.lyrics.insert(uri, Some(lyrics_from_cache(cached)));
+            }
+        }
+    }
+    Ok(data)
 }
 
-/// Persist lyrics atomically so a crash mid-write cannot leave a partial cache.
-pub fn save_cache(path: &Path, entries: &HashMap<String, Option<Lyrics>>) -> Result<()> {
+impl LyricsCacheData {
+    /// Remember that a track has no lyrics at all.
+    pub fn no_lyrics(&mut self, uri: String) {
+        self.lyrics.insert(uri, None);
+    }
+}
+
+/// Persist a whole cache atomically so a crash mid-write cannot leave a partial
+/// file. Retained for tooling/tests; runtime updates use [`save_downloaded`]
+/// so concurrent downloads cannot overwrite each other's entries.
+#[allow(dead_code)]
+pub fn save_cache(
+    path: &Path,
+    entries: &HashMap<String, Option<Lyrics>>,
+    translations: &HashMap<String, Vec<String>>,
+) -> Result<()> {
     let file = LyricsCacheFile {
         version: CACHE_VERSION,
         tracks: entries
             .iter()
-            .map(|(uri, lyrics)| (uri.clone(), lyrics.as_ref().map(lyrics_to_cache)))
+            .map(|(uri, lyrics)| {
+                let cached = lyrics.as_ref().map(|lyrics| {
+                    let mut cached = lyrics_to_cache(lyrics);
+                    cached.translated_lines = translations.get(uri).cloned();
+                    cached
+                });
+                (uri.clone(), cached)
+            })
             .collect(),
     };
-    let json = serde_json::to_string(&file).context("encoding lyrics cache")?;
+    write_cache_file(path, &file)
+}
+
+/// Load, update one track's lyrics/translation, and save. Used by the download
+/// pipeline so a saved copy works without a network connection.
+pub fn save_downloaded(
+    path: &Path,
+    uri: &str,
+    lyrics: Option<&Lyrics>,
+    translation: Option<&[String]>,
+) -> Result<()> {
+    let mut file = if path.exists() {
+        let contents = std::fs::read_to_string(path)
+            .with_context(|| format!("reading lyrics cache {}", path.display()))?;
+        serde_json::from_str::<LyricsCacheFile>(&contents)
+            .with_context(|| format!("parsing lyrics cache {}", path.display()))?
+    } else {
+        LyricsCacheFile {
+            version: CACHE_VERSION,
+            tracks: HashMap::new(),
+        }
+    };
+    if !matches!(file.version, CACHE_VERSION | LEGACY_CACHE_VERSION) {
+        // Keep an incompatible cache untouched rather than corrupting it.
+        return Err(anyhow::anyhow!(
+            "unsupported lyrics cache version {}",
+            file.version
+        ));
+    }
+    file.version = CACHE_VERSION;
+    let cached = lyrics.map(|lyrics| {
+        let mut cached = lyrics_to_cache(lyrics);
+        if let Some(translation) = translation {
+            cached.translated_lines = Some(translation.to_vec());
+        } else if let Some(existing) = file.tracks.get(uri).and_then(|entry| entry.as_ref()) {
+            // Keep a previously saved translation when the refresh did not
+            // produce one (e.g. the translation service was unavailable).
+            cached.translated_lines = existing.translated_lines.clone();
+        }
+        cached
+    });
+    file.tracks.insert(uri.to_string(), cached);
+    write_cache_file(path, &file)
+}
+
+fn write_cache_file(path: &Path, file: &LyricsCacheFile) -> Result<()> {
+    let json = serde_json::to_string(file).context("encoding lyrics cache")?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
@@ -125,6 +217,7 @@ fn lyrics_to_cache(lyrics: &Lyrics) -> CachedLyrics {
             .collect(),
         synced: lyrics.synced,
         source: lyrics.source.clone(),
+        translated_lines: None,
     }
 }
 
@@ -366,6 +459,34 @@ fn lyrics_from_parts(
     None
 }
 
+/// Fetch both original lyrics and their English translation for offline use.
+/// Translation is best-effort: a translation-service failure still leaves the
+/// original lyrics saved. An unchanged translation (already-English lyrics) is
+/// reported as absent so the UI does not show a redundant toggle.
+pub async fn fetch_for_download(
+    client: &reqwest::Client,
+    track: &Track,
+) -> Result<(Option<Lyrics>, Option<Vec<String>>)> {
+    let Some(lyrics) = fetch(client, track).await? else {
+        return Ok((None, None));
+    };
+    match translate_lines(client, &lyrics.lines, "en").await {
+        Ok(translated)
+            if translated
+                .iter()
+                .zip(&lyrics.lines)
+                .any(|(new, old)| !new.eq_ignore_ascii_case(&old.text)) =>
+        {
+            Ok((Some(lyrics), Some(translated)))
+        }
+        Ok(_) => Ok((Some(lyrics), None)),
+        Err(err) => {
+            tracing::warn!("Could not translate lyrics for {}: {err:#}", track.uri);
+            Ok((Some(lyrics), None))
+        }
+    }
+}
+
 /// Translate lyric lines to English. Batched to keep requests few while still
 /// aligning each translated line with its original timestamp.
 pub async fn translate_lines(
@@ -601,21 +722,84 @@ mod tests {
             }),
         );
         entries.insert("spotify:track:miss".to_string(), None);
+        let mut translations = HashMap::new();
+        translations.insert(
+            "spotify:track:hit".to_string(),
+            vec!["hello".to_string()],
+        );
 
-        save_cache(&path, &entries).expect("save cache");
+        save_cache(&path, &entries, &translations).expect("save cache");
         let loaded = load_cache(&path).expect("load cache");
-        let hit = loaded["spotify:track:hit"].as_ref().expect("cached hit");
+        let hit = loaded.lyrics["spotify:track:hit"]
+            .as_ref()
+            .expect("cached hit");
         assert_eq!(hit.lines[0].time, Duration::from_millis(12_500));
         assert_eq!(hit.lines[0].text, "こんにちは");
         assert!(hit.synced);
         assert_eq!(hit.source, "LRCLIB (original)");
-        assert!(loaded["spotify:track:miss"].is_none());
+        assert!(loaded.lyrics["spotify:track:miss"].is_none());
+        assert_eq!(
+            loaded.translations["spotify:track:hit"],
+            vec!["hello".to_string()]
+        );
+        assert!(!loaded.translations.contains_key("spotify:track:miss"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn download_cache_update_keeps_existing_translation() {
+        let path = temp_cache_path();
+        let original = Lyrics {
+            lines: vec![LyricLine {
+                time: Duration::ZERO,
+                text: "こんにちは".to_string(),
+            }],
+            synced: true,
+            source: "LRCLIB (original)".to_string(),
+        };
+        save_downloaded(
+            &path,
+            "spotify:track:one",
+            Some(&original),
+            Some(&["hello".to_string()]),
+        )
+        .expect("save downloaded lyrics");
+        let refreshed = Lyrics {
+            lines: original.lines.clone(),
+            synced: original.synced,
+            source: "LRCLIB".to_string(),
+        };
+        save_downloaded(&path, "spotify:track:one", Some(&refreshed), None)
+            .expect("refresh lyrics");
+        let loaded = load_cache(&path).expect("load cache");
+        assert_eq!(
+            loaded.translations["spotify:track:one"],
+            vec!["hello".to_string()]
+        );
+        assert_eq!(loaded.lyrics["spotify:track:one"].as_ref().unwrap().source, "LRCLIB");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn legacy_lyrics_cache_is_readable() {
+        let path = temp_cache_path();
+        std::fs::write(
+            &path,
+            r#"{"version":1,"tracks":{"spotify:track:old":{"lines":[{"time_ms":1000,"text":"old"}],"synced":true,"source":"LRCLIB"}}}"#,
+        )
+        .expect("write legacy cache");
+        let loaded = load_cache(&path).expect("load legacy cache");
+        let lyrics = loaded.lyrics["spotify:track:old"].as_ref().expect("old lyrics");
+        assert_eq!(lyrics.lines[0].text, "old");
+        assert!(loaded.translations.is_empty());
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn missing_lyrics_cache_is_not_an_error() {
         let path = temp_cache_path();
-        assert!(load_cache(&path).expect("missing cache").is_empty());
+        let loaded = load_cache(&path).expect("missing cache");
+        assert!(loaded.lyrics.is_empty());
+        assert!(loaded.translations.is_empty());
     }
 }

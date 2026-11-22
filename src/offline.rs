@@ -1,8 +1,10 @@
 //! Offline download index and local playback of downloaded tracks.
 //!
 //! Downloads are stored as decrypted Ogg Vorbis or MP3 files in the application
-//! cache directory. `downloads.json` maps Spotify URIs to those files so
-//! playback can continue with `--offline` and no network session at all.
+//! cache directory. Each track's cover art is saved beside the audio, and its
+//! lyrics (plus an English translation when available) are written to the
+//! persistent `lyrics.json` cache. `downloads.json` maps Spotify URIs to those
+//! files so playback continues with `--offline` and no network session at all.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
@@ -45,9 +47,21 @@ pub struct DownloadEntry {
     pub track: Track,
     /// File name relative to the downloads directory.
     pub file: String,
+    /// Saved cover image, if one was available. Older v2 indexes have no field.
+    #[serde(default)]
+    pub cover_file: Option<String>,
     pub size: u64,
     /// Unix timestamp, used only for display/sorting.
     pub downloaded_at: u64,
+}
+
+/// Optional headless helpers used while downloading a track. Cover art is
+/// fetched with `reqwest` (no terminal needed) and lyrics go into the shared
+/// cache so the same data is available in `--offline` mode.
+#[derive(Debug, Clone, Default)]
+pub struct DownloadAssets {
+    pub http_client: Option<reqwest::Client>,
+    pub lyrics_cache_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -200,6 +214,16 @@ impl DownloadStore {
         self.dir.join(&entry.file)
     }
 
+    /// Full path of a saved cover image, when one exists for this download.
+    pub fn cover_path(&self, entry: &DownloadEntry) -> Option<PathBuf> {
+        entry
+            .cover_file
+            .as_ref()
+            .filter(|name| safe_cover_file_name(name))
+            .map(|name| self.dir.join(name))
+            .filter(|path| path.is_file())
+    }
+
     /// Commit a completed download and persist the index atomically.
     pub fn insert(&mut self, entry: DownloadEntry) -> Result<()> {
         self.entries.insert(entry.track.uri.clone(), entry);
@@ -214,6 +238,11 @@ impl DownloadStore {
                 if err.kind() != std::io::ErrorKind::NotFound {
                     self.entries.insert(uri.to_string(), entry);
                     return Err(err).with_context(|| "deleting downloaded audio");
+                }
+            }
+            if let Some(cover) = &entry.cover_file {
+                if safe_cover_file_name(cover) {
+                    let _ = std::fs::remove_file(self.dir.join(cover));
                 }
             }
             self.save()?;
@@ -264,6 +293,16 @@ impl DownloadStore {
                         &self.dir.join(&entry.file),
                         entry.file.ends_with(".ogg"),
                     )
+            })
+            .map(|(uri, mut entry)| {
+                // A deleted or tampered cover must not break audio playback;
+                // simply forget where it used to be.
+                if let Some(cover) = &entry.cover_file {
+                    if !safe_cover_file_name(cover) || !self.dir.join(cover).is_file() {
+                        entry.cover_file = None;
+                    }
+                }
+                (uri, entry)
             })
             .collect();
         // Playlists can only contain tracks that survived the check above.
@@ -327,6 +366,24 @@ fn safe_file_name(name: &str) -> bool {
             path.extension().and_then(|ext| ext.to_str()),
             Some("ogg" | "mp3")
         )
+}
+
+/// Cover images use the same URI hash as the audio so they can be found without
+/// trusting any metadata from the index beyond the safe file name.
+fn cover_file_name(uri: &str) -> String {
+    format!("{}.jpg", file_stem(uri))
+}
+
+/// Only accept cover names written by the download pipeline. The bytes are
+/// self-describing (decoded by format sniffing), so one extension is enough.
+fn safe_cover_file_name(name: &str) -> bool {
+    let path = Path::new(name);
+    !name.contains(['/', '\\'])
+        && path.extension().and_then(|ext| ext.to_str()) == Some("jpg")
+        && path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| stem.len() == 16 && stem.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
 /// Check the first bytes of a stored file before offering it for playback.
@@ -672,20 +729,146 @@ async fn download_format(
             .and_then(|name| name.to_str())
             .context("download file name is not UTF-8")?
             .to_string(),
+        cover_file: None,
         size,
         downloaded_at: now_timestamp(),
     })
+}
+
+/// Fill in metadata that the CLI download command cannot know from the URI
+/// alone. The librespot session already fetched full track metadata to resolve
+/// audio files, so this adds no request. Values supplied by the Web API (for
+/// example from a playlist view) are never overwritten.
+fn enriched_track(track: &Track, item: &AudioItem) -> Track {
+    let mut enriched = track.clone();
+    if enriched.title.is_empty() || enriched.title == enriched.uri {
+        enriched.title = item.name.clone();
+    }
+    if enriched.artist.is_empty() {
+        enriched.artist = match &item.unique_fields {
+            librespot_metadata::audio::UniqueFields::Track { artists, .. } => artists
+                .0
+                .iter()
+                .take(3)
+                .map(|artist| artist.name.clone())
+                .collect::<Vec<_>>()
+                .join(", "),
+            librespot_metadata::audio::UniqueFields::Episode { show_name, .. } => {
+                show_name.clone()
+            }
+            librespot_metadata::audio::UniqueFields::Local { artists, .. } => {
+                artists.clone().unwrap_or_default()
+            }
+        };
+    }
+    if enriched.album.is_empty() {
+        enriched.album = match &item.unique_fields {
+            librespot_metadata::audio::UniqueFields::Track { album, .. } => album.clone(),
+            librespot_metadata::audio::UniqueFields::Episode { show_name, .. } => {
+                show_name.clone()
+            }
+            librespot_metadata::audio::UniqueFields::Local { album, .. } => {
+                album.clone().unwrap_or_default()
+            }
+        };
+    }
+    if enriched.duration.is_zero() {
+        enriched.duration = Duration::from_millis(u64::from(item.duration_ms));
+    }
+    if enriched.art_url.is_none() {
+        // Match the Web API's preference: the 300px variant when available,
+        // otherwise the largest cover Spotify lists for the track.
+        enriched.art_url = item
+            .covers
+            .iter()
+            .find(|cover| cover.width == 300)
+            .or_else(|| item.covers.iter().max_by_key(|cover| cover.width))
+            .map(|cover| cover.url.clone());
+    }
+    enriched
+}
+
+/// Save a track's cover image next to its audio. The bytes are decoded once to
+/// reject HTML error pages before they become a "cover" that breaks rendering.
+async fn save_cover(client: &reqwest::Client, uri: &str, url: &str, dir: &Path) -> Result<()> {
+    let bytes = crate::art::fetch_bytes(client, url).await?;
+    crate::art::decode_bytes(&bytes).context("downloaded cover is not an image")?;
+    let name = cover_file_name(uri);
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("creating downloads directory {}", dir.display()))?;
+    let tmp = dir.join(format!("{name}.part"));
+    std::fs::write(&tmp, &bytes).with_context(|| format!("writing {}", tmp.display()))?;
+    if let Err(err) = std::fs::rename(&tmp, dir.join(&name)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err).with_context(|| format!("storing cover {}", name));
+    }
+    Ok(())
+}
+
+/// Fetch cover art and lyrics for a downloaded track. Both are best-effort: a
+/// missing cover or an unavailable translation service must never turn a
+/// successful audio download into a failure.
+async fn download_assets(track: &Track, dir: &Path, assets: &DownloadAssets) -> Option<String> {
+    let cover = async {
+        let (Some(client), Some(url)) = (&assets.http_client, track.art_url.as_deref()) else {
+            return None;
+        };
+        match save_cover(client, &track.uri, url, dir).await {
+            Ok(()) => Some(cover_file_name(&track.uri)),
+            Err(err) => {
+                tracing::warn!("Could not save cover for {}: {err:#}", track.uri);
+                None
+            }
+        }
+    };
+    let lyrics = async {
+        let (Some(client), Some(path)) = (&assets.http_client, &assets.lyrics_cache_file) else {
+            return;
+        };
+        match crate::lyrics::fetch_for_download(client, track).await {
+            Ok((lyrics, translation)) => {
+                if let Err(err) = crate::lyrics::save_downloaded(
+                    path,
+                    &track.uri,
+                    lyrics.as_ref(),
+                    translation.as_deref(),
+                ) {
+                    tracing::warn!("Could not save lyrics for {}: {err:#}", track.uri);
+                }
+            }
+            Err(err) => tracing::warn!("Could not fetch lyrics for {}: {err:#}", track.uri),
+        }
+    };
+    let (cover_file, ()) = tokio::join!(cover, lyrics);
+    cover_file
+}
+
+/// Download a track without cover art or lyrics. Kept for callers that only
+/// need the audio (for example tests); the app and CLI use
+/// [`download_track_with_assets`].
+#[allow(dead_code)]
+pub async fn download_track(session: &Session, track: &Track, dir: &Path) -> Result<DownloadEntry> {
+    download_track_with_assets(session, track, dir, &DownloadAssets::default()).await
 }
 
 /// Download a track through the authenticated librespot session and write a
 /// plain (decrypted) audio file into `dir`. Ogg files have Spotify's extra
 /// normalisation header removed so generic decoders can read them.
 ///
+/// When `assets` is configured, the track's cover and lyrics (plus an English
+/// translation where available) are saved alongside the audio so they work
+/// without a network connection.
+///
 /// The actual copy runs on a blocking thread because `AudioFile::read` waits
 /// on the background downloader rather than yielding to tokio. If the best
 /// format fails (for example, a key service rejection), lower-quality formats
 /// are tried before giving up so one bad variant cannot block offline listening.
-pub async fn download_track(session: &Session, track: &Track, dir: &Path) -> Result<DownloadEntry> {
+pub async fn download_track_with_assets(
+    session: &Session,
+    track: &Track,
+    dir: &Path,
+    assets: &DownloadAssets,
+) -> Result<DownloadEntry> {
     // Fetch params are installed once at startup (see `configure_audio_fetch`)
     // before any player or decoder can lock in the defaults.
     let uri =
@@ -698,12 +881,15 @@ pub async fn download_track(session: &Session, track: &Track, dir: &Path) -> Res
         .context("could not read track metadata for download")?;
     if let Err(reason) = &item.availability {
         let error = anyhow!("track is not available for download: {reason}");
-        record_download_failure(dir, track, &error);
+        record_download_failure(dir, &track, &error);
         return Err(error);
     }
     // Metadata may resolve an alternative track ID; that is the ID the key
     // service expects, not necessarily the URI the client started with.
     let track_id: SpotifyId = (&item.track_id).try_into().unwrap_or(requested_id);
+    // CLI downloads start with just a URI. Fill in what librespot already knows
+    // so the index, cover lookup and LRCLIB query all have real metadata.
+    let track = enriched_track(track, &item);
 
     let mut last_error = None;
     let mut attempted = false;
@@ -714,7 +900,7 @@ pub async fn download_track(session: &Session, track: &Track, dir: &Path) -> Res
         attempted = true;
         let mut format_result = None;
         for attempt in 1..=DOWNLOAD_ATTEMPTS {
-            match download_format(session, track_id, file_id, format, track, dir).await {
+            match download_format(session, track_id, file_id, format, &track, dir).await {
                 Ok(entry) => {
                     format_result = Some(Ok(entry));
                     break;
@@ -735,7 +921,12 @@ pub async fn download_track(session: &Session, track: &Track, dir: &Path) -> Res
             }
         }
         match format_result.expect("download loop always produces a result") {
-            Ok(entry) => return Ok(entry),
+            Ok(mut entry) => {
+                if let Some(cover) = download_assets(&track, dir, assets).await {
+                    entry.cover_file = Some(cover);
+                }
+                return Ok(entry);
+            }
             Err(err) => {
                 tracing::warn!("Could not download {} as {format:?}: {err:#}", track.uri);
                 last_error = Some(err.context(format!("{format:?} audio")));
@@ -748,7 +939,7 @@ pub async fn download_track(session: &Session, track: &Track, dir: &Path) -> Res
         None if attempted => anyhow!("track lists formats but none could be prepared"),
         None => anyhow!("track has no supported download format"),
     };
-    record_download_failure(dir, track, &error);
+    record_download_failure(dir, &track, &error);
     Err(error)
 }
 
@@ -787,6 +978,7 @@ mod tests {
                 added_by: None,
             },
             file: format!("{}.{extension}", file_stem(uri)),
+            cover_file: None,
             size: 42,
             downloaded_at: 1,
         }
@@ -803,6 +995,13 @@ mod tests {
         assert!(!safe_file_name("../outside.ogg"));
         assert!(!safe_file_name("present.ogg"));
         assert!(!safe_file_name(&format!("{stem}.flac")));
+
+        let cover = cover_file_name("spotify:track:abc");
+        assert_eq!(cover, format!("{stem}.jpg"));
+        assert!(safe_cover_file_name(&cover));
+        assert!(!safe_cover_file_name("../outside.jpg"));
+        assert!(!safe_cover_file_name(&format!("{stem}.png")));
+        assert!(!safe_cover_file_name("short.jpg"));
     }
 
     #[test]
@@ -826,6 +1025,57 @@ mod tests {
 
         store.remove("spotify:track:present").expect("remove");
         assert!(!dir.join(&present.file).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn store_tracks_and_removes_saved_covers() {
+        let dir = temp_dir("covers");
+        let mut store = DownloadStore::open(&dir).expect("open store");
+        let mut saved = entry("spotify:track:cover", "ogg");
+        saved.cover_file = Some(cover_file_name(&saved.track.uri));
+        std::fs::write(dir.join(&saved.file), b"OggS").expect("write audio");
+        std::fs::write(dir.join(saved.cover_file.as_ref().unwrap()), b"\xff\xd8\xff")
+            .expect("write cover");
+        store.insert(saved.clone()).expect("insert");
+
+        let mut reopened = DownloadStore::open(&dir).expect("reopen store");
+        assert_eq!(
+            reopened
+                .cover_path(reopened.get(&saved.track.uri).unwrap())
+                .as_deref(),
+            Some(dir.join(saved.cover_file.as_ref().unwrap()).as_path())
+        );
+
+        reopened.remove(&saved.track.uri).expect("remove");
+        assert!(!dir.join(saved.file).exists());
+        assert!(!dir.join(saved.cover_file.as_ref().unwrap()).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_cover_reference_is_forgotten_without_dropping_audio() {
+        let dir = temp_dir("stale-cover");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let mut saved = entry("spotify:track:stale", "ogg");
+        saved.cover_file = Some(cover_file_name(&saved.track.uri));
+        std::fs::write(dir.join(&saved.file), b"OggS").expect("write audio");
+        let mut tracks = serde_json::Map::new();
+        tracks.insert(
+            saved.track.uri.clone(),
+            serde_json::to_value(&saved).expect("encode entry"),
+        );
+        std::fs::write(
+            DownloadStore::index_file(&dir),
+            serde_json::to_string(&serde_json::json!({"version": 2, "tracks": tracks}))
+                .expect("encode index"),
+        )
+        .expect("write index");
+
+        let store = DownloadStore::open(&dir).expect("open store");
+        let entry = store.get(&saved.track.uri).expect("audio kept");
+        assert!(entry.cover_file.is_none());
+        assert!(store.cover_path(entry).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
