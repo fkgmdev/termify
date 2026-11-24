@@ -11,7 +11,7 @@ mod player;
 mod ui;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use tokio::sync::mpsc;
 
 use crate::config::{Config, Paths};
@@ -39,14 +39,26 @@ struct Cli {
     command: Option<Command>,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum SearchKind {
+    Track,
+    Album,
+    Artist,
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Authenticate with Spotify and cache the token.
     Auth,
     /// Streaming smoke test: play one track locally until Ctrl-C.
     Play { uri: String },
-    /// Search tracks and print the results (useful for diagnosing API errors).
-    Search { query: String },
+    /// Search the Spotify catalog and print the results.
+    Search {
+        query: String,
+        /// Which catalog type to search.
+        #[arg(long, value_enum, default_value = "track")]
+        kind: SearchKind,
+    },
     /// Download one track and print the full error chain if it fails.
     Download { uri: String },
 }
@@ -143,16 +155,40 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Some(Command::Search { query }) => {
+        Some(Command::Search { query, kind }) => {
             let spotify = auth::authenticated(&config, &paths, cli.relogin)
                 .await
                 .context("authenticating with Spotify Web API")?;
-            let tracks = api::search_tracks(&spotify, &query).await?;
-            if tracks.is_empty() {
-                println!("No tracks found for '{query}'");
-            } else {
-                for track in tracks {
-                    println!("{} - {} - {}", track.uri, track.title, track.artist);
+            match kind {
+                SearchKind::Track => {
+                    let tracks = api::search_tracks(&spotify, &query).await?;
+                    if tracks.is_empty() {
+                        println!("No tracks found for '{query}'");
+                    } else {
+                        for track in tracks {
+                            println!("{} - {} - {}", track.uri, track.title, track.artist);
+                        }
+                    }
+                }
+                SearchKind::Album => {
+                    let albums = api::search_albums(&spotify, &query).await?;
+                    if albums.is_empty() {
+                        println!("No albums found for '{query}'");
+                    } else {
+                        for album in albums {
+                            println!("{} - {} - {}", album.id, album.name, album.artist);
+                        }
+                    }
+                }
+                SearchKind::Artist => {
+                    let artists = api::search_artists(&spotify, &query).await?;
+                    if artists.is_empty() {
+                        println!("No artists found for '{query}'");
+                    } else {
+                        for artist in artists {
+                            println!("{} - {}", artist.id, artist.name);
+                        }
+                    }
                 }
             }
         }
@@ -283,15 +319,53 @@ async fn run_tui(
         tokio::spawn(async move {
             use librespot_playback::player::PlayerEvent;
             let mut events = player.event_channel();
+            let track_uri =
+                |track_id: &librespot_core::spotify_uri::SpotifyUri| track_id.to_uri().ok();
             while let Some(event) = events.recv().await {
                 let action = match event {
-                    PlayerEvent::EndOfTrack { .. } => Some(ui::Action::PlayerEndOfTrack),
-                    PlayerEvent::Playing { position_ms, .. } => {
-                        Some(ui::Action::PlayerPlaying(position_ms))
+                    PlayerEvent::EndOfTrack { track_id, .. } => {
+                        Some(ui::Action::PlayerEndOfTrack {
+                            track_uri: track_uri(&track_id),
+                        })
                     }
-                    PlayerEvent::Paused { position_ms, .. } => {
-                        Some(ui::Action::PlayerPaused(position_ms))
+                    PlayerEvent::Playing {
+                        position_ms,
+                        track_id,
+                        ..
+                    } => Some(ui::Action::PlayerPlaying {
+                        position_ms,
+                        track_uri: track_uri(&track_id),
+                        at: std::time::Instant::now(),
+                    }),
+                    PlayerEvent::Paused {
+                        position_ms,
+                        track_id,
+                        ..
+                    } => Some(ui::Action::PlayerPaused {
+                        position_ms,
+                        track_uri: track_uri(&track_id),
+                    }),
+                    // librespot emits these on underruns, seeks and periodic
+                    // updates. They are authoritative position corrections.
+                    PlayerEvent::PositionCorrection {
+                        position_ms,
+                        track_id,
+                        ..
                     }
+                    | PlayerEvent::PositionChanged {
+                        position_ms,
+                        track_id,
+                        ..
+                    }
+                    | PlayerEvent::Seeked {
+                        position_ms,
+                        track_id,
+                        ..
+                    } => Some(ui::Action::PlayerPosition {
+                        position_ms,
+                        track_uri: track_uri(&track_id),
+                        at: std::time::Instant::now(),
+                    }),
                     PlayerEvent::Unavailable { .. } => Some(ui::Action::Error(
                         "Track unavailable for playback".to_string(),
                     )),
@@ -359,7 +433,8 @@ async fn run_tui(
                     let publish_discord = app.discord_presence_enabled
                         && (!playing
                             || !is_tick
-                            || last_discord_publish.elapsed() >= std::time::Duration::from_secs(15));
+                            || last_discord_publish.elapsed()
+                                >= std::time::Duration::from_secs(15));
                     if publish_discord {
                         handle.publish(app.mpris_state());
                         last_discord_publish = std::time::Instant::now();

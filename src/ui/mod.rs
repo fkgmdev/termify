@@ -2,4 +2,4 @@ pub mod app;
 pub mod event;
 pub mod render;
 
-pub use app::{Action, App, AppOptions, Playlist, RepeatMode, Track};
+pub use app::{Action, Album, App, AppOptions, Artist, Playlist, RepeatMode, Track};

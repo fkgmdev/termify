@@ -52,7 +52,12 @@ impl LocalPlayer {
         let sink_builder = audio_backend::find(Some(config.audio_backend.clone()))
             .with_context(|| format!("unknown audio backend '{}'", config.audio_backend))?;
         let player = Player::new(
-            PlayerConfig::default(),
+            PlayerConfig {
+                // Ask librespot for periodic authoritative positions so a
+                // buffer underrun can be corrected instead of drifting.
+                position_update_interval: Some(std::time::Duration::from_secs(1)),
+                ..PlayerConfig::default()
+            },
             session.clone(),
             mixer.clone().get_soft_volume(),
             move || sink_builder(None, AudioFormat::default()),

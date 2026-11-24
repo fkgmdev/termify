@@ -26,8 +26,8 @@ use tokio::time::sleep;
 
 use crate::ui::Track;
 
-/// Version 2 adds downloaded-playlist memberships. Version 1 indexes are still
-/// readable and are upgraded on the next successful save.
+/// Version 2 adds downloaded-playlist and downloaded-album memberships. Version
+/// 1 indexes are still readable and are upgraded on the next successful save.
 const INDEX_VERSION: u8 = 2;
 const LEGACY_INDEX_VERSION: u8 = 1;
 const INDEX_FILE: &str = "downloads.json";
@@ -102,6 +102,9 @@ struct IndexFile {
     tracks: BTreeMap<String, DownloadEntry>,
     #[serde(default)]
     playlists: BTreeMap<String, DownloadedPlaylist>,
+    /// Older v1/v2 indexes have no album memberships.
+    #[serde(default)]
+    albums: BTreeMap<String, DownloadedAlbum>,
 }
 
 /// A playlist whose tracks are available offline. Membership is stored by URI
@@ -114,15 +117,29 @@ pub struct DownloadedPlaylist {
     pub downloaded_at: u64,
 }
 
-/// Persistent index of downloaded tracks and playlists. Missing or corrupt
-/// files are dropped when the index is loaded so the UI never offers a download
-/// that cannot be played.
+/// An album whose tracks are available offline. Like playlists, membership is
+/// stored by URI so a track can belong to several groupings without duplicating
+/// audio files. `artist` defaults so older indexes remain readable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadedAlbum {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub artist: String,
+    pub track_uris: Vec<String>,
+    pub downloaded_at: u64,
+}
+
+/// Persistent index of downloaded tracks, playlists and albums. Missing or
+/// corrupt files are dropped when the index is loaded so the UI never offers a
+/// download that cannot be played.
 #[derive(Debug, Clone)]
 pub struct DownloadStore {
     dir: PathBuf,
     index_file: PathBuf,
     entries: BTreeMap<String, DownloadEntry>,
     playlists: BTreeMap<String, DownloadedPlaylist>,
+    albums: BTreeMap<String, DownloadedAlbum>,
 }
 
 impl DownloadStore {
@@ -137,6 +154,7 @@ impl DownloadStore {
             index_file,
             entries: BTreeMap::new(),
             playlists: BTreeMap::new(),
+            albums: BTreeMap::new(),
         };
         store.load()?;
         Ok(store)
@@ -149,6 +167,7 @@ impl DownloadStore {
             index_file: PathBuf::new(),
             entries: BTreeMap::new(),
             playlists: BTreeMap::new(),
+            albums: BTreeMap::new(),
         }
     }
 
@@ -235,6 +254,64 @@ impl DownloadStore {
     /// Forget an offline playlist grouping without deleting its audio files.
     pub fn remove_playlist(&mut self, id: &str) -> Result<()> {
         if self.playlists.remove(id).is_some() {
+            self.save()?;
+        }
+        Ok(())
+    }
+
+    /// Downloaded albums, ordered by name (then id) for a stable listing.
+    pub fn albums(&self) -> Vec<DownloadedAlbum> {
+        let mut albums: Vec<&DownloadedAlbum> = self.albums.values().collect();
+        albums.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+        albums.into_iter().cloned().collect()
+    }
+
+    /// Saved tracks of a downloaded album, in the order they were stored.
+    /// Tracks that were later deleted are left out rather than breaking the
+    /// queue.
+    pub fn album_tracks(&self, id: &str) -> Vec<Track> {
+        let Some(album) = self.albums.get(id) else {
+            return Vec::new();
+        };
+        album
+            .track_uris
+            .iter()
+            .filter_map(|uri| self.entries.get(uri))
+            .map(|entry| entry.track.clone())
+            .collect()
+    }
+
+    /// Record that an album is available offline. URIs are deduplicated while
+    /// keeping their original order; the index is saved so the grouping
+    /// survives a restart. Deleted tracks are pruned when the index is loaded.
+    pub fn insert_album(
+        &mut self,
+        id: &str,
+        name: &str,
+        artist: &str,
+        uris: Vec<String>,
+    ) -> Result<()> {
+        let mut seen = HashSet::new();
+        let track_uris: Vec<String> = uris
+            .into_iter()
+            .filter(|uri| seen.insert(uri.clone()))
+            .collect();
+        self.albums.insert(
+            id.to_string(),
+            DownloadedAlbum {
+                id: id.to_string(),
+                name: name.to_string(),
+                artist: artist.to_string(),
+                track_uris,
+                downloaded_at: now_timestamp(),
+            },
+        );
+        self.save()
+    }
+
+    /// Forget an offline album grouping without deleting its audio files.
+    pub fn remove_album(&mut self, id: &str) -> Result<()> {
+        if self.albums.remove(id).is_some() {
             self.save()?;
         }
         Ok(())
@@ -362,6 +439,20 @@ impl DownloadStore {
             })
             .filter(|(_, playlist)| !playlist.track_uris.is_empty())
             .collect();
+        // Albums follow the same rule: only tracks that survived validation
+        // remain, and an album with nothing left is forgotten.
+        self.albums = file
+            .albums
+            .into_iter()
+            .filter(|(_, album)| !album.track_uris.is_empty())
+            .map(|(id, mut album)| {
+                album
+                    .track_uris
+                    .retain(|uri| self.entries.contains_key(uri));
+                (id, album)
+            })
+            .filter(|(_, album)| !album.track_uris.is_empty())
+            .collect();
         Ok(())
     }
 
@@ -373,6 +464,7 @@ impl DownloadStore {
             version: INDEX_VERSION,
             tracks: self.entries.clone(),
             playlists: self.playlists.clone(),
+            albums: self.albums.clone(),
         };
         let json = serde_json::to_string_pretty(&file).context("encoding download index")?;
         std::fs::create_dir_all(&self.dir)
@@ -504,10 +596,10 @@ impl OfflinePlayer {
         self.sink.pause();
     }
 
-    pub fn seek(&self, position: Duration) {
-        if self.sink.try_seek(position).is_err() {
-            tracing::warn!("Could not seek downloaded audio to {position:?}");
-        }
+    pub fn seek(&self, position: Duration) -> Result<()> {
+        self.sink.try_seek(position).map_err(|err| {
+            anyhow::anyhow!("could not seek downloaded audio to {position:?}: {err:?}")
+        })
     }
 
     pub fn set_volume(&self, percent: u8) {
@@ -1236,6 +1328,174 @@ mod tests {
     }
 
     #[test]
+    fn store_persists_albums_and_omits_deleted_tracks() {
+        let dir = temp_dir("albums");
+        let mut store = DownloadStore::open(&dir).expect("open store");
+        let first = entry("spotify:track:album-first", "ogg");
+        let second = entry("spotify:track:album-second", "mp3");
+        std::fs::write(dir.join(&first.file), b"OggS").expect("write first");
+        std::fs::write(dir.join(&second.file), b"ID3\x04").expect("write second");
+        store.insert(first.clone()).expect("insert first");
+        store.insert(second.clone()).expect("insert second");
+        store
+            .insert_album(
+                "album-1",
+                "Greatest Hits",
+                "Artist",
+                vec![
+                    first.track.uri.clone(),
+                    first.track.uri.clone(),
+                    second.track.uri.clone(),
+                    "spotify:track:missing".to_string(),
+                ],
+            )
+            .expect("insert album");
+
+        let reopened = DownloadStore::open(&dir).expect("reopen store");
+        let albums = reopened.albums();
+        assert_eq!(albums.len(), 1);
+        assert_eq!(albums[0].id, "album-1");
+        assert_eq!(albums[0].name, "Greatest Hits");
+        assert_eq!(albums[0].artist, "Artist");
+        // Duplicate and unavailable URIs are not kept in the saved grouping.
+        assert_eq!(
+            albums[0].track_uris,
+            vec![first.track.uri.clone(), second.track.uri.clone()]
+        );
+        let tracks = reopened.album_tracks("album-1");
+        assert_eq!(
+            tracks
+                .iter()
+                .map(|track| track.uri.as_str())
+                .collect::<Vec<_>>(),
+            vec![first.track.uri.as_str(), second.track.uri.as_str()]
+        );
+
+        store.remove(&first.track.uri).expect("remove first");
+        let reopened = DownloadStore::open(&dir).expect("reopen after delete");
+        assert_eq!(
+            reopened.albums()[0].track_uris,
+            vec![second.track.uri.clone()]
+        );
+        let tracks = reopened.album_tracks("album-1");
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].uri, second.track.uri);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn album_membership_is_pruned_without_deleting_audio() {
+        let dir = temp_dir("album-prune");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let saved = entry("spotify:track:album-survivor", "ogg");
+        let missing = entry("spotify:track:album-gone", "ogg");
+        std::fs::write(dir.join(&saved.file), b"OggS").expect("write survivor");
+        let mut tracks = serde_json::Map::new();
+        tracks.insert(
+            saved.track.uri.clone(),
+            serde_json::to_value(&saved).expect("encode saved track"),
+        );
+        tracks.insert(
+            missing.track.uri.clone(),
+            serde_json::to_value(&missing).expect("encode missing track"),
+        );
+        let album = DownloadedAlbum {
+            id: "album-2".to_string(),
+            name: "Mixed".to_string(),
+            artist: "Artist".to_string(),
+            track_uris: vec![missing.track.uri.clone(), saved.track.uri.clone()],
+            downloaded_at: 1,
+        };
+        let empty_album = DownloadedAlbum {
+            id: "album-empty".to_string(),
+            name: "Gone".to_string(),
+            artist: String::new(),
+            track_uris: vec![missing.track.uri.clone()],
+            downloaded_at: 1,
+        };
+        let mut albums = serde_json::Map::new();
+        albums.insert(
+            album.id.clone(),
+            serde_json::to_value(&album).expect("encode album"),
+        );
+        albums.insert(
+            empty_album.id.clone(),
+            serde_json::to_value(&empty_album).expect("encode empty album"),
+        );
+        let index = serde_json::json!({
+            "version": 2,
+            "tracks": tracks,
+            "albums": albums,
+        });
+        std::fs::write(
+            DownloadStore::index_file(&dir),
+            serde_json::to_string(&index).expect("encode index"),
+        )
+        .expect("write index");
+
+        let store = DownloadStore::open(&dir).expect("open store");
+        let albums = store.albums();
+        assert_eq!(albums.len(), 1);
+        assert_eq!(albums[0].id, "album-2");
+        assert_eq!(albums[0].track_uris, vec![saved.track.uri.clone()]);
+        assert_eq!(store.album_tracks("album-2").len(), 1);
+        assert!(store.album_tracks("album-empty").is_empty());
+        // Pruning only changes the index; the surviving audio stays on disk.
+        assert!(dir.join(&saved.file).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v2_index_without_albums_field_loads() {
+        let dir = temp_dir("no-albums");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let saved = entry("spotify:track:no-albums", "ogg");
+        std::fs::write(dir.join(&saved.file), b"OggS").expect("write audio");
+        let mut tracks = serde_json::Map::new();
+        tracks.insert(
+            saved.track.uri.clone(),
+            serde_json::to_value(&saved).expect("encode track"),
+        );
+        std::fs::write(
+            DownloadStore::index_file(&dir),
+            serde_json::to_string(&serde_json::json!({"version": 2, "tracks": tracks}))
+                .expect("encode index"),
+        )
+        .expect("write index");
+
+        let mut store = DownloadStore::open(&dir).expect("open store");
+        assert!(store.contains(&saved.track.uri));
+        assert!(store.albums().is_empty());
+        // Names, not ids, decide the listing order.
+        store
+            .insert_album("album-a", "Zebra", "Artist", vec![saved.track.uri.clone()])
+            .expect("insert zebra album");
+        store
+            .insert_album("album-z", "Apple", "Artist", vec![saved.track.uri.clone()])
+            .expect("insert apple album");
+        assert_eq!(
+            store
+                .albums()
+                .iter()
+                .map(|album| album.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Apple", "Zebra"]
+        );
+        let reopened = DownloadStore::open(&dir).expect("reopen store");
+        assert_eq!(reopened.albums().len(), 2);
+        assert_eq!(reopened.album_tracks("album-z").len(), 1);
+        store.remove_album("album-a").expect("remove album");
+        assert_eq!(
+            DownloadStore::open(&dir)
+                .expect("reopen after removal")
+                .albums()
+                .len(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn failures_are_appended_to_the_download_error_log() {
         let dir = temp_dir("error-log");
         let track = entry("spotify:track:failed", "ogg").track;
@@ -1345,12 +1605,14 @@ mod tests {
         let mut store = DownloadStore::open(&dir).expect("open store");
         assert!(store.contains(&track.track.uri));
         assert!(store.playlists().is_empty());
+        assert!(store.albums().is_empty());
         store
             .insert_playlist("playlist-1", "Legacy", &[track.track.uri.clone()])
             .expect("insert playlist");
         let contents =
             std::fs::read_to_string(DownloadStore::index_file(&dir)).expect("read index");
         assert!(contents.contains("\"version\": 2"));
+        assert!(contents.contains("\"albums\": {}"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

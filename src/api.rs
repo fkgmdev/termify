@@ -8,13 +8,15 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use rspotify::clients::{BaseClient, OAuthClient};
 use rspotify::model::{
-    FullPlaylist, FullTrack, Image as SpotifyImage, PlayableId, PlayableItem, PlaylistId,
-    PlaylistItem, PublicUser, SearchResult, SearchType, SimplifiedPlaylist, TrackId,
+    AlbumId, AlbumType, ArtistId, FullAlbum, FullArtist, FullPlaylist, FullTrack,
+    Image as SpotifyImage, PlayableId, PlayableItem, PlaylistId, PlaylistItem, PublicUser,
+    SearchResult, SearchType, SimplifiedAlbum, SimplifiedArtist, SimplifiedPlaylist,
+    SimplifiedTrack, TrackId,
 };
 use rspotify::prelude::*;
 use rspotify::{AuthCodePkceSpotify, ClientError};
 
-use crate::ui::{Playlist, Track};
+use crate::ui::{Album, Artist, Playlist, Track};
 
 /// Turn rspotify's error into an actionable message for the status bar.
 fn map_spotify_error(err: ClientError) -> anyhow::Error {
@@ -162,6 +164,101 @@ fn playlist_from_full(
     }
 }
 
+/// Shared album conversion. Only full albums know the track count; search
+/// results leave it as `None`.
+fn album_from_parts(
+    id: &str,
+    name: &str,
+    artists: &[SimplifiedArtist],
+    album_type: Option<String>,
+    release_date: Option<String>,
+    images: &[SpotifyImage],
+    track_count: Option<u32>,
+) -> Album {
+    let names: Vec<String> = artists.iter().map(|artist| artist.name.clone()).collect();
+    let artist = names
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "Unknown artist".to_string());
+    Album {
+        id: id.to_string(),
+        name: name.to_string(),
+        artist,
+        artists: names,
+        album_type,
+        release_date,
+        track_count,
+        art_url: pick_art_url(images),
+    }
+}
+
+/// Convert a search-result album. Albums without an ID cannot be opened, so
+/// they are dropped.
+fn album_from_simplified(album: &SimplifiedAlbum) -> Option<Album> {
+    let id = album.id.as_ref()?;
+    Some(album_from_parts(
+        id.id(),
+        &album.name,
+        &album.artists,
+        album.album_type.clone(),
+        album.release_date.clone(),
+        &album.images,
+        None,
+    ))
+}
+
+/// `FullAlbum::album_type` is an enum, unlike the simplified model's string;
+/// use the same snake-case label Spotify returns in the API.
+fn album_from_full(album: &FullAlbum) -> Album {
+    let album_type: &'static str = album.album_type.into();
+    album_from_parts(
+        album.id.id(),
+        &album.name,
+        &album.artists,
+        Some(album_type.to_string()),
+        Some(album.release_date.clone()),
+        &album.images,
+        Some(album.tracks.total),
+    )
+}
+
+/// Genres are deprecated in rspotify 0.16.1 but still returned for many
+/// artists, so keep them on a best-effort basis. Popularity/followers are
+/// ignored because Spotify has removed those fields.
+#[allow(deprecated)]
+fn artist_from_full(artist: &FullArtist) -> Artist {
+    Artist {
+        id: artist.id.id().to_string(),
+        name: artist.name.clone(),
+        genres: artist.genres.clone(),
+        art_url: pick_art_url(&artist.images),
+    }
+}
+
+/// Album-track pages carry no album object, so the enclosing album's name and
+/// art are passed in by the caller.
+fn track_from_simplified(
+    track: &SimplifiedTrack,
+    album_name: &str,
+    album_art_url: Option<String>,
+) -> Option<Track> {
+    let id = track.id.as_ref()?;
+    let artist = track
+        .artists
+        .first()
+        .map(|artist| artist.name.clone())
+        .unwrap_or_else(|| "Unknown artist".to_string());
+    Some(Track {
+        title: track.name.clone(),
+        artist,
+        album: album_name.to_string(),
+        duration: track.duration.to_std().unwrap_or(Duration::ZERO),
+        uri: format!("spotify:track:{}", id.id()),
+        art_url: album_art_url,
+        added_by: None,
+    })
+}
+
 /// Search Spotify tracks by keyword (up to 10 results per Spotify's 2026 limit).
 pub async fn search_tracks(client: &AuthCodePkceSpotify, query: &str) -> Result<Vec<Track>> {
     let result = client
@@ -173,6 +270,103 @@ pub async fn search_tracks(client: &AuthCodePkceSpotify, query: &str) -> Result<
         SearchResult::Tracks(page) => Ok(page.items.iter().filter_map(track_from_full).collect()),
         _ => Ok(Vec::new()),
     }
+}
+
+/// Search Spotify albums by keyword (up to 10 results).
+pub async fn search_albums(client: &AuthCodePkceSpotify, query: &str) -> Result<Vec<Album>> {
+    let result = client
+        .search(query, SearchType::Album, None, None, Some(10), None)
+        .await
+        .map_err(map_spotify_error)
+        .context("album search failed")?;
+    match result {
+        SearchResult::Albums(page) => Ok(page
+            .items
+            .iter()
+            .filter_map(album_from_simplified)
+            .collect()),
+        _ => Ok(Vec::new()),
+    }
+}
+
+/// Search Spotify artists by keyword (up to 10 results).
+pub async fn search_artists(client: &AuthCodePkceSpotify, query: &str) -> Result<Vec<Artist>> {
+    let result = client
+        .search(query, SearchType::Artist, None, None, Some(10), None)
+        .await
+        .map_err(map_spotify_error)
+        .context("artist search failed")?;
+    match result {
+        SearchResult::Artists(page) => Ok(page.items.iter().map(artist_from_full).collect()),
+        _ => Ok(Vec::new()),
+    }
+}
+
+/// Fetch album metadata and every page of its tracks by raw ID or URI.
+pub async fn album_details(
+    client: &AuthCodePkceSpotify,
+    album_id: &str,
+) -> Result<(Album, Vec<Track>)> {
+    let id = AlbumId::from_id_or_uri(album_id)
+        .with_context(|| format!("invalid album ID/URI: {album_id}"))?;
+    let full = client
+        .album(id.as_ref(), None)
+        .await
+        .map_err(map_spotify_error)
+        .context("fetching album failed")?;
+    let album = album_from_full(&full);
+
+    let mut tracks = Vec::new();
+    let total = full.tracks.total;
+    let mut offset = 0u32;
+    while offset < total {
+        // rspotify 0.16 order: (id, market, limit, offset).
+        let page = client
+            .album_track_manual(id.as_ref(), None, Some(50), Some(offset))
+            .await
+            .map_err(map_spotify_error)
+            .with_context(|| format!("fetching album tracks at offset {offset} failed"))?;
+        let count = page.items.len() as u32;
+        for track in &page.items {
+            if let Some(track) = track_from_simplified(track, &album.name, album.art_url.clone()) {
+                tracks.push(track);
+            }
+        }
+        if count == 0 {
+            break; // don't spin forever on an empty or short page
+        }
+        offset += count;
+    }
+    Ok((album, tracks))
+}
+
+/// Fetch an artist and their albums by raw ID or URI. An empty
+/// `include_groups` means all album types, which is what the browse view wants.
+pub async fn artist_details(
+    client: &AuthCodePkceSpotify,
+    artist_id: &str,
+) -> Result<(Artist, Vec<Album>)> {
+    let id = ArtistId::from_id_or_uri(artist_id)
+        .with_context(|| format!("invalid artist ID/URI: {artist_id}"))?;
+    let full = client
+        .artist(id.as_ref())
+        .await
+        .map_err(map_spotify_error)
+        .context("fetching artist failed")?;
+    let page = client
+        .artist_albums_manual(id.as_ref(), Vec::<AlbumType>::new(), None, Some(50), None)
+        .await
+        .map_err(map_spotify_error)
+        .context("fetching artist albums failed")?;
+
+    let mut albums: Vec<Album> = page
+        .items
+        .iter()
+        .filter_map(album_from_simplified)
+        .collect();
+    // Spotify returns albums newest-first already, but make it explicit.
+    albums.sort_by(|a, b| b.release_date.cmp(&a.release_date));
+    Ok((artist_from_full(&full), albums))
 }
 
 async fn current_user_id(client: &AuthCodePkceSpotify) -> Option<String> {
@@ -510,7 +704,7 @@ pub async fn save_playlist(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rspotify::model::UserId;
+    use rspotify::model::{DatePrecision, Followers, Page, UserId};
 
     #[allow(deprecated)]
     fn user(id: &str, display_name: Option<&str>) -> PublicUser {
@@ -534,6 +728,185 @@ mod tests {
 
     fn uris(list: &[&str]) -> Vec<String> {
         list.iter().map(|uri| (*uri).to_string()).collect()
+    }
+
+    fn simplified_artist(id: Option<&str>, name: &str) -> SimplifiedArtist {
+        SimplifiedArtist {
+            external_urls: HashMap::new(),
+            href: None,
+            id: id.map(|id| ArtistId::from_id(id.to_string()).unwrap()),
+            name: name.to_string(),
+        }
+    }
+
+    #[allow(deprecated)]
+    fn simplified_album(
+        id: Option<&str>,
+        name: &str,
+        artists: Vec<SimplifiedArtist>,
+        images: Vec<SpotifyImage>,
+    ) -> SimplifiedAlbum {
+        SimplifiedAlbum {
+            album_group: None,
+            album_type: Some("album".to_string()),
+            artists,
+            available_markets: Vec::new(),
+            external_urls: HashMap::new(),
+            href: None,
+            id: id.map(|id| AlbumId::from_id(id.to_string()).unwrap()),
+            images,
+            name: name.to_string(),
+            release_date: Some("2026-01-02".to_string()),
+            release_date_precision: Some("day".to_string()),
+            restrictions: None,
+        }
+    }
+
+    #[allow(deprecated)]
+    fn simplified_track(
+        id: Option<&str>,
+        name: &str,
+        artists: Vec<SimplifiedArtist>,
+    ) -> SimplifiedTrack {
+        SimplifiedTrack {
+            album: None,
+            artists,
+            available_markets: None,
+            disc_number: 1,
+            duration: chrono::TimeDelta::seconds(200),
+            explicit: false,
+            external_urls: HashMap::new(),
+            href: None,
+            id: id.map(|id| TrackId::from_id(id.to_string()).unwrap()),
+            is_local: false,
+            is_playable: None,
+            linked_from: None,
+            restrictions: None,
+            name: name.to_string(),
+            preview_url: None,
+            track_number: 1,
+        }
+    }
+
+    #[allow(deprecated)]
+    fn full_album(id: &str, name: &str, total: u32) -> FullAlbum {
+        FullAlbum {
+            artists: vec![simplified_artist(None, "Solo")],
+            album_type: AlbumType::Album,
+            available_markets: None,
+            copyrights: Vec::new(),
+            external_ids: HashMap::new(),
+            external_urls: HashMap::new(),
+            genres: Vec::new(),
+            href: String::new(),
+            id: AlbumId::from_id(id.to_string()).unwrap(),
+            images: vec![image(300, "full-art")],
+            name: name.to_string(),
+            popularity: 0,
+            release_date: "2026-01-02".to_string(),
+            release_date_precision: DatePrecision::Day,
+            tracks: Page {
+                href: String::new(),
+                items: Vec::new(),
+                limit: 50,
+                next: None,
+                offset: 0,
+                previous: None,
+                total,
+            },
+            label: None,
+        }
+    }
+
+    #[allow(deprecated)]
+    fn full_artist(id: &str, name: &str, genres: Vec<String>) -> FullArtist {
+        FullArtist {
+            external_urls: HashMap::new(),
+            followers: Followers { total: 0 },
+            genres,
+            href: String::new(),
+            id: ArtistId::from_id(id.to_string()).unwrap(),
+            images: vec![image(300, "artist-art")],
+            name: name.to_string(),
+            popularity: 0,
+        }
+    }
+
+    #[test]
+    fn simplified_album_converter_keeps_metadata_and_skips_missing_id() {
+        let album = simplified_album(
+            Some("albumid"),
+            "Record",
+            vec![
+                simplified_artist(None, "First"),
+                simplified_artist(None, "Second"),
+            ],
+            vec![image(300, "cover")],
+        );
+        let converted = album_from_simplified(&album).unwrap();
+        assert_eq!(converted.id, "albumid");
+        assert_eq!(converted.name, "Record");
+        assert_eq!(converted.artist, "First");
+        assert_eq!(converted.artists, ["First", "Second"]);
+        assert_eq!(converted.album_type.as_deref(), Some("album"));
+        assert_eq!(converted.release_date.as_deref(), Some("2026-01-02"));
+        assert_eq!(converted.track_count, None);
+        assert_eq!(converted.art_url.as_deref(), Some("cover"));
+
+        let mut no_id = album;
+        no_id.id = None;
+        assert!(album_from_simplified(&no_id).is_none());
+
+        let no_artists = simplified_album(Some("solo"), "Solo", Vec::new(), Vec::new());
+        let converted = album_from_simplified(&no_artists).unwrap();
+        assert_eq!(converted.artist, "Unknown artist");
+        assert_eq!(converted.art_url, None);
+    }
+
+    #[test]
+    fn simplified_track_converter_uses_album_context_and_skips_missing_id() {
+        let track = simplified_track(
+            Some("trackid"),
+            "Song",
+            vec![simplified_artist(None, "Singer")],
+        );
+        let converted = track_from_simplified(&track, "Record", Some("cover".to_string())).unwrap();
+        assert_eq!(converted.uri, "spotify:track:trackid");
+        assert_eq!(converted.album, "Record");
+        assert_eq!(converted.artist, "Singer");
+        assert_eq!(converted.duration, Duration::from_secs(200));
+        assert_eq!(converted.art_url.as_deref(), Some("cover"));
+        assert_eq!(converted.added_by, None);
+
+        let mut no_id = track;
+        no_id.id = None;
+        assert!(track_from_simplified(&no_id, "Record", None).is_none());
+    }
+
+    #[test]
+    fn full_album_converter_reports_track_count() {
+        let converted = album_from_full(&full_album("albumid", "Record", 123));
+        assert_eq!(converted.id, "albumid");
+        assert_eq!(converted.name, "Record");
+        assert_eq!(converted.album_type.as_deref(), Some("album"));
+        assert_eq!(converted.track_count, Some(123));
+        assert_eq!(converted.art_url.as_deref(), Some("full-art"));
+    }
+
+    #[test]
+    fn artist_converter_handles_empty_genres_and_ignores_deprecated_fields() {
+        let converted = artist_from_full(&full_artist("artistid", "Solo", Vec::new()));
+        assert_eq!(converted.id, "artistid");
+        assert_eq!(converted.name, "Solo");
+        assert!(converted.genres.is_empty());
+        assert_eq!(converted.art_url.as_deref(), Some("artist-art"));
+
+        let converted = artist_from_full(&full_artist(
+            "other",
+            "Band",
+            vec!["rock".to_string(), "indie".to_string()],
+        ));
+        assert_eq!(converted.genres, ["rock", "indie"]);
     }
 
     #[test]

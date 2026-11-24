@@ -45,10 +45,12 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
 
     let selected = match app.tab {
         Tab::Search => 0,
-        Tab::Playlists => 1,
-        Tab::Queue => 2,
-        Tab::Lyrics => 3,
-        Tab::Downloads => 4,
+        Tab::Albums => 1,
+        Tab::Artists => 2,
+        Tab::Playlists => 3,
+        Tab::Queue => 4,
+        Tab::Lyrics => 5,
+        Tab::Downloads => 6,
     };
 
     let block = Block::default()
@@ -309,6 +311,19 @@ fn render_list_pane(frame: &mut Frame, area: Rect, app: &App) {
                 format!(" Search: {} ", app.search_query)
             }
         }
+        Tab::Albums | Tab::Artists => {
+            let (label, kind) = match app.tab {
+                Tab::Albums => ("Albums", "Album"),
+                _ => ("Artists", "Artist"),
+            };
+            if app.search_active {
+                format!(" {kind} search: {}_ ", app.search_query)
+            } else if app.search_query.is_empty() {
+                format!(" {label} ")
+            } else {
+                format!(" {kind} search: {} ", app.search_query)
+            }
+        }
         Tab::Playlists => " Playlists ".to_string(),
         Tab::Queue => " Queue ".to_string(),
         Tab::Lyrics => " Lyrics ".to_string(),
@@ -346,10 +361,50 @@ fn render_list_pane(frame: &mut Frame, area: Rect, app: &App) {
                 })
                 .collect()
         }
+    } else if app.tab == Tab::Albums {
+        if app.albums.is_empty() {
+            vec![ListItem::new(Line::from(Span::styled(
+                " No albums — press / to search ",
+                Style::default().fg(DARK_GRAY).italic(),
+            )))]
+        } else {
+            app.albums
+                .iter()
+                .map(|album| {
+                    let label = match app.album_downloads.get(&album.id) {
+                        Some(progress) if progress.total > 0 => format!(
+                            "{} — {}  (offline {}/{})",
+                            album.name, album.artist, progress.completed, progress.total
+                        ),
+                        Some(_) => format!(
+                            "{} — {}  (fetching offline tracks)",
+                            album.name, album.artist
+                        ),
+                        None => format!("{} — {}", album.name, album.artist),
+                    };
+                    ListItem::new(Line::from(Span::styled(label, Style::default().fg(WHITE))))
+                })
+                .collect()
+        }
+    } else if app.tab == Tab::Artists {
+        if app.artists.is_empty() {
+            vec![ListItem::new(Line::from(Span::styled(
+                " No artists — press / to search ",
+                Style::default().fg(DARK_GRAY).italic(),
+            )))]
+        } else {
+            app.artists
+                .iter()
+                .map(|artist| {
+                    let label = format!("{}  [{}]", artist.name, short_genres(&artist.genres));
+                    ListItem::new(Line::from(Span::styled(label, Style::default().fg(WHITE))))
+                })
+                .collect()
+        }
     } else if app.tab == Tab::Downloads {
         if app.offline_items.is_empty() {
             vec![ListItem::new(Line::from(Span::styled(
-                " No downloads — press d on a track or playlist ",
+                " No downloads — press d on a track, playlist, or album ",
                 Style::default().fg(DARK_GRAY).italic(),
             )))]
         } else {
@@ -357,6 +412,10 @@ fn render_list_pane(frame: &mut Frame, area: Rect, app: &App) {
                 .iter()
                 .map(|item| {
                     let (label, style) = match item {
+                        super::app::OfflineItem::Album { name, count, .. } => (
+                            format!("▸ {name}  [album · {count} tracks]  Enter to play"),
+                            Style::default().fg(CYAN),
+                        ),
                         super::app::OfflineItem::Playlist { name, count, .. } => (
                             format!("▸ {name}  [{count} tracks]  Enter to play"),
                             Style::default().fg(CYAN),
@@ -433,6 +492,24 @@ fn render_list_pane(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_stateful_widget(list, area, &mut app.list_state.clone());
 }
 
+/// Two genres plus an overflow count keep artist rows compact.
+fn short_genres(genres: &[String]) -> String {
+    if genres.is_empty() {
+        return "—".to_string();
+    }
+    let summary = genres
+        .iter()
+        .take(2)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if genres.len() > 2 {
+        format!("{summary} +{}", genres.len() - 2)
+    } else {
+        summary
+    }
+}
+
 fn render_detail_pane(frame: &mut Frame, area: Rect, app: &App) {
     let title = if app.playlist_is_dirty() {
         " Details — unsaved playlist changes "
@@ -461,10 +538,11 @@ fn render_detail_pane(frame: &mut Frame, area: Rect, app: &App) {
     };
 
     if let Some(art_area) = art_area {
-        let pane_art = if app.tab == Tab::Playlists {
-            &app.playlist_art
-        } else {
-            &app.art
+        let pane_art = match app.tab {
+            Tab::Playlists => &app.playlist_art,
+            Tab::Albums => &app.album_art,
+            Tab::Artists => &app.artist_art,
+            _ => &app.art,
         };
         render_cover(frame, art_area, pane_art, app.art_enabled);
     }
@@ -548,6 +626,33 @@ fn render_detail_pane(frame: &mut Frame, area: Rect, app: &App) {
             .and_then(|i| app.offline_items.get(i))
             .cloned();
         let mut lines = match selected {
+            Some(super::app::OfflineItem::Album { name, count, .. }) => {
+                let active = app
+                    .offline_queue
+                    .as_ref()
+                    .is_some_and(|queue| queue.name() == name);
+                vec![
+                    Line::from(vec![
+                        Span::styled("Album:    ", Style::default().fg(DARK_GRAY)),
+                        Span::styled(name, Style::default().fg(WHITE).bold()),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("Tracks:   ", Style::default().fg(DARK_GRAY)),
+                        Span::styled(count.to_string(), Style::default().fg(WHITE)),
+                        Span::raw("   "),
+                        Span::styled("Loaded:   ", Style::default().fg(DARK_GRAY)),
+                        Span::styled(
+                            if active { "yes" } else { "no" },
+                            Style::default().fg(if active { YELLOW } else { GRAY }),
+                        ),
+                    ]),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "Enter play whole album · j/k browse · n/p skip · r repeat",
+                        Style::default().fg(DARK_GRAY).italic(),
+                    )),
+                ]
+            }
             Some(super::app::OfflineItem::Playlist { name, count, .. }) => {
                 let active = app
                     .offline_queue
@@ -636,7 +741,7 @@ fn render_detail_pane(frame: &mut Frame, area: Rect, app: &App) {
                 }
             }
             None => vec![Line::from(Span::styled(
-                "No downloads — press d on a track to save it offline",
+                "No downloads — press d on a track, playlist, or album to save it offline",
                 Style::default().fg(DARK_GRAY).italic(),
             ))],
         };
@@ -654,6 +759,110 @@ fn render_detail_pane(frame: &mut Frame, area: Rect, app: &App) {
             }
         }
         lines
+    } else if app.tab == Tab::Albums {
+        match app.list_state.selected().and_then(|i| app.albums.get(i)) {
+            Some(album) => {
+                let mut lines = vec![
+                    Line::from(vec![
+                        Span::styled("Name:        ", Style::default().fg(DARK_GRAY)),
+                        Span::styled(album.name.clone(), Style::default().fg(WHITE).bold()),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("Artist:      ", Style::default().fg(DARK_GRAY)),
+                        Span::styled(album.artist.clone(), Style::default().fg(WHITE)),
+                    ]),
+                ];
+                if !album.artists.is_empty() {
+                    lines.push(Line::from(vec![
+                        Span::styled("Artists:     ", Style::default().fg(DARK_GRAY)),
+                        Span::styled(album.artists.join(", "), Style::default().fg(WHITE)),
+                    ]));
+                }
+                lines.push(Line::from(vec![
+                    Span::styled("Type:        ", Style::default().fg(DARK_GRAY)),
+                    Span::styled(
+                        album.album_type.as_deref().unwrap_or("—"),
+                        Style::default().fg(WHITE),
+                    ),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled("Released:    ", Style::default().fg(DARK_GRAY)),
+                    Span::styled(
+                        album.release_date.as_deref().unwrap_or("—"),
+                        Style::default().fg(WHITE),
+                    ),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled("Tracks:      ", Style::default().fg(DARK_GRAY)),
+                    Span::styled(
+                        album
+                            .track_count
+                            .map(|count| count.to_string())
+                            .unwrap_or_else(|| "—".to_string()),
+                        Style::default().fg(WHITE),
+                    ),
+                ]));
+                if let Some(progress) = app.album_downloads.get(&album.id) {
+                    let status = if progress.total > 0 {
+                        let failed = if progress.failed > 0 {
+                            format!(", {} failed", progress.failed)
+                        } else {
+                            String::new()
+                        };
+                        format!("{}/{}{}", progress.completed, progress.total, failed)
+                    } else {
+                        "fetching tracks".to_string()
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled("Offline:     ", Style::default().fg(DARK_GRAY)),
+                        Span::styled(status, Style::default().fg(GRAY)),
+                    ]));
+                }
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "Enter: load tracks · d: download album",
+                    Style::default().fg(DARK_GRAY).italic(),
+                )));
+                lines
+            }
+            None => vec![Line::from(Span::styled(
+                "Select an album to see details",
+                Style::default().fg(DARK_GRAY).italic(),
+            ))],
+        }
+    } else if app.tab == Tab::Artists {
+        match app.list_state.selected().and_then(|i| app.artists.get(i)) {
+            Some(artist) => vec![
+                Line::from(vec![
+                    Span::styled("Name:   ", Style::default().fg(DARK_GRAY)),
+                    Span::styled(artist.name.clone(), Style::default().fg(WHITE).bold()),
+                ]),
+                Line::from(vec![
+                    Span::styled("Genres: ", Style::default().fg(DARK_GRAY)),
+                    Span::styled(
+                        if artist.genres.is_empty() {
+                            "—".to_string()
+                        } else {
+                            artist.genres.join(", ")
+                        },
+                        Style::default().fg(GRAY),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("Albums: ", Style::default().fg(DARK_GRAY)),
+                    Span::styled(app.albums.len().to_string(), Style::default().fg(WHITE)),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Enter: view albums",
+                    Style::default().fg(DARK_GRAY).italic(),
+                )),
+            ],
+            None => vec![Line::from(Span::styled(
+                "Select an artist to see details",
+                Style::default().fg(DARK_GRAY).italic(),
+            ))],
+        }
     } else {
         match app.list_state.selected().and_then(|i| app.tracks.get(i)) {
             Some(track) => vec![
@@ -889,7 +1098,11 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled(" [+/-] ", Style::default().fg(YELLOW)),
         Span::raw("vol"),
         Span::styled(" [/] ", Style::default().fg(YELLOW)),
-        Span::raw("search"),
+        Span::raw(match app.tab {
+            Tab::Albums => "search albums",
+            Tab::Artists => "search artists",
+            _ => "search tracks",
+        }),
         Span::styled(" [l] ", Style::default().fg(YELLOW)),
         Span::raw("lyrics"),
         Span::styled(" [c] ", Style::default().fg(YELLOW)),
@@ -915,7 +1128,11 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled(" [o] ", Style::default().fg(YELLOW)),
         Span::raw("offline"),
         Span::styled(" [d] ", Style::default().fg(YELLOW)),
-        Span::raw("save"),
+        Span::raw(match app.tab {
+            Tab::Playlists => "download playlist",
+            Tab::Albums => "download album",
+            _ => "download track",
+        }),
         Span::styled(" [Enter] ", Style::default().fg(YELLOW)),
         Span::raw("jump"),
         Span::styled(" [?] ", Style::default().fg(YELLOW)),
@@ -1041,7 +1258,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::from("  g / G       First / last item"),
         Line::from("  PgUp/PgDn   Page up / down"),
         Line::from("  Enter       Select track"),
-        Line::from("  /           Search"),
+        Line::from("  /           Contextual search (tracks / albums / artists)"),
         Line::from("  Tab         Next tab (Shift+Tab prev)"),
         Line::from("  Space       Play / pause"),
         Line::from("  n / p       Next / previous track"),
@@ -1050,7 +1267,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::from("  l           Lyrics tab"),
         Line::from("  Q           Queue tab"),
         Line::from("  o           Offline / downloads tab"),
-        Line::from("  d           Download selected track (whole playlist on Playlists tab)"),
+        Line::from("  d           Download track / playlist / album"),
         Line::from("  D           Delete offline copy (Offline tab)"),
         Line::from("  J / K       Move queue track down / up (Queue tab)"),
         Line::from("  Enter       Play queue track / jump to selected lyric"),
@@ -1090,7 +1307,9 @@ fn render_help(frame: &mut Frame, area: Rect) {
 mod tests {
     use super::*;
     use crate::art::{self, CoverArt};
-    use crate::ui::app::{App, DownloadFailure, Playlist, PromptKind, Track};
+    use crate::ui::app::{
+        Album, App, Artist, DownloadFailure, Playlist, PlaylistDownload, PromptKind, Track,
+    };
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui_image::picker::Picker;
@@ -1294,5 +1513,115 @@ mod tests {
         let text = buffer_text(&terminal);
         assert!(text.contains("Add 'Song' to playlist"));
         assert!(text.contains("Road Trip"));
+    }
+
+    #[test]
+    fn album_and_artist_lists_and_details_render() {
+        let mut app = test_app();
+        app.art_enabled = false;
+        app.tab = Tab::Albums;
+        app.albums = vec![Album {
+            id: "album-1".into(),
+            name: "Blue Hour".into(),
+            artist: "Nova".into(),
+            artists: vec!["Nova".into(), "Guest".into()],
+            album_type: Some("album".into()),
+            release_date: Some("2024-05-01".into()),
+            track_count: Some(11),
+            art_url: None,
+        }];
+        app.album_downloads.insert(
+            "album-1".into(),
+            PlaylistDownload {
+                name: "Blue Hour".into(),
+                total: 5,
+                completed: 2,
+                ..Default::default()
+            },
+        );
+        app.list_state.select(Some(0));
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 36)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Albums"));
+        assert!(text.contains("Blue Hour — Nova"));
+        assert!(text.contains("offline 2/5"));
+        assert!(text.contains("Nova, Guest"));
+        assert!(text.contains("2024-05-01"));
+        assert!(text.contains("Enter: load tracks · d: download album"));
+
+        app.tab = Tab::Artists;
+        app.artists = vec![Artist {
+            id: "artist-1".into(),
+            name: "Nova".into(),
+            genres: vec!["indie".into(), "electronic".into(), "ambient".into()],
+            art_url: None,
+        }];
+        app.list_state.select(Some(0));
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Artists"));
+        assert!(text.contains("indie, electronic +1"));
+        assert!(text.contains("Genres:"));
+        assert!(text.contains("indie, electronic, ambient"));
+        assert!(text.contains("Enter: view albums"));
+    }
+
+    #[test]
+    fn album_and_artist_details_use_tab_specific_art() {
+        let mut app = test_app();
+        app.tab = Tab::Albums;
+        app.albums = vec![Album {
+            id: "album-1".into(),
+            name: "Blue Hour".into(),
+            artist: "Nova".into(),
+            artists: Vec::new(),
+            album_type: None,
+            release_date: None,
+            track_count: None,
+            art_url: None,
+        }];
+        app.list_state.select(Some(0));
+        app.art = CoverArt::disabled("track art marker");
+        app.album_art = CoverArt::disabled("album art marker");
+        app.artist_art = CoverArt::disabled("artist art marker");
+
+        let mut terminal = Terminal::new(TestBackend::new(110, 34)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("album art marker"));
+        assert!(!text.contains("track art marker"));
+
+        app.tab = Tab::Artists;
+        app.artists = vec![Artist {
+            id: "artist-1".into(),
+            name: "Nova".into(),
+            genres: Vec::new(),
+            art_url: None,
+        }];
+        app.list_state.select(Some(0));
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("artist art marker"));
+        assert!(!text.contains("album art marker"));
+    }
+
+    #[test]
+    fn contextual_search_and_download_hints_render() {
+        let mut app = test_app();
+        app.art_enabled = false;
+        app.tab = Tab::Albums;
+        let mut terminal = Terminal::new(TestBackend::new(200, 36)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("search albums"));
+        assert!(text.contains("download album"));
+
+        app.show_help = true;
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Contextual search (tracks / albums / artists)"));
+        assert!(text.contains("Download track / playlist / album"));
     }
 }

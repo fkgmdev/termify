@@ -14,6 +14,9 @@ library, play music, and read synced lyrics, all from the terminal.
   with Spotify's desktop client ID through the device-pairing flow
 - Two separate cached tokens so Web API rate limits do not affect playback
 - Search tracks, browse playlists, load playlist tracks and liked songs
+- Search albums and artists; open an album to load its full track list or open
+  an artist to browse their albums. `/` searches the catalog type of the current
+  tab
 - Playlist editing: create/rename private playlists, add tracks from search,
   remove tracks, and reorder tracks; re-login is required once for the new
   `playlist-modify-private`/`playlist-modify-public` scopes
@@ -24,13 +27,14 @@ library, play music, and read synced lyrics, all from the terminal.
   playlist when its last track ends, using the current shuffle order, and is
   exposed as MPRIS `Loop_Status` on Linux
 - Offline downloads: save tracks through the librespot session, list them on the
-  Offline tab, play single tracks or a whole downloaded playlist with rodio, and
-  launch with `--offline` without a login
-- Press `d` on the Playlists tab to download every track of a playlist; already
-  saved and in-flight tracks are skipped, with progress shown in the list
+  Offline tab, play single tracks or a whole downloaded album/playlist with rodio,
+  and launch with `--offline` without a login
+- Press `d` on the Playlists or Albums tab to download every track of that
+  collection; already saved and in-flight tracks are skipped, with progress
+  shown in the list
 - Downloaded copies are preferred automatically, so selecting a saved track from
   search or a playlist also plays from disk; delete copies with `D`
-- Persistent v2 `downloads.json` index with hashed filenames, playlist
+- Persistent v2 `downloads.json` index with hashed filenames, playlist and album
   memberships, atomic writes and stale-entry cleanup; audio-key failures are
   retried with backoff and bad files are never indexed
 - Playlist shuffling with a saved playback order (`s`)
@@ -41,6 +45,10 @@ library, play music, and read synced lyrics, all from the terminal.
   resume following playback
 - Original-language lyrics preferred over translated LRCLIB entries; optional
   English translation (`t`), cached per track
+- Playback progress and lyric highlighting re-anchor on librespot's reported
+  position, including seeks and corrections, instead of accumulating 250 ms UI
+  ticks; stale events from skipped tracks are ignored. Offline seeks report
+  failures instead of silently moving the clock
 - Downloads also save cover art, lyrics and an English translation when
   available, so downloaded tracks keep their artwork and translated lyrics in
   `--offline` mode
@@ -59,7 +67,9 @@ library, play music, and read synced lyrics, all from the terminal.
   next/previous, seek and volume events route into the same action loop as the
   keyboard
 
-Not in v1: Spotify Connect, daemon mode, audio visualization.
+Not in v1: Spotify Connect, daemon mode, audio visualization, Spotify
+listening-history/Wrapped writes, or appearing as the active device on other
+Spotify devices (see [Spotify stats and other devices](#spotify-stats-and-other-devices)).
 
 ## Requirements
 
@@ -124,7 +134,7 @@ termify                 # launch the TUI (requires auth first)
 termify --demo          # TUI with sample data, no credentials needed
 termify --offline       # play only downloaded tracks, no login or network
 termify auth            # force a fresh Web API login (reuse playback token)
-termify search <query>  # search tracks and print results
+termify search <query> [--kind track|album|artist]  # search the catalog
 termify play <uri>      # smoke test: play one track locally until Ctrl-C
 termify download <uri>  # save one track and print the full error chain on failure
 termify --relogin       # force re-login for both Web API and playback
@@ -138,9 +148,9 @@ termify --relogin       # force re-login for both Web API and playback
 | `k` / `↑` | Move up (select playlist on Playlists tab; lyric line on Lyrics tab; cursor on Queue tab) |
 | `g` / `G` | First / last item (first/last lyric line on Lyrics tab) |
 | `PgUp` / `PgDn` | Page up / down |
-| `Enter` | Select track to play (offline copy when saved); open playlist; play a whole offline playlist/all saved tracks; play queue item; jump to selected lyric line |
-| `/` | Search tracks |
-| `Tab` / `Shift+Tab` | Next / previous tab |
+| `Enter` | Select track to play (offline copy when saved); open playlist; load album tracks; view an artist's albums; play a whole offline album/playlist/all saved tracks; play queue item; jump to selected lyric line |
+| `/` | Contextual search: tracks on Search/Playlists, albums on Albums, artists on Artists |
+| `Tab` / `Shift+Tab` | Next / previous tab (Search → Albums → Artists → Playlists → Queue → Lyrics → Offline) |
 | `Space` | Play / pause |
 | `n` / `p` | Next / previous track |
 | `←` / `→` | Seek −5s / +5s |
@@ -148,8 +158,8 @@ termify --relogin       # force re-login for both Web API and playback
 | `l` | Lyrics tab |
 | `Q` | Queue tab |
 | `o` | Offline / downloads tab |
-| `d` | Download the selected track; download all tracks on the Playlists tab |
-| `D` | On the Offline tab: delete the selected track's copy, or forget the selected offline playlist (files kept); elsewhere: discard staged playlist changes |
+| `d` | Download the selected track; download all tracks on the Playlists or Albums tab |
+| `D` | On the Offline tab: delete the selected track's copy, or forget the selected offline album/playlist grouping (files kept); elsewhere: discard staged playlist changes |
 | `J` / `K` | Move selected queue track down / up (Queue tab only) |
 | `L` | Load liked songs |
 | `N` | Create a new private playlist (Playlists tab) |
@@ -162,6 +172,7 @@ termify --relogin       # force re-login for both Web API and playback
 | `s` | Shuffle on / off (affects next/prev and auto-advance) |
 | `r` | Repeat off / playlist / one; playlist repeat restarts the shuffled order too (MPRIS Loop Status) |
 | `c` | Show / hide cover art (no effect when the terminal blocks images) |
+| `P` | Toggle Discord Rich Presence (when configured) |
 | `a` | Lyrics follow playback on / off (re-syncs the selected line when re-enabled) |
 | `t` | Translate lyrics to English (on the Lyrics tab) |
 | `?` | Help overlay |
@@ -208,8 +219,9 @@ Setup table:
 The v2 index is `downloads.json` inside that `downloads/` folder
 (`~/.cache/termify/downloads/downloads.json`, for example). It maps Spotify URIs
 to hashed `.ogg`/`.mp3` filenames, an optional matching `.jpg` cover file, and
-records which playlists each track belongs to. Lyrics and translations live in
-`lyrics.json` beside the `downloads/` folder, shared with online playback.
+records which playlists and albums each track belongs to. Lyrics and
+translations live in `lyrics.json` beside the `downloads/` folder, shared with
+online playback.
 Writes are atomic, names are validated when the index is read, and stale entries
 (missing files or invalid audio headers) disappear on the next launch without
 touching your other audio files.
@@ -229,13 +241,13 @@ quality. A track only gets 320 kbps if Spotify has that format for it.
 Yes. Downloaded files are **not DRM-encrypted** — they are ordinary Ogg Vorbis
 or MP3 audio files, with a plain image file for the saved cover. Use `D` on the
 Offline tab to remove the selected track's audio, cover and index entry together;
-on a downloaded-playlist row, `D` only forgets the playlist grouping and keeps
-the files. Lyrics entries in `lyrics.json` are shared with online playback and
-are not deleted with a track. You can also delete files manually: the next launch
-drops index entries whose audio is gone or whose headers are invalid, and forgets
-missing covers. No tokens or credentials are stored in `downloads/`; token caches
-stay in the parent cache directory with `0600` permissions, so protect the whole
-cache directory as you would any media library.
+on a downloaded-album or downloaded-playlist row, `D` only forgets that grouping
+and keeps the files. Lyrics entries in `lyrics.json` are shared with online
+playback and are not deleted with a track. You can also delete files manually:
+the next launch drops index entries whose audio is gone or whose headers are
+invalid, and forgets missing covers. No tokens or credentials are stored in
+`downloads/`; token caches stay in the parent cache directory with `0600`
+permissions, so protect the whole cache directory as you would any media library.
 
 ### Downloading and playing offline
 
@@ -270,18 +282,20 @@ downloads all of them sequentially, with a 400 ms pause between tracks to avoid
 key-service bursts. Tracks already on disk or in flight are skipped, duplicates
 within the playlist are collapsed, and the list shows `offline n/total` progress
 while it runs. The final status reports how many tracks were saved and how many
-failed; a failed track does not stop the rest of the playlist.
+failed; a failed track does not stop the rest of the playlist. `d` on the Albums
+tab uses the same flow for the selected album and stores the album's track order
+in the index.
 
-Press `o` (or `Tab`) to open the Offline tab. Downloaded playlists appear first,
-then an **All downloaded tracks** row, then individual tracks. `Enter` on a
-playlist plays its saved tracks in playlist order; `Enter` on **All downloaded
-tracks** plays the whole library; `Enter` on a track plays that copy. `n`/`p`,
-shuffle and repeat work on the loaded offline queue, so playlist repeat keeps
-cycling after the last track. Saved tracks have a `↓` marker in other lists and
-are preferred automatically, even when selected from search results or a
-playlist. Downloads require a working local-playback session (the same
-device-pairing token used for streaming); browsing without one still works, but
-cannot fetch new audio.
+Press `o` (or `Tab`) to open the Offline tab. Downloaded albums appear first,
+then downloaded playlists, then an **All downloaded tracks** row, then individual
+tracks. `Enter` on an album or playlist plays its saved tracks in album/playlist
+order; `Enter` on **All downloaded tracks** plays the whole library; `Enter` on a
+track plays that copy. `n`/`p`, shuffle and repeat work on the loaded offline
+queue, so list repeat keeps cycling after the last track. Saved tracks have a
+`↓` marker in other lists and are preferred automatically, even when selected
+from search results or a playlist. Downloads require a working local-playback
+session (the same device-pairing token used for streaming); browsing without one
+still works, but cannot fetch new audio.
 
 `termify --offline` skips config validation, Web API login and the playback
 session, then starts directly in the Offline tab. It uses rodio to play only
@@ -290,6 +304,23 @@ lyrics, translations and cover art for downloaded tracks are loaded from disk;
 tracks without saved copies fall back to text placeholders. API browsing stays
 unavailable without a login; desktop media controls continue to work with the
 local player.
+
+## Albums and artists
+
+The Albums and Artists tabs use the same Web API token and scopes as track
+search, so no extra login is required. Press `/` on the Albums tab to search
+albums, or on the Artists tab to search artists; the footer shows which catalog
+type is active. On the Albums tab, `Enter` loads the selected album's full track
+list into the Search view, and `d` downloads every track of the selected album
+(using the loaded list when that album is already open). The Details pane shows
+the album's artists, type, release date, track count and cover, with
+`offline n/total` progress on the list row while a download runs.
+
+On the Artists tab, `Enter` replaces the album list with that artist's
+discography (all album types, newest first). The Detail pane shows the artist's
+image and best-effort genres; Spotify has deprecated some artist metadata, so
+genres may be empty. Each tab keeps its own detail image, independent of the
+current song's cover.
 
 ## Playlists and collaborators
 
@@ -413,6 +444,20 @@ Discord's local RPC API does not forward media keys to termify, so use the
 desktop media controls above for play/pause/next/previous. The presence card's
 "Open in Spotify" button opens the current track on the web.
 
+## Spotify stats and other devices
+
+Spotify's Web API can read data such as recently played tracks and top
+artists/tracks, but it has no endpoint to record a play, scrobble a track, or
+modify your listening history or Wrapped. termify therefore does not write
+anything back to Spotify; local playback stays local, and Spotify's own stats
+are not affected by tracks played here.
+
+Likewise, termify cannot make itself appear as the active player on another
+Spotify device through the public Web API. That would require registering a
+Spotify Connect device (the Spirc protocol), which termify does not do: audio is
+streamed by a private local librespot client. The Web API can start or resume
+playback only on devices Spotify already knows about.
+
 ## Architecture
 
 Single binary, modular source:
@@ -423,15 +468,15 @@ src/
   config.rs   # config.toml, platform-specific paths, env overrides
   art.rs      # cover-art state, fetch/decode, terminal protocol helpers
   auth.rs     # PKCE + device-pairing flows, token caches + refresh
-  api.rs      # rspotify wrapper (search, playlists, liked songs)
+  api.rs      # rspotify wrapper (track/album/artist search, playlist details/edits, liked songs)
   player.rs   # librespot session, Player, mixer, playback controls
-  offline.rs  # download/decrypt audio, v2 disk index, rodio playback for saved tracks
+  offline.rs  # download/decrypt audio, v2 index with playlist/album groups, rodio playback
   lyrics.rs   # LRCLIB client, LRC parser, language preference, translation, disk cache
   mpris.rs    # MPRIS D-Bus player and shared media-state/types
   os_media.rs # platform dispatcher: MPRIS on Linux, Now Playing/SMTC on macOS/Windows
   discord.rs  # optional Discord Rich Presence over local Discord IPC
   ui/
-    app.rs    # App state, Action enum, keys, queue/shuffle/repeat/lyrics/cover/downloads
+    app.rs    # App state, Action enum, keys, tabs, queue/shuffle/repeat/lyrics/cover/downloads
     event.rs  # crossterm stream + tick -> Action channel
     render.rs # ratatui layout and widgets
 ```
@@ -443,8 +488,12 @@ a state snapshot to the active media thread: MPRIS runs on its own current-threa
 Tokio runtime because `mpris-server`'s `Player` is `Rc`-based and not `Send`,
 while macOS/Windows use `souvlaki` on a dedicated thread (with a hidden Win32
 message window on Windows). Optional Discord Rich Presence consumes the same
-snapshot on its own IPC thread. Online progress is derived from a local clock anchored
-on a 250 ms tick; offline progress comes from the rodio sink.
+snapshot on its own IPC thread. Online progress is extrapolated from an `Instant`
+captured with librespot's `Playing`, `Paused`, `PositionCorrection`,
+`PositionChanged` and `Seeked` events; those audio-reported positions are
+authoritative and events for a track that is no longer current are ignored. The
+250 ms UI tick only redraws the display. Offline progress comes from the rodio
+sink.
 
 ## Notes / troubleshooting
 
@@ -496,6 +545,9 @@ on a 250 ms tick; offline progress comes from the rodio sink.
   may vary. If its exact-match lookup returns a translated entry for a non-Latin
   track, termify searches LRCLIB for the original-language entry (verified with
   DECO*27's モニタリング). Genius fallback is planned but not implemented yet.
+  Highlighting now follows audio-reported positions, including librespot seek
+  and correction events, rather than counting 250 ms UI ticks, so skipping or
+  underruns no longer leave the lyric cursor drifting.
 - **Translation**: English translation uses Google's public translate endpoint
   (unofficial, no API key). It is cached per track in `lyrics.json`, including
   for downloaded tracks so it works offline. If the service is unavailable the

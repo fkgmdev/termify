@@ -1,7 +1,7 @@
 # termify — implementation plan
 
 A from-scratch Rust TUI Spotify client that **plays audio locally** through librespot,
-with search, playlists and synced lyrics. Project name: `termify`.
+with catalog search, playlists, offline listening and synced lyrics. Project name: `termify`.
 
 This file is the living copy of the plan; it is updated as milestones are completed
 or decisions change.
@@ -12,12 +12,14 @@ or decisions change.
 | --- | --- |
 | Playback | Local streaming via librespot 0.8 (no remote control of the official app) |
 | Auth | Two tokens: user Client ID + PKCE for Web API; Spotify desktop Client ID + device pairing for local playback |
-| Web API | `rspotify` 0.16 (`AuthCodePkceSpotify`, loaded from the PKCE token); PKCE scopes include `playlist-modify-private`/`playlist-modify-public`, with re-login when a cached token lacks them |
+| Web API | `rspotify` 0.16 (`AuthCodePkceSpotify`, loaded from the PKCE token); PKCE scopes include `playlist-modify-private`/`playlist-modify-public`, with re-login when a cached token lacks them. Search and detail calls for tracks, albums and artists use the same token/scopes |
 | Playlists | Create/rename/add/remove/reorder via the Web API; owner, collaborative flag and contributors shown. Contributors are derived from playlist item `added_by` because Spotify no longer exposes a separate collaborator list |
+| Catalog discovery | Albums and Artists tabs search with `/`; `Enter` loads an album's tracks or an artist's discography. No auth scope changes. The CLI search accepts `--kind track\|album\|artist` |
 | UI | `ratatui` 0.30 + `crossterm` 0.29 |
 | Runtime | `tokio` (multi-thread), single `mpsc` Action channel into `App` |
 | Audio backend | librespot-playback with rodio/ALSA (`SoftMixer` for volume) |
-| Offline | Download through the authenticated librespot session (`librespot-audio`/`librespot-metadata`), store decrypted Ogg Vorbis/MP3 in `cache/downloads`, index in v2 `downloads.json` with playlist memberships and an optional saved cover; `d` saves one track or a whole playlist from the Playlists tab; downloads also save cover art and lyrics/translations when available; Offline tab can replay a whole saved playlist, single tracks play with rodio, saved copies are preferred online, and `--offline` works with no login/network. Audio keys are retried with backoff, never assumed missing, and files are decoder-verified before indexing; lower-quality formats are tried before failure, and full error chains go to `downloads/download-errors.log` plus a short Offline-tab history. A `termify download <uri>` CLI subcommand prints the full chain without the TUI |
+| Progress | Online progress extrapolates from an `Instant` anchored on librespot `Playing`/`Paused`/`PositionCorrection`/`PositionChanged`/`Seeked` events; the 250 ms tick only redraws. Events for a stale track URI are ignored. Offline progress comes from the rodio sink and failed seeks are reported |
+| Offline | Download through the authenticated librespot session (`librespot-audio`/`librespot-metadata`), store decrypted Ogg Vorbis/MP3 in `cache/downloads`, index in v2 `downloads.json` with playlist/album memberships and an optional saved cover; `d` saves one track, a whole playlist from the Playlists tab, or a whole album from the Albums tab; downloads also save cover art and lyrics/translations when available; Offline tab can replay a whole saved album or playlist, single tracks play with rodio, saved copies are preferred online, and `--offline` works with no login/network. Audio keys are retried with backoff, never assumed missing, and files are decoder-verified before indexing; lower-quality formats are tried before failure, and full error chains go to `downloads/download-errors.log` plus a short Offline-tab history. A `termify download <uri>` CLI subcommand prints the full chain without the TUI |
 | Lyrics | LRCLIB (line-synced, no key) primary, original-language entry preferred; English translation via Google's public endpoint on demand. Cached in-memory by track URI and persisted to v2 `lyrics.json` (including "no lyrics" results and translations saved for downloaded tracks). Genius unsynced fallback deferred to polish |
 | Cover art | Album and playlist images from the Web API, rendered with `ratatui-image` 11.1.0 (Kitty/iTerm2/Sixel with halfblocks fallback); the current song's cover has an 8x4 footer thumbnail on every tab and a large adaptive pane in Lyrics/Queue/Details (up to 44x22 cells), with protocols rebuilt on resize without refetching. Downloads save a plain `.jpg` cover beside the audio and offline playback loads it from disk. Fetch/decode failures degrade to text placeholders; `TERMIFY_NO_ART`/`TERM=dumb` disable all art areas. Playlist-tab selection uses a separate cover state so it never replaces the current song's art; current album URL is published as MPRIS `mpris:artUrl` |
 | Config/cache | Platform-specific `#[cfg]` blocks: Linux XDG (`~/.config/termify`, `~/.cache/termify`), macOS (`~/Library/Application Support/termify`, `~/Library/Caches/termify`), Windows (`%APPDATA%\termify`, `%LOCALAPPDATA%\termify`) |
@@ -38,16 +40,16 @@ src/
   config.rs          # config.toml (client id, redirect URI, volume, backend), platform paths
   art.rs             # cover-art state, fetch/decode, terminal protocol helpers
   auth.rs            # PKCE + device-pairing flows, token caches + refresh
-  api.rs             # rspotify wrapper (search, playlist details/edits, liked songs)
+  api.rs             # rspotify wrapper (track/album/artist search and details, playlist edits, liked songs)
   player.rs          # librespot Session + Player, playback controls, events
-  offline.rs         # download/decrypt audio + cover/lyrics assets, v2 index, rodio offline playback
+  offline.rs         # download/decrypt audio + assets, v2 index with playlist/album groups, rodio playback
   lyrics.rs          # LRCLIB client, LRC parser, language preference, translation, v2 disk cache with translations
   mpris.rs           # MPRIS D-Bus server + shared media-state/types
   os_media.rs        # native media-control dispatcher (MPRIS/Now Playing/SMTC)
   discord.rs         # optional Discord Rich Presence over local Discord IPC
   ui/
     mod.rs
-    app.rs           # App state, Action enum, key handling, async helpers
+    app.rs           # App state, Action enum, tabs, key handling, async helpers
     event.rs         # crossterm stream -> Action (incl. Windows arrow-fragment normalization)
     render.rs        # ratatui layout + widgets
 ```
@@ -58,8 +60,11 @@ actions, publishes a media state snapshot and redraws. The MPRIS `Player` is
 `!Send`, so it runs on a dedicated thread with a current-thread runtime; the
 macOS/Windows `souvlaki` controls also run on their own thread (with a hidden
 message window on Windows).
-Playback progress is derived from a local clock anchored on a 250 ms tick for
-streaming tracks and from the rodio sink for downloaded files.
+Playback progress for streaming tracks is extrapolated from an `Instant` anchored
+on librespot's reported positions (`Playing`, `Paused`, `PositionCorrection`,
+`PositionChanged`, `Seeked`); the 250 ms tick only redraws the UI. Events for a
+track that is no longer current are ignored. Downloaded tracks use the rodio
+sink's actual position.
 
 ## Milestones
 
@@ -85,8 +90,9 @@ streaming tracks and from the rodio sink for downloaded files.
 
 ### M1 — TUI shell (done)
 - [x] Layout: header with tabs, list pane, detail pane, now-playing footer
-- [x] Keybindings: `j/k`, `g/G`, `PgUp/PgDn`, `Enter`, `/`, `Space`, `n/p`, `←/→`, `+/-`, `l`, `Q`, `o`, `d`, `D`, `J/K`, `L`, `s`, `r`, `c`, `a`, `t`, `Tab`, `?`, `q`, `Ctrl-C`
-      (Tab/Shift+Tab use crossterm's `Tab`/`BackTab` codes)
+- [x] Keybindings: `j/k`, `g/G`, `PgUp/PgDn`, `Enter`, `/`, `Space`, `n/p`, `←/→`, `+/-`, `l`, `Q`, `o`, `d`, `D`, `J/K`, `L`, `s`, `r`, `c`, `P`, `a`, `t`, `Tab`, `?`, `q`, `Ctrl-C`
+      (Tab/Shift+Tab use crossterm's `Tab`/`BackTab` codes and cycle Search →
+      Albums → Artists → Playlists → Queue → Lyrics → Offline)
 - [x] Config loading (client ID, redirect URI, volume, audio backend)
 - [x] Single `mpsc` Action channel with crossterm event stream + 250 ms tick
 - [x] Loading / error states, help overlay
@@ -94,6 +100,9 @@ streaming tracks and from the rodio sink for downloaded files.
 
 ### M2 — Library & search (done)
 - [x] Search tracks via rspotify (top 10 results; verified live with PKCE token)
+- [x] Albums and Artists tabs: contextual `/` search, album details/tracks with
+      paging, artist details/discography, tab-specific detail art and CLI
+      `search --kind track|album|artist`
 - [x] Current user's playlists; load playlist tracks on Enter
 - [x] Liked songs (`L`)
 - [x] Async API tasks with loading/status feedback in UI
@@ -122,6 +131,10 @@ streaming tracks and from the rodio sink for downloaded files.
       playlist download progress, shuffled playlist repeat, Playlists-tab
       navigation, offline playlist playback and playlist cover selection
       (66 passing)
+- [x] Playback progress and lyric highlighting now anchor on librespot's
+      `Instant`-stamped position events (including seeks/corrections) instead of
+      counting 250 ms ticks; stale events from skipped tracks are ignored and
+      failed offline seeks surface an error
 - [x] Fixed LRCLIB camelCase field mapping (`syncedLyrics`/`plainLyrics`) that
       made every lookup report "no lyrics"; verified with "Knee Socks"
 - [x] Prefer original-language LRCLIB entry when `/api/get` returns a translation
@@ -217,15 +230,17 @@ streaming tracks and from the rodio sink for downloaded files.
       playlist memberships with atomic replacement; v1 indexes are readable and
       upgraded on save. On load, corrupt/outdated indexes, missing files, invalid
       audio headers and unsafe names are ignored without deleting audio
-- [x] Offline tab (`o`) lists downloaded playlists, an all-tracks row and saved
-      tracks; `Enter` plays a whole offline playlist or the full library with
-      correct `n`/`p`, shuffle and repeat queue handling; `D` deletes a selected
-      track's copy or forgets a playlist grouping (audio files kept). Downloaded
-      copies are preferred automatically from any tab with a `↓` marker
+- [x] Offline tab (`o`) lists downloaded albums and playlists, an all-tracks row
+      and saved tracks; `Enter` plays a whole offline album/playlist or the full
+      library with correct `n`/`p`, shuffle and repeat queue handling; `D`
+      deletes a selected track's copy or forgets an album/playlist grouping
+      (audio files kept). Downloaded copies are preferred automatically from any
+      tab with a `↓` marker
 - [x] On the Playlists tab, `d` fetches the selected playlist's saved tracks and
       downloads all of them sequentially, skipping saved/in-flight tracks and
       duplicates; a 400 ms inter-track delay reduces key-service bursts, and the
-      list shows progress and a final saved/failed summary
+      list shows progress and a final saved/failed summary. The Albums tab uses
+      the same flow and persists album memberships additively in the v2 index
 - [x] Audio-key hardening: no "assume unencrypted" fallback, 250 ms spacing plus
       four attempts with exponential backoff for transient key failures; permanent
       refusals get an actionable message. The key is requested before the CDN stream
@@ -248,8 +263,9 @@ streaming tracks and from the rodio sink for downloaded files.
       progress/errors, tab loading, offline mode, deletion, offline playlist
       playback, playlist cover selection, persistent current-track art and download
       failure diagnostics, transient-timeout retry, explicit-format header validation,
-      saved-cover cleanup, stale-cover pruning and translation cache round-trips
-      (79 passing)
+      saved-cover cleanup, stale-cover pruning, translation cache round-trips,
+      album/artist browsing and details, album download progress/persistence,
+      offline album rows and anchored position/lyric timing (106 passing)
 - [x] Fixed a real download failure where `.part` files were validated against the
       wrong container rules because their extension is `part`, not `ogg`/`mp3`;
       header validation now takes an explicit format hint and regression-tested it
@@ -270,8 +286,10 @@ streaming tracks and from the rodio sink for downloaded files.
 
 ## Deferred (not in v1)
 
-Spotify Connect device registration, daemon mode, CLI scripting, audio
-visualization, desktop notifications.
+Spotify Connect device registration (needed to appear as the active device on
+other Spotify clients), writing listening history/Wrapped entries (the Web API
+has no scrobble/write endpoint), daemon mode, CLI scripting, audio visualization,
+desktop notifications.
 
 ## User-provided credentials needed
 

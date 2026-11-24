@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -16,6 +16,8 @@ use crate::offline::{self, DownloadEntry, DownloadStore, OfflinePlayer};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Search,
+    Albums,
+    Artists,
     Playlists,
     Queue,
     Lyrics,
@@ -23,8 +25,10 @@ pub enum Tab {
 }
 
 impl Tab {
-    pub const ALL: [Tab; 5] = [
+    pub const ALL: [Tab; 7] = [
         Tab::Search,
+        Tab::Albums,
+        Tab::Artists,
         Tab::Playlists,
         Tab::Queue,
         Tab::Lyrics,
@@ -33,7 +37,9 @@ impl Tab {
 
     pub fn next(self) -> Self {
         match self {
-            Tab::Search => Tab::Playlists,
+            Tab::Search => Tab::Albums,
+            Tab::Albums => Tab::Artists,
+            Tab::Artists => Tab::Playlists,
             Tab::Playlists => Tab::Queue,
             Tab::Queue => Tab::Lyrics,
             Tab::Lyrics => Tab::Downloads,
@@ -44,7 +50,9 @@ impl Tab {
     pub fn prev(self) -> Self {
         match self {
             Tab::Search => Tab::Downloads,
-            Tab::Playlists => Tab::Search,
+            Tab::Albums => Tab::Search,
+            Tab::Artists => Tab::Albums,
+            Tab::Playlists => Tab::Artists,
             Tab::Queue => Tab::Playlists,
             Tab::Lyrics => Tab::Queue,
             Tab::Downloads => Tab::Lyrics,
@@ -54,6 +62,8 @@ impl Tab {
     pub fn title(self) -> &'static str {
         match self {
             Tab::Search => "Search",
+            Tab::Albums => "Albums",
+            Tab::Artists => "Artists",
             Tab::Playlists => "Playlists",
             Tab::Queue => "Queue",
             Tab::Lyrics => "Lyrics",
@@ -178,6 +188,30 @@ impl Playlist {
     }
 }
 
+/// A Spotify album shown on the Albums tab. Kept deliberately small: the
+/// full track list is fetched only when the album is opened or downloaded.
+#[derive(Debug, Clone)]
+pub struct Album {
+    pub id: String,
+    pub name: String,
+    pub artist: String,
+    pub artists: Vec<String>,
+    pub album_type: Option<String>,
+    pub release_date: Option<String>,
+    pub track_count: Option<u32>,
+    pub art_url: Option<String>,
+}
+
+/// A Spotify artist shown on the Artists tab. Genres are best-effort: Spotify
+/// has deprecated the artist popularity/follower fields this data came from.
+#[derive(Debug, Clone)]
+pub struct Artist {
+    pub id: String,
+    pub name: String,
+    pub genres: Vec<String>,
+    pub art_url: Option<String>,
+}
+
 /// Text input overlay used for playlist name editing.
 #[derive(Debug, Clone)]
 pub enum PromptKind {
@@ -200,6 +234,8 @@ impl PromptKind {
 pub enum CoverArtTarget {
     Track { uri: String },
     Playlist { id: String },
+    Album { id: String },
+    Artist { id: String },
 }
 
 /// Locally staged edits for one playlist. Nothing is sent to Spotify until
@@ -262,6 +298,11 @@ pub struct PlaylistDownload {
 /// that can be played without a network connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OfflineItem {
+    Album {
+        id: String,
+        name: String,
+        count: usize,
+    },
     Playlist {
         id: String,
         name: String,
@@ -274,11 +315,12 @@ pub enum OfflineItem {
 }
 
 /// Which offline queue was last loaded for playback. This is deliberately
-/// separate from `current_playlist_id`: offline playlists are local groupings
-/// and must never be edited or renamed through the Web API.
+/// separate from `current_playlist_id`: offline albums and playlists are local
+/// groupings and must never be edited or renamed through the Web API.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OfflineQueue {
     All,
+    Album { id: String, name: String },
     Playlist { id: String, name: String },
 }
 
@@ -286,7 +328,7 @@ impl OfflineQueue {
     pub fn name(&self) -> String {
         match self {
             Self::All => "All downloaded tracks".to_string(),
-            Self::Playlist { name, .. } => name.clone(),
+            Self::Album { name, .. } | Self::Playlist { name, .. } => name.clone(),
         }
     }
 }
@@ -307,6 +349,14 @@ pub struct NowPlaying {
     pub volume: u8,
 }
 
+/// Audio-derived anchor for the online progress clock. Ticks use this instead
+/// of adding a fixed 250ms, so a delayed/stale tick cannot drift the lyrics.
+#[derive(Debug, Clone, Copy)]
+struct PositionAnchor {
+    at: Instant,
+    position: Duration,
+}
+
 /// Optional paths used when constructing `App`; tests can omit them.
 #[derive(Default)]
 pub struct AppOptions {
@@ -324,6 +374,13 @@ pub enum Action {
     Key(KeyEvent),
     Loading(String),
     SearchResults(Result<Vec<Track>, String>),
+    AlbumSearchResults(Result<Vec<Album>, String>),
+    ArtistSearchResults(Result<Vec<Artist>, String>),
+    /// Full album metadata plus all of its tracks.
+    AlbumDetailsLoaded(Result<(Album, Vec<Track>), String>),
+    /// Artist metadata plus their albums (the deprecated top-tracks endpoint
+    /// is deliberately not used).
+    ArtistDetailsLoaded(Result<(Artist, Vec<Album>), String>),
     PlaylistsLoaded(Result<Vec<Playlist>, String>),
     /// Full playlist metadata plus its tracks and per-track attribution.
     PlaylistDetailsLoaded(Result<(Playlist, Vec<Track>), String>),
@@ -377,9 +434,46 @@ pub enum Action {
         members: Vec<String>,
         error: Option<String>,
     },
-    PlayerEndOfTrack,
-    PlayerPlaying(u32),
-    PlayerPaused(u32),
+    /// Album tracks were fetched and queued for offline download.
+    AlbumDownloadStarted {
+        id: String,
+        name: String,
+        total: usize,
+        uris: Vec<String>,
+        members: Vec<String>,
+    },
+    /// All tracks for an album download finished, or fetching it failed.
+    AlbumDownloadFinished {
+        id: String,
+        name: String,
+        artist: String,
+        total: usize,
+        failed: usize,
+        members: Vec<String>,
+        error: Option<String>,
+    },
+    /// librespot events carry the URI and the time the position was sampled.
+    /// Both are needed to ignore stale events and avoid turning event lag into
+    /// a permanent lyric offset.
+    PlayerEndOfTrack {
+        track_uri: Option<String>,
+    },
+    PlayerPlaying {
+        position_ms: u32,
+        track_uri: Option<String>,
+        at: Instant,
+    },
+    PlayerPaused {
+        position_ms: u32,
+        track_uri: Option<String>,
+    },
+    /// Authoritative position from a librespot correction, periodic update, or
+    /// completed seek. Re-anchors the UI clock instead of extrapolating ticks.
+    PlayerPosition {
+        position_ms: u32,
+        track_uri: Option<String>,
+        at: Instant,
+    },
     LyricsLoaded {
         uri: String,
         result: Result<Option<crate::lyrics::Lyrics>, String>,
@@ -425,9 +519,14 @@ pub struct App {
     pub search_active: bool,
     pub list_state: ListState,
     pub tracks: Vec<Track>,
+    pub albums: Vec<Album>,
+    pub artists: Vec<Artist>,
     pub playlists: Vec<Playlist>,
     /// Playlist whose tracks are currently loaded (for track edits).
     pub current_playlist_id: Option<String>,
+    /// Album/artist currently opened from their tabs.
+    pub current_album_id: Option<String>,
+    pub current_artist_id: Option<String>,
     /// Active playlist name input overlay.
     pub prompt: Option<PromptKind>,
     pub prompt_input: String,
@@ -447,6 +546,8 @@ pub struct App {
     pub downloading: HashSet<String>,
     /// Whole-playlist downloads currently in progress, keyed by playlist ID.
     pub playlist_downloads: HashMap<String, PlaylistDownload>,
+    /// Whole-album downloads currently in progress, keyed by album ID.
+    pub album_downloads: HashMap<String, PlaylistDownload>,
     /// Most recent download failures, newest first. The full error chain is
     /// also appended to `downloads/download-errors.log`.
     pub download_failures: Vec<DownloadFailure>,
@@ -459,6 +560,9 @@ pub struct App {
     /// Lazily created when an offline track is first played.
     offline_player: Option<OfflinePlayer>,
     pub playback_mode: PlaybackMode,
+    /// Online playback position is extrapolated from the last audio event,
+    /// never from a count of 250ms ticks.
+    position_anchor: Option<PositionAnchor>,
     offline_end_handled: bool,
     pub lyrics: std::collections::HashMap<String, crate::lyrics::Lyrics>,
     pub lyrics_loading: bool,
@@ -484,6 +588,10 @@ pub struct App {
     /// Cover for the playlist highlighted on the Playlists tab. Kept separate so
     /// browsing playlists never replaces the current song's artwork.
     pub playlist_art: CoverArt,
+    /// Cover for the album highlighted on the Albums tab.
+    pub album_art: CoverArt,
+    /// Image for the artist highlighted on the Artists tab.
+    pub artist_art: CoverArt,
     /// User-facing art toggle. Forced off when the terminal cannot show images.
     pub art_enabled: bool,
     /// Whether a Discord Rich Presence session could be started this run.
@@ -541,6 +649,14 @@ impl App {
             Some(reason) => CoverArt::disabled(reason.clone()),
             None => CoverArt::no_art(),
         };
+        let album_art = match &art_blocked_reason {
+            Some(reason) => CoverArt::disabled(reason.clone()),
+            None => CoverArt::no_art(),
+        };
+        let artist_art = match &art_blocked_reason {
+            Some(reason) => CoverArt::disabled(reason.clone()),
+            None => CoverArt::no_art(),
+        };
         let art_enabled = art_blocked_reason.is_none();
         let discord_presence_available = options.discord_presence_available;
         let mut app = Self {
@@ -551,8 +667,12 @@ impl App {
             search_active: false,
             list_state,
             tracks: Vec::new(),
+            albums: Vec::new(),
+            artists: Vec::new(),
             playlists: Vec::new(),
             current_playlist_id: None,
+            current_album_id: None,
+            current_artist_id: None,
             prompt: None,
             prompt_input: String::new(),
             playlist_picker: None,
@@ -566,12 +686,14 @@ impl App {
             downloads: options.downloads.unwrap_or_else(DownloadStore::disabled),
             downloading: HashSet::new(),
             playlist_downloads: HashMap::new(),
+            album_downloads: HashMap::new(),
             download_failures: Vec::new(),
             offline_items: Vec::new(),
             offline_queue: None,
             offline_track_index: 0,
             offline_player: None,
             playback_mode: PlaybackMode::Online,
+            position_anchor: None,
             offline_end_handled: false,
             lyrics: std::collections::HashMap::new(),
             no_lyrics: HashSet::new(),
@@ -588,6 +710,8 @@ impl App {
             queue_cursor: 0,
             art,
             playlist_art,
+            album_art,
+            artist_art,
             art_enabled,
             discord_presence_available,
             discord_presence_enabled: discord_presence_available,
@@ -730,17 +854,31 @@ impl App {
         let tracks = self.downloads.tracks();
         let mut items: Vec<OfflineItem> = self
             .downloads
-            .playlists()
+            .albums()
             .into_iter()
-            .filter_map(|playlist| {
-                let count = self.downloads.playlist_tracks(&playlist.id).len();
-                (count > 0).then_some(OfflineItem::Playlist {
-                    id: playlist.id,
-                    name: playlist.name,
+            .filter_map(|album| {
+                let count = self.downloads.album_tracks(&album.id).len();
+                (count > 0).then_some(OfflineItem::Album {
+                    id: album.id,
+                    name: album.name,
                     count,
                 })
             })
             .collect();
+        items.extend(
+            self.downloads
+                .playlists()
+                .into_iter()
+                .filter_map(|playlist| {
+                    let count = self.downloads.playlist_tracks(&playlist.id).len();
+                    (count > 0).then_some(OfflineItem::Playlist {
+                        id: playlist.id,
+                        name: playlist.name,
+                        count,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        );
         if !tracks.is_empty() {
             items.push(OfflineItem::AllTracks);
             items.extend(tracks.iter().map(|track| OfflineItem::Track {
@@ -748,6 +886,11 @@ impl App {
             }));
         }
         self.offline_items = items;
+        let albums = self
+            .offline_items
+            .iter()
+            .filter(|item| matches!(item, OfflineItem::Album { .. }))
+            .count();
         let playlists = self
             .offline_items
             .iter()
@@ -769,8 +912,9 @@ impl App {
             "No downloads yet — select a track and press d".to_string()
         } else {
             format!(
-                "Offline library — {} tracks, {} playlists",
+                "Offline library — {} tracks, {} albums, {} playlists",
                 tracks.len(),
+                albums,
                 playlists
             )
         };
@@ -778,6 +922,41 @@ impl App {
 
     fn show_downloads(&mut self) {
         self.load_downloaded_tracks();
+    }
+
+    /// Load the selected album's tracks into the Search view. Keeping the
+    /// album ID lets `d` download it without a second lookup.
+    fn open_selected_album(&mut self) {
+        let Some(album) = self
+            .list_state
+            .selected()
+            .and_then(|index| self.albums.get(index))
+            .cloned()
+        else {
+            self.status = "Select an album to open".to_string();
+            return;
+        };
+        self.current_album_id = Some(album.id.clone());
+        self.loading = true;
+        self.status = format!("Loading album '{}'...", album.name);
+        self.load_album_details(album.id);
+    }
+
+    /// Replace the album list with the selected artist's discography.
+    fn open_selected_artist(&mut self) {
+        let Some(artist) = self
+            .list_state
+            .selected()
+            .and_then(|index| self.artists.get(index))
+            .cloned()
+        else {
+            self.status = "Select an artist to view".to_string();
+            return;
+        };
+        self.current_artist_id = Some(artist.id.clone());
+        self.loading = true;
+        self.status = format!("Loading albums by {}...", artist.name);
+        self.load_artist_details(artist.id);
     }
 
     /// Launch in offline mode: only downloaded tracks are available.
@@ -802,6 +981,24 @@ impl App {
             return;
         };
         match item {
+            OfflineItem::Album { id, name, .. } => {
+                let tracks = self.downloads.album_tracks(&id);
+                if tracks.is_empty() {
+                    self.status = format!("Offline album '{name}' has no saved tracks");
+                    return;
+                }
+                let count = tracks.len();
+                self.set_tracks(tracks);
+                self.offline_queue = Some(OfflineQueue::Album {
+                    id,
+                    name: name.clone(),
+                });
+                self.offline_track_index = 0;
+                self.list_state.select(Some(index));
+                self.status = format!("Playing offline album '{name}' — {count} tracks");
+                self.select_current();
+                self.status = format!("Playing offline album '{name}' — {count} tracks");
+            }
             OfflineItem::Playlist { id, name, .. } => {
                 let tracks = self.downloads.playlist_tracks(&id);
                 if tracks.is_empty() {
@@ -861,8 +1058,12 @@ impl App {
     }
 
     fn download_selected(&mut self) {
-        // On the Playlists tab the selected row is a playlist, so `d` saves all
-        // of its tracks instead of the last track list shown in Search.
+        // On collection tabs the selected row is an album/playlist, so `d`
+        // saves all of its tracks instead of the last track list shown in Search.
+        if self.tab == Tab::Albums {
+            self.download_selected_album();
+            return;
+        }
         if self.tab == Tab::Playlists {
             self.download_selected_playlist();
             return;
@@ -1063,6 +1264,156 @@ impl App {
         });
     }
 
+    /// Download every track of the selected album. The flow mirrors playlist
+    /// downloads: per-track `DownloadFinished` actions update the shared index,
+    /// while a final action persists the album as an offline queue.
+    fn download_selected_album(&mut self) {
+        let Some(album) = self
+            .list_state
+            .selected()
+            .and_then(|index| self.albums.get(index))
+            .cloned()
+        else {
+            self.status = "Select an album to download".to_string();
+            return;
+        };
+        if self.album_downloads.contains_key(&album.id) {
+            self.status = format!("Already downloading '{}'", album.name);
+            return;
+        }
+        let Some(client) = self.api_client.clone() else {
+            self.status = "Sign in to download albums".to_string();
+            return;
+        };
+        let Some(player) = self.player.clone() else {
+            self.status = "Sign in with local playback enabled to download tracks".to_string();
+            return;
+        };
+
+        let id = album.id.clone();
+        let name = album.name.clone();
+        let artist = album.artist.clone();
+        let mut skip: HashSet<String> = self.downloading.clone();
+        skip.extend(self.downloads.tracks().into_iter().map(|track| track.uri));
+        self.album_downloads.insert(
+            id.clone(),
+            PlaylistDownload {
+                name: name.clone(),
+                ..PlaylistDownload::default()
+            },
+        );
+        self.status = format!("Fetching album '{name}' for offline download...");
+        let cached_tracks =
+            if self.current_album_id.as_deref() == Some(id.as_str()) && !self.tracks.is_empty() {
+                Some(self.tracks.clone())
+            } else {
+                None
+            };
+
+        let tx = self.tx.clone();
+        let dir = self.downloads.dir().to_path_buf();
+        let assets = self.download_assets();
+        tokio::spawn(async move {
+            let tracks = match cached_tracks {
+                Some(tracks) => Ok(tracks),
+                None => crate::api::album_details(&client, &id)
+                    .await
+                    .map(|(_, tracks)| tracks),
+            };
+            let tracks = match tracks {
+                Ok(tracks) => tracks,
+                Err(err) => {
+                    let message = format!("Could not download album '{name}': {err:#}");
+                    let _ = tx
+                        .send(Action::AlbumDownloadFinished {
+                            id,
+                            name,
+                            artist,
+                            total: 0,
+                            failed: 0,
+                            members: Vec::new(),
+                            error: Some(message),
+                        })
+                        .await;
+                    return;
+                }
+            };
+
+            let mut seen = HashSet::new();
+            let mut members = Vec::new();
+            let mut pending = Vec::new();
+            for track in tracks {
+                if !seen.insert(track.uri.clone()) {
+                    continue;
+                }
+                members.push(track.uri.clone());
+                if !skip.contains(&track.uri) {
+                    pending.push(track);
+                }
+            }
+            let total = pending.len();
+            let uris: Vec<String> = pending.iter().map(|track| track.uri.clone()).collect();
+            let _ = tx
+                .send(Action::AlbumDownloadStarted {
+                    id: id.clone(),
+                    name: name.clone(),
+                    total,
+                    uris,
+                    members: members.clone(),
+                })
+                .await;
+
+            let mut failed = 0;
+            for (index, track) in pending.into_iter().enumerate() {
+                if index > 0 {
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                }
+                let result = offline::download_track(&player.session, &track, &dir)
+                    .await
+                    .map_err(|err| format!("{err:#}"));
+                if result.is_err() {
+                    failed += 1;
+                }
+                let saved = result.is_ok();
+                let asset_uri = track.uri.clone();
+                let _ = tx
+                    .send(Action::DownloadFinished {
+                        uri: asset_uri.clone(),
+                        result,
+                    })
+                    .await;
+                if saved {
+                    let asset_tx = tx.clone();
+                    let asset_dir = dir.clone();
+                    let asset_track = track.clone();
+                    let asset_assets = assets.clone();
+                    tokio::spawn(async move {
+                        let cover_file =
+                            offline::download_assets_for(&asset_track, &asset_dir, &asset_assets)
+                                .await;
+                        let _ = asset_tx
+                            .send(Action::DownloadAssetsFinished {
+                                uri: asset_uri,
+                                cover_file,
+                            })
+                            .await;
+                    });
+                }
+            }
+            let _ = tx
+                .send(Action::AlbumDownloadFinished {
+                    id,
+                    name,
+                    artist,
+                    total,
+                    failed,
+                    members,
+                    error: None,
+                })
+                .await;
+        });
+    }
+
     fn delete_selected_download(&mut self) {
         let selected = self
             .list_state
@@ -1070,6 +1421,20 @@ impl App {
             .and_then(|index| self.offline_items.get(index))
             .cloned();
         match selected {
+            Some(OfflineItem::Album { id, name, .. }) => {
+                if let Err(err) = self.downloads.remove_album(&id) {
+                    self.set_error(format!("Could not remove offline album: {err:#}"));
+                    return;
+                }
+                if self.offline_queue.as_ref().is_some_and(|queue| {
+                    matches!(queue, OfflineQueue::Album { id: queue_id, .. } if queue_id == &id)
+                }) {
+                    self.offline_queue = None;
+                }
+                self.load_downloaded_tracks();
+                self.status = format!("Forgot offline album '{name}' — audio files kept");
+                return;
+            }
             Some(OfflineItem::Playlist { id, name, .. }) => {
                 if let Err(err) = self.downloads.remove_playlist(&id) {
                     self.set_error(format!("Could not remove offline playlist: {err:#}"));
@@ -1207,6 +1572,60 @@ impl App {
     }
 
     /// Snapshot of everything the desktop needs to show in its media player.
+    /// Start (or restart) extrapolating from an audio-reported position.
+    fn anchor_position(&mut self, position: Duration, at: Instant) {
+        self.position_anchor = Some(PositionAnchor { at, position });
+    }
+
+    /// Find the in-flight collection containing `uri`. The bool is true for
+    /// albums, so progress messages can use the right noun. Only the ID is
+    /// returned so callers can freely access the download store afterwards.
+    fn collection_progress_id(&self, uri: &str) -> Option<(String, bool)> {
+        if let Some((id, _)) = self
+            .playlist_downloads
+            .iter()
+            .find(|(_, progress)| progress.uris.contains(uri))
+        {
+            return Some((id.clone(), false));
+        }
+        self.album_downloads
+            .iter()
+            .find(|(_, progress)| progress.uris.contains(uri))
+            .map(|(id, _)| (id.clone(), true))
+    }
+
+    fn collection_progress_mut(
+        &mut self,
+        id: &str,
+        is_album: bool,
+    ) -> Option<&mut PlaylistDownload> {
+        if is_album {
+            self.album_downloads.get_mut(id)
+        } else {
+            self.playlist_downloads.get_mut(id)
+        }
+    }
+
+    /// Position at `at` derived from the last authoritative player event.
+    fn anchored_position(&self, at: Instant) -> Option<Duration> {
+        self.position_anchor.map(|anchor| {
+            anchor
+                .position
+                .saturating_add(at.saturating_duration_since(anchor.at))
+        })
+    }
+
+    /// librespot events can arrive after the user already skipped tracks.
+    fn player_event_matches(&self, track_uri: &Option<String>) -> bool {
+        match track_uri {
+            None => true,
+            Some(uri) => self
+                .now_playing
+                .as_ref()
+                .is_some_and(|np| np.track.uri == *uri),
+        }
+    }
+
     pub fn mpris_state(&self) -> crate::mpris::MprisState {
         let now_playing = self.now_playing.as_ref();
         crate::mpris::MprisState {
@@ -1229,11 +1648,23 @@ impl App {
     pub fn handle_action(&mut self, action: Action) -> Result<()> {
         match action {
             Action::Tick => {
+                let now = Instant::now();
+                let online_position = if self.playback_mode == PlaybackMode::Online
+                    && self.now_playing.as_ref().is_some_and(|np| np.playing)
+                {
+                    self.anchored_position(now)
+                } else {
+                    None
+                };
                 let mut ended = false;
                 if let Some(np) = &mut self.now_playing {
                     if np.playing {
                         if self.playback_mode == PlaybackMode::Online {
-                            np.position += Duration::from_millis(250);
+                            // With no audio anchor yet (librespot still loading),
+                            // hold the position instead of inventing progress.
+                            if let Some(position) = online_position {
+                                np.position = position;
+                            }
                             if let Some(track) = self.tracks.iter().find(|t| t.uri == np.track.uri)
                             {
                                 ended = np.position >= track.duration;
@@ -1262,6 +1693,71 @@ impl App {
                         self.current_playlist_id = None;
                         self.set_tracks(tracks);
                         self.status = format!("Found {} tracks", self.tracks.len());
+                    }
+                    Err(err) => self.set_error(err),
+                }
+            }
+            Action::AlbumSearchResults(result) => {
+                self.loading = false;
+                match result {
+                    Ok(albums) => {
+                        self.albums = albums;
+                        self.list_state.select(if self.albums.is_empty() {
+                            None
+                        } else {
+                            Some(0)
+                        });
+                        self.status = format!("Found {} albums", self.albums.len());
+                        self.load_selected_album_cover();
+                    }
+                    Err(err) => self.set_error(err),
+                }
+            }
+            Action::ArtistSearchResults(result) => {
+                self.loading = false;
+                match result {
+                    Ok(artists) => {
+                        self.artists = artists;
+                        self.list_state.select(if self.artists.is_empty() {
+                            None
+                        } else {
+                            Some(0)
+                        });
+                        self.status = format!("Found {} artists", self.artists.len());
+                        self.load_selected_artist_image();
+                    }
+                    Err(err) => self.set_error(err),
+                }
+            }
+            Action::AlbumDetailsLoaded(result) => {
+                self.loading = false;
+                match result {
+                    Ok((album, tracks)) => {
+                        self.current_album_id = Some(album.id);
+                        self.current_playlist_id = None;
+                        self.tab = Tab::Search;
+                        self.set_tracks(tracks);
+                        self.status =
+                            format!("Loaded {} tracks from '{}'", self.tracks.len(), album.name);
+                        self.sync_current_art();
+                    }
+                    Err(err) => self.set_error(err),
+                }
+            }
+            Action::ArtistDetailsLoaded(result) => {
+                self.loading = false;
+                match result {
+                    Ok((artist, albums)) => {
+                        self.current_artist_id = Some(artist.id);
+                        self.albums = albums;
+                        self.tab = Tab::Albums;
+                        self.list_state.select(if self.albums.is_empty() {
+                            None
+                        } else {
+                            Some(0)
+                        });
+                        self.status = format!("{} albums by {}", self.albums.len(), artist.name);
+                        self.load_selected_album_cover();
                     }
                     Err(err) => self.set_error(err),
                 }
@@ -1403,12 +1899,20 @@ impl App {
                 self.downloading.remove(&uri);
                 let label = self.track_label_for_uri(&uri);
                 let mut saved_assets = false;
-                let playlist = self
-                    .playlist_downloads
-                    .values_mut()
-                    .find(|progress| progress.uris.contains(&uri));
-                if let Some(progress) = playlist {
-                    progress.completed += 1;
+                let collection = self.collection_progress_id(&uri);
+                if let Some((collection_id, is_album)) = collection {
+                    let (name, total, completed, mut failed) = {
+                        let progress = self
+                            .collection_progress_mut(&collection_id, is_album)
+                            .expect("collection progress");
+                        progress.completed += 1;
+                        (
+                            progress.name.clone(),
+                            progress.total,
+                            progress.completed,
+                            progress.failed,
+                        )
+                    };
                     let mut failure = None;
                     match result {
                         Ok(entry) => {
@@ -1420,32 +1924,36 @@ impl App {
                                     cover.as_deref(),
                                     &audio_path,
                                 );
-                                progress.failed += 1;
+                                failed += 1;
                                 failure = Some(format!("Could not index download: {err:#}"));
                             } else {
                                 saved_assets = true;
                             }
                         }
                         Err(err) => {
-                            progress.failed += 1;
+                            failed += 1;
                             failure = Some(err);
                         }
                     }
-                    let name = progress.name.clone();
-                    let total = progress.total;
-                    let completed = progress.completed;
-                    let failed = progress.failed;
+                    if failure.is_some() {
+                        if let Some(progress) =
+                            self.collection_progress_mut(&collection_id, is_album)
+                        {
+                            progress.failed = failed;
+                        }
+                    }
                     if let Some(message) = failure {
                         self.record_download_failure(label, message);
                     }
+                    let noun = if is_album { "album" } else { "playlist" };
                     self.status = if completed >= total {
                         format!(
-                            "Finished playlist '{name}': {} saved, {failed} failed",
+                            "Finished {noun} '{name}': {} saved, {failed} failed",
                             total.saturating_sub(failed)
                         )
                     } else {
                         format!(
-                            "Downloading playlist '{name}': {completed}/{total} ({failed} failed)"
+                            "Downloading {noun} '{name}': {completed}/{total} ({failed} failed)"
                         )
                     };
                 } else {
@@ -1554,23 +2062,128 @@ impl App {
                     format!("Downloaded {total} tracks from '{name}' for offline listening")
                 };
             }
-            Action::PlayerEndOfTrack if self.playback_mode == PlaybackMode::Online => {
+            Action::AlbumDownloadStarted {
+                id,
+                name,
+                total,
+                uris,
+                members,
+            } => {
+                let progress =
+                    self.album_downloads
+                        .entry(id.clone())
+                        .or_insert_with(|| PlaylistDownload {
+                            name: name.clone(),
+                            ..PlaylistDownload::default()
+                        });
+                progress.name = name.clone();
+                progress.total = total;
+                progress.uris = uris.into_iter().collect();
+                progress.members = members;
+                for uri in &progress.uris {
+                    self.downloading.insert(uri.clone());
+                }
+                self.status = if total == 0 {
+                    format!("All tracks in album '{name}' are already offline")
+                } else {
+                    format!("Downloading album '{name}': 0/{total}")
+                };
+            }
+            Action::AlbumDownloadFinished {
+                id,
+                name,
+                artist,
+                total,
+                failed,
+                members,
+                error,
+            } => {
+                self.album_downloads.remove(&id);
+                if let Some(message) = error {
+                    self.record_download_failure(name, message.clone());
+                    self.set_error(message);
+                    return Ok(());
+                }
+                if let Err(err) = self.downloads.insert_album(&id, &name, &artist, members) {
+                    let message = format!("Could not save offline album: {err:#}");
+                    self.record_download_failure(name, message.clone());
+                    self.set_error(message);
+                    return Ok(());
+                }
+                if self.tab == Tab::Downloads {
+                    self.load_downloaded_tracks();
+                }
+                self.status = if total == 0 {
+                    format!("All tracks in album '{name}' are offline — press Enter to play")
+                } else if failed > 0 {
+                    format!(
+                        "Downloaded {}/{} tracks from '{name}' ({} failed)",
+                        total.saturating_sub(failed),
+                        total,
+                        failed
+                    )
+                } else {
+                    format!("Downloaded {total} tracks from '{name}' for offline listening")
+                };
+            }
+            Action::PlayerEndOfTrack { track_uri }
+                if self.playback_mode == PlaybackMode::Online
+                    && self.player_event_matches(&track_uri) =>
+            {
+                self.position_anchor = None;
                 self.handle_track_end();
             }
-            Action::PlayerEndOfTrack => {}
-            Action::PlayerPlaying(position_ms) if self.playback_mode == PlaybackMode::Online => {
+            Action::PlayerEndOfTrack { .. } => {}
+            Action::PlayerPlaying {
+                position_ms,
+                track_uri,
+                at,
+            } if self.playback_mode == PlaybackMode::Online
+                && self.player_event_matches(&track_uri) =>
+            {
+                let position = Duration::from_millis(u64::from(position_ms));
                 if let Some(np) = &mut self.now_playing {
                     np.playing = true;
-                    np.position = Duration::from_millis(u64::from(position_ms));
+                    np.position = position;
                 }
+                self.anchor_position(position, at);
+                self.sync_lyric_cursor();
             }
-            Action::PlayerPaused(position_ms) if self.playback_mode == PlaybackMode::Online => {
+            Action::PlayerPaused {
+                position_ms,
+                track_uri,
+            } if self.playback_mode == PlaybackMode::Online
+                && self.player_event_matches(&track_uri) =>
+            {
+                let position = Duration::from_millis(u64::from(position_ms));
                 if let Some(np) = &mut self.now_playing {
                     np.playing = false;
-                    np.position = Duration::from_millis(u64::from(position_ms));
+                    np.position = position;
                 }
+                self.position_anchor = None;
+                self.sync_lyric_cursor();
             }
-            Action::PlayerPlaying(_) | Action::PlayerPaused(_) => {}
+            Action::PlayerPosition {
+                position_ms,
+                track_uri,
+                at,
+            } if self.playback_mode == PlaybackMode::Online
+                && self.player_event_matches(&track_uri) =>
+            {
+                let position = Duration::from_millis(u64::from(position_ms));
+                if let Some(np) = &mut self.now_playing {
+                    np.position = position;
+                    if np.playing {
+                        self.anchor_position(position, at);
+                    } else {
+                        self.position_anchor = None;
+                    }
+                }
+                self.sync_lyric_cursor();
+            }
+            Action::PlayerPlaying { .. }
+            | Action::PlayerPaused { .. }
+            | Action::PlayerPosition { .. } => {}
             Action::LyricsLoaded { uri, result } => {
                 self.lyrics_loading = false;
                 match result {
@@ -1627,6 +2240,16 @@ impl App {
                         .iter()
                         .find(|playlist| &playlist.id == id)
                         .and_then(|playlist| playlist.art_url.as_deref()),
+                    CoverArtTarget::Album { id } => self
+                        .albums
+                        .iter()
+                        .find(|album| &album.id == id)
+                        .and_then(|album| album.art_url.as_deref()),
+                    CoverArtTarget::Artist { id } => self
+                        .artists
+                        .iter()
+                        .find(|artist| &artist.id == id)
+                        .and_then(|artist| artist.art_url.as_deref()),
                 };
                 if current != Some(url.as_str()) {
                     return Ok(()); // stale response for a previous item
@@ -1651,6 +2274,8 @@ impl App {
                 match target {
                     CoverArtTarget::Track { .. } => self.art = state,
                     CoverArtTarget::Playlist { .. } => self.playlist_art = state,
+                    CoverArtTarget::Album { .. } => self.album_art = state,
+                    CoverArtTarget::Artist { .. } => self.artist_art = state,
                 }
             }
             Action::MprisPlayPause => self.toggle_play(),
@@ -1837,7 +2462,11 @@ impl App {
                     } else {
                         self.status = format!("Searching for '{query}'...");
                         self.loading = true;
-                        self.search_tracks(query);
+                        match self.tab {
+                            Tab::Albums => self.search_albums(query),
+                            Tab::Artists => self.search_artists(query),
+                            _ => self.search_tracks(query),
+                        }
                     }
                 }
                 KeyCode::Backspace => {
@@ -1918,6 +2547,12 @@ impl App {
                 } else if self.tab == Tab::Playlists {
                     self.load_selected_playlist_cover();
                     self.status = format!("Tab: {}", self.tab.title());
+                } else if self.tab == Tab::Albums {
+                    self.load_selected_album_cover();
+                    self.status = format!("Tab: {}", self.tab.title());
+                } else if self.tab == Tab::Artists {
+                    self.load_selected_artist_image();
+                    self.status = format!("Tab: {}", self.tab.title());
                 } else {
                     self.status = format!("Tab: {}", self.tab.title());
                 }
@@ -1929,6 +2564,8 @@ impl App {
                 self.status = "Search: type query, Enter to submit, Esc to cancel".to_string();
             }
             KeyCode::Enter => match self.tab {
+                Tab::Albums => self.open_selected_album(),
+                Tab::Artists => self.open_selected_artist(),
                 Tab::Queue => self.play_queue_item(),
                 Tab::Lyrics => self.jump_to_lyric(),
                 Tab::Downloads => self.play_downloaded_track(),
@@ -2361,6 +2998,8 @@ impl App {
     /// Length of the list currently rendered on the left side.
     fn list_len(&self) -> usize {
         match self.tab {
+            Tab::Albums => self.albums.len(),
+            Tab::Artists => self.artists.len(),
             Tab::Playlists => self.playlists.len(),
             Tab::Downloads => self.offline_items.len(),
             _ => self.tracks.len(),
@@ -2375,8 +3014,11 @@ impl App {
         let current = self.list_state.selected().unwrap_or(0) as i32;
         let next = (current + delta).clamp(0, len as i32 - 1) as usize;
         self.list_state.select(Some(next));
-        if self.tab == Tab::Playlists {
-            self.load_selected_playlist_cover();
+        match self.tab {
+            Tab::Playlists => self.load_selected_playlist_cover(),
+            Tab::Albums => self.load_selected_album_cover(),
+            Tab::Artists => self.load_selected_artist_image(),
+            _ => {}
         }
     }
 
@@ -2384,8 +3026,11 @@ impl App {
         let len = self.list_len();
         if len > 0 {
             self.list_state.select(Some(index.min(len - 1)));
-            if self.tab == Tab::Playlists {
-                self.load_selected_playlist_cover();
+            match self.tab {
+                Tab::Playlists => self.load_selected_playlist_cover(),
+                Tab::Albums => self.load_selected_album_cover(),
+                Tab::Artists => self.load_selected_artist_image(),
+                _ => {}
             }
         }
     }
@@ -2610,12 +3255,16 @@ impl App {
             np.playing = true;
             np.track.clone()
         };
+        self.position_anchor = None;
         self.lyrics_auto_scroll = true;
         self.lyric_cursor = 0;
         self.sync_lyric_cursor();
         if let Err(err) = self.play_track(&track, Duration::ZERO) {
             self.set_error(format!("Could not repeat track: {err}"));
             return;
+        }
+        if self.playback_mode == PlaybackMode::Online && self.player.is_none() {
+            self.anchor_position(Duration::ZERO, Instant::now());
         }
         self.status = format!("Repeating {}", track.title);
     }
@@ -2763,10 +3412,56 @@ impl App {
         );
     }
 
+    /// Show the selected album's cover image in the Details pane.
+    fn load_selected_album_cover(&mut self) {
+        if self.tab != Tab::Albums {
+            return;
+        }
+        let selected = self
+            .list_state
+            .selected()
+            .and_then(|index| self.albums.get(index))
+            .cloned();
+        let Some(album) = selected else {
+            self.album_art = CoverArt::no_art();
+            return;
+        };
+        self.load_cover_art_url(
+            CoverArtTarget::Album {
+                id: album.id.clone(),
+            },
+            album.art_url.clone(),
+        );
+    }
+
+    /// Show the selected artist's image in the Details pane.
+    fn load_selected_artist_image(&mut self) {
+        if self.tab != Tab::Artists {
+            return;
+        }
+        let selected = self
+            .list_state
+            .selected()
+            .and_then(|index| self.artists.get(index))
+            .cloned();
+        let Some(artist) = selected else {
+            self.artist_art = CoverArt::no_art();
+            return;
+        };
+        self.load_cover_art_url(
+            CoverArtTarget::Artist {
+                id: artist.id.clone(),
+            },
+            artist.art_url.clone(),
+        );
+    }
+
     fn cover_slot(&self, target: &CoverArtTarget) -> &CoverArt {
         match target {
             CoverArtTarget::Track { .. } => &self.art,
             CoverArtTarget::Playlist { .. } => &self.playlist_art,
+            CoverArtTarget::Album { .. } => &self.album_art,
+            CoverArtTarget::Artist { .. } => &self.artist_art,
         }
     }
 
@@ -2774,6 +3469,8 @@ impl App {
         match target {
             CoverArtTarget::Track { .. } => &mut self.art,
             CoverArtTarget::Playlist { .. } => &mut self.playlist_art,
+            CoverArtTarget::Album { .. } => &mut self.album_art,
+            CoverArtTarget::Artist { .. } => &mut self.artist_art,
         }
     }
 
@@ -2854,7 +3551,11 @@ impl App {
                     self.offline_track_index = track_index.unwrap_or(self.offline_track_index);
                     self.tracks.get(self.offline_track_index).cloned()
                 }
-                Some(OfflineItem::Playlist { .. } | OfflineItem::AllTracks) => {
+                Some(
+                    OfflineItem::Album { .. }
+                    | OfflineItem::Playlist { .. }
+                    | OfflineItem::AllTracks,
+                ) => {
                     self.offline_track_index = 0;
                     self.tracks.first().cloned()
                 }
@@ -2875,6 +3576,9 @@ impl App {
             playing,
             volume,
         });
+        // Wait for librespot's Playing event before advancing the online
+        // clock; demo mode has no player event and starts its own clock here.
+        self.position_anchor = None;
         // A new track starts with lyrics following playback again.
         self.lyrics_auto_scroll = true;
         self.lyric_cursor = 0;
@@ -2890,6 +3594,9 @@ impl App {
                 } else if self.player.is_some() {
                     format!("Playing: {}", track.title)
                 } else {
+                    if playing {
+                        self.anchor_position(Duration::ZERO, Instant::now());
+                    }
                     format!("Selected: {} (demo mode)", track.title)
                 };
             }
@@ -2915,9 +3622,18 @@ impl App {
 
     /// Idempotent play/pause used by both keybindings and MPRIS controls.
     fn set_playing(&mut self, playing: bool) {
+        let now = Instant::now();
+        let anchored = if self.playback_mode == PlaybackMode::Online
+            && self.now_playing.as_ref().is_some_and(|np| np.playing)
+        {
+            self.anchored_position(now)
+        } else {
+            None
+        };
         let Some(np) = &mut self.now_playing else {
             return;
         };
+        let current_position = anchored.unwrap_or(np.position);
         // An offline sink is empty after the file ends, so pressing play again
         // has to reload the file rather than just unpause an empty queue.
         let restart = playing
@@ -2930,7 +3646,15 @@ impl App {
             return;
         }
         np.playing = playing;
+        np.position = current_position;
         let track = np.track.clone();
+        if self.playback_mode == PlaybackMode::Online {
+            if playing {
+                self.anchor_position(current_position, now);
+            } else {
+                self.position_anchor = None;
+            }
+        }
         if restart {
             if let Err(err) = self.play_track(&track, Duration::ZERO) {
                 if let Some(np) = &mut self.now_playing {
@@ -3031,17 +3755,39 @@ impl App {
 
     /// Absolute seek to a position within the current track.
     fn seek_to(&mut self, position_ms: u64) {
-        let Some(np) = &mut self.now_playing else {
-            return;
+        let now = Instant::now();
+        let (target, playing) = {
+            let Some(np) = &self.now_playing else {
+                return;
+            };
+            (
+                Duration::from_millis(position_ms).min(np.track.duration),
+                np.playing,
+            )
         };
-        let target = Duration::from_millis(position_ms).min(np.track.duration);
-        np.position = target;
+        let mut actual_position = None;
         if self.playback_mode == PlaybackMode::Offline {
             if let Some(player) = &self.offline_player {
-                player.seek(target);
+                if let Err(err) = player.seek(target) {
+                    self.set_error(format!("Seek failed: {err:#}"));
+                    return;
+                }
+                // rodio reports where the decoder actually landed.
+                actual_position = Some(player.position());
             }
         } else if let Some(player) = &self.player {
             player.seek(target.as_millis().min(u128::from(u32::MAX)) as u32);
+        }
+        if self.playback_mode == PlaybackMode::Online && playing {
+            self.position_anchor = Some(PositionAnchor {
+                at: now,
+                position: target,
+            });
+        } else {
+            self.position_anchor = None;
+        }
+        if let Some(np) = &mut self.now_playing {
+            np.position = actual_position.unwrap_or(target);
         }
         self.status = format!("Seek to {:.0}s", target.as_secs_f64());
         self.sync_lyric_cursor();
@@ -3120,6 +3866,62 @@ impl App {
                 .await
                 .map_err(|err| format!("{err:#}"));
             let _ = tx.send(Action::SearchResults(result)).await;
+        });
+    }
+
+    pub fn search_albums(&self, query: String) {
+        let Some(client) = self.api_client.clone() else {
+            self.send(Action::Error("Not signed in".to_string()));
+            return;
+        };
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = crate::api::search_albums(&client, &query)
+                .await
+                .map_err(|err| format!("{err:#}"));
+            let _ = tx.send(Action::AlbumSearchResults(result)).await;
+        });
+    }
+
+    pub fn search_artists(&self, query: String) {
+        let Some(client) = self.api_client.clone() else {
+            self.send(Action::Error("Not signed in".to_string()));
+            return;
+        };
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = crate::api::search_artists(&client, &query)
+                .await
+                .map_err(|err| format!("{err:#}"));
+            let _ = tx.send(Action::ArtistSearchResults(result)).await;
+        });
+    }
+
+    pub fn load_album_details(&self, album_id: String) {
+        let Some(client) = self.api_client.clone() else {
+            self.send(Action::Error("Not signed in".to_string()));
+            return;
+        };
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = crate::api::album_details(&client, &album_id)
+                .await
+                .map_err(|err| format!("{err:#}"));
+            let _ = tx.send(Action::AlbumDetailsLoaded(result)).await;
+        });
+    }
+
+    pub fn load_artist_details(&self, artist_id: String) {
+        let Some(client) = self.api_client.clone() else {
+            self.send(Action::Error("Not signed in".to_string()));
+            return;
+        };
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = crate::api::artist_details(&client, &artist_id)
+                .await
+                .map_err(|err| format!("{err:#}"));
+            let _ = tx.send(Action::ArtistDetailsLoaded(result)).await;
         });
     }
 
@@ -3885,7 +4687,8 @@ mod tests {
     #[tokio::test]
     async fn track_end_honours_repeat_mode() {
         let mut app = playing_app_at(4);
-        app.handle_action(Action::PlayerEndOfTrack).unwrap();
+        app.handle_action(Action::PlayerEndOfTrack { track_uri: None })
+            .unwrap();
         assert!(!app.now_playing.as_ref().unwrap().playing);
         assert_eq!(
             app.now_playing.as_ref().unwrap().track.uri,
@@ -3895,7 +4698,8 @@ mod tests {
 
         let mut app = playing_app_at(4);
         app.set_repeat(RepeatMode::All);
-        app.handle_action(Action::PlayerEndOfTrack).unwrap();
+        app.handle_action(Action::PlayerEndOfTrack { track_uri: None })
+            .unwrap();
         assert_eq!(
             app.now_playing.as_ref().unwrap().track.uri,
             "spotify:track:test0"
@@ -3904,7 +4708,8 @@ mod tests {
 
         let mut app = playing_app_at(2);
         app.set_repeat(RepeatMode::One);
-        app.handle_action(Action::PlayerEndOfTrack).unwrap();
+        app.handle_action(Action::PlayerEndOfTrack { track_uri: None })
+            .unwrap();
         assert_eq!(
             app.now_playing.as_ref().unwrap().track.uri,
             "spotify:track:test2"
@@ -4328,10 +5133,266 @@ mod tests {
             volume: 60,
         });
 
-        app.handle_action(Action::PlayerEndOfTrack).unwrap();
+        app.handle_action(Action::PlayerEndOfTrack { track_uri: None })
+            .unwrap();
         assert_eq!(app.list_state.selected(), Some(first));
         assert_eq!(app.now_playing.as_ref().unwrap().track.uri, first_uri);
         assert!(app.now_playing.as_ref().unwrap().playing);
         assert!(app.status.contains("Repeating playlist 'Road Trip'"));
+    }
+
+    fn demo_album(id: &str, name: &str) -> Album {
+        Album {
+            id: id.to_string(),
+            name: name.to_string(),
+            artist: "Artist".to_string(),
+            artists: vec!["Artist".to_string()],
+            album_type: Some("album".to_string()),
+            release_date: Some("2026-01-01".to_string()),
+            track_count: Some(3),
+            art_url: None,
+        }
+    }
+
+    fn demo_artist(id: &str, name: &str) -> Artist {
+        Artist {
+            id: id.to_string(),
+            name: name.to_string(),
+            genres: vec!["rock".to_string(), "indie".to_string()],
+            art_url: None,
+        }
+    }
+
+    #[test]
+    fn album_and_artist_tabs_keep_separate_lists() {
+        let mut app = test_app();
+        app.tab = Tab::Albums;
+        app.handle_action(Action::AlbumSearchResults(Ok(vec![demo_album(
+            "album-1",
+            "Album One",
+        )])))
+        .unwrap();
+        assert_eq!(app.albums.len(), 1);
+        assert_eq!(app.list_len(), 1);
+        assert!(app.status.contains("1 albums"));
+
+        app.tab = Tab::Artists;
+        app.handle_action(Action::ArtistSearchResults(Ok(vec![demo_artist(
+            "artist-1",
+            "Artist One",
+        )])))
+        .unwrap();
+        assert_eq!(app.artists.len(), 1);
+        assert_eq!(app.list_len(), 1);
+        assert!(app.status.contains("1 artists"));
+
+        app.tab = Tab::Albums;
+        assert_eq!(app.list_len(), 1);
+    }
+
+    #[test]
+    fn album_and_artist_details_load_into_the_right_views() {
+        let mut app = test_app();
+        let album = demo_album("album-1", "Album One");
+        let artist = demo_artist("artist-1", "Artist One");
+
+        app.handle_action(Action::AlbumDetailsLoaded(Ok((
+            album.clone(),
+            demo_tracks(),
+        ))))
+        .unwrap();
+        assert_eq!(app.tab, Tab::Search);
+        assert_eq!(app.current_album_id.as_deref(), Some("album-1"));
+        assert_eq!(app.tracks.len(), 5);
+        assert!(app.status.contains("Album One"));
+
+        app.handle_action(Action::ArtistDetailsLoaded(Ok((artist, vec![album]))))
+            .unwrap();
+        assert_eq!(app.tab, Tab::Albums);
+        assert_eq!(app.current_artist_id.as_deref(), Some("artist-1"));
+        assert_eq!(app.albums.len(), 1);
+        assert!(app.status.contains("Artist One"));
+    }
+
+    #[test]
+    fn download_key_on_albums_tab_requires_sign_in() {
+        let mut app = test_app();
+        app.tab = Tab::Albums;
+        app.albums = vec![demo_album("album-1", "Album One")];
+        app.list_state.select(Some(0));
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.status.contains("Sign in to download albums"));
+        assert!(app.album_downloads.is_empty());
+    }
+
+    #[test]
+    fn album_download_actions_track_progress_and_persist_the_group() {
+        let (mut app, dir) = offline_test_app("album-download");
+        let tracks = demo_tracks();
+        let mut uris = Vec::new();
+        for (index, track) in tracks.iter().enumerate() {
+            let file = format!("000000000000000{index}.ogg");
+            std::fs::write(dir.join(&file), b"audio").expect("write audio");
+            app.handle_action(Action::DownloadFinished {
+                uri: track.uri.clone(),
+                result: Ok(stored_entry(track, &file)),
+            })
+            .unwrap();
+            uris.push(track.uri.clone());
+        }
+
+        app.handle_action(Action::AlbumDownloadStarted {
+            id: "album-1".to_string(),
+            name: "Album One".to_string(),
+            total: 2,
+            uris: uris[..2].to_vec(),
+            members: uris.clone(),
+        })
+        .unwrap();
+        assert_eq!(app.album_downloads["album-1"].total, 2);
+        assert!(app.status.contains("Downloading album 'Album One'"));
+
+        for (index, uri) in uris[..2].iter().enumerate() {
+            app.handle_action(Action::DownloadFinished {
+                uri: uri.clone(),
+                result: Ok(stored_entry(
+                    &tracks[index],
+                    &format!("000000000000000{index}.ogg"),
+                )),
+            })
+            .unwrap();
+        }
+        assert_eq!(app.album_downloads["album-1"].completed, 2);
+
+        app.handle_action(Action::AlbumDownloadFinished {
+            id: "album-1".to_string(),
+            name: "Album One".to_string(),
+            artist: "Artist".to_string(),
+            total: 2,
+            failed: 0,
+            members: uris.clone(),
+            error: None,
+        })
+        .unwrap();
+        assert!(app.album_downloads.is_empty());
+        assert_eq!(app.downloads.album_tracks("album-1").len(), 5);
+        assert!(app.status.contains("Downloaded 2 tracks from 'Album One'"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn offline_album_row_loads_saved_tracks_as_a_playable_queue() {
+        let (mut app, dir) = offline_test_app("offline-album");
+        let tracks = demo_tracks();
+        let mut uris = Vec::new();
+        for (index, track) in tracks.iter().take(3).enumerate() {
+            let file = format!("000000000000000{index}.ogg");
+            std::fs::write(dir.join(&file), b"audio").expect("write audio");
+            app.handle_action(Action::DownloadFinished {
+                uri: track.uri.clone(),
+                result: Ok(stored_entry(track, &file)),
+            })
+            .unwrap();
+            uris.push(track.uri.clone());
+        }
+        app.downloads
+            .insert_album("album-1", "Album One", "Artist", uris.clone())
+            .unwrap();
+        app.load_downloaded_tracks();
+        let row = app
+            .offline_items
+            .iter()
+            .position(|item| matches!(item, OfflineItem::Album { id, .. } if id == "album-1"))
+            .expect("album row");
+        app.list_state.select(Some(row));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.tracks.len(), 3);
+        assert_eq!(
+            app.offline_queue,
+            Some(OfflineQueue::Album {
+                id: "album-1".to_string(),
+                name: "Album One".to_string(),
+            })
+        );
+        assert_eq!(
+            app.now_playing.as_ref().map(|np| np.track.uri.clone()),
+            Some(uris[0].clone())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn online_progress_uses_audio_anchor_and_ignores_stale_events() {
+        let mut app = test_app();
+        let tracks = demo_tracks();
+        let uri = tracks[0].uri.clone();
+        app.set_tracks(tracks);
+        app.now_playing = Some(NowPlaying {
+            track: app.tracks[0].clone(),
+            position: Duration::ZERO,
+            playing: true,
+            volume: 60,
+        });
+
+        let at = Instant::now() - Duration::from_secs(2);
+        app.handle_action(Action::PlayerPosition {
+            position_ms: 10_000,
+            track_uri: Some(uri.clone()),
+            at,
+        })
+        .unwrap();
+        app.handle_action(Action::Tick).unwrap();
+        let position = app.now_playing.as_ref().unwrap().position;
+        assert!(position >= Duration::from_secs(12));
+        assert!(position < Duration::from_secs(13));
+
+        // Five queued ticks must not add 5 * 250ms to the audio clock.
+        for _ in 0..5 {
+            app.handle_action(Action::Tick).unwrap();
+        }
+        let after_burst = app.now_playing.as_ref().unwrap().position;
+        assert!(after_burst.saturating_sub(position) < Duration::from_millis(100));
+
+        app.handle_action(Action::PlayerPlaying {
+            position_ms: 99_000,
+            track_uri: Some("spotify:track:some-other-track".to_string()),
+            at: Instant::now(),
+        })
+        .unwrap();
+        assert_eq!(app.now_playing.as_ref().unwrap().position, after_burst);
+
+        // An authoritative correction re-anchors instead of leaving the old
+        // extrapolation in place.
+        app.handle_action(Action::PlayerPosition {
+            position_ms: 20_000,
+            track_uri: Some(uri),
+            at: Instant::now(),
+        })
+        .unwrap();
+        app.handle_action(Action::Tick).unwrap();
+        let corrected = app.now_playing.as_ref().unwrap().position;
+        assert!(corrected >= Duration::from_secs(20));
+        assert!(corrected < Duration::from_secs(21));
+    }
+
+    #[test]
+    fn player_without_audio_anchor_does_not_invent_progress() {
+        let mut app = test_app();
+        app.set_tracks(demo_tracks());
+        app.now_playing = Some(NowPlaying {
+            track: app.tracks[0].clone(),
+            position: Duration::from_secs(3),
+            playing: true,
+            volume: 60,
+        });
+        for _ in 0..10 {
+            app.handle_action(Action::Tick).unwrap();
+        }
+        assert_eq!(
+            app.now_playing.as_ref().unwrap().position,
+            Duration::from_secs(3)
+        );
     }
 }

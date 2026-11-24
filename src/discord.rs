@@ -193,8 +193,7 @@ fn run(client_id: String, mut update_rx: watch::Receiver<DiscordUpdate>) {
                 DiscordUpdate::State(state) if enabled => {
                     let signature = presence_signature(&state);
                     let should_send = last_signature.as_ref() != Some(&signature)
-                        || (state.playing
-                            && last_sent_at.elapsed() >= Duration::from_secs(15));
+                        || (state.playing && last_sent_at.elapsed() >= Duration::from_secs(15));
                     if should_send {
                         if apply_state(
                             &mut client,
