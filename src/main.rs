@@ -67,8 +67,12 @@ enum Command {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                // Symphonia's MP3 demuxer logs one warning per bogus frame sync.
+                // Encrypted bytes fed to it by a failed key request can produce
+                // thousands of these, drowning out the actual error in the TUI.
+                tracing_subscriber::EnvFilter::new("warn,symphonia_bundle_mp3::demuxer=error")
+            }),
         )
         .init();
 
@@ -323,52 +327,75 @@ async fn run_tui(
                 |track_id: &librespot_core::spotify_uri::SpotifyUri| track_id.to_uri().ok();
             while let Some(event) = events.recv().await {
                 let action = match event {
-                    PlayerEvent::EndOfTrack { track_id, .. } => {
-                        Some(ui::Action::PlayerEndOfTrack {
-                            track_uri: track_uri(&track_id),
-                        })
-                    }
-                    PlayerEvent::Playing {
-                        position_ms,
+                    PlayerEvent::Loading {
+                        play_request_id,
                         track_id,
                         ..
+                    } => Some(ui::Action::PlayerLoading {
+                        play_request_id,
+                        track_uri: track_uri(&track_id),
+                    }),
+                    PlayerEvent::PlayRequestIdChanged { play_request_id } => {
+                        Some(ui::Action::PlayerLoading {
+                            play_request_id,
+                            track_uri: None,
+                        })
+                    }
+                    PlayerEvent::EndOfTrack {
+                        play_request_id,
+                        track_id,
+                    } => Some(ui::Action::PlayerEndOfTrack {
+                        play_request_id,
+                        track_uri: track_uri(&track_id),
+                    }),
+                    PlayerEvent::Playing {
+                        play_request_id,
+                        position_ms,
+                        track_id,
                     } => Some(ui::Action::PlayerPlaying {
+                        play_request_id,
                         position_ms,
                         track_uri: track_uri(&track_id),
                         at: std::time::Instant::now(),
                     }),
                     PlayerEvent::Paused {
+                        play_request_id,
                         position_ms,
                         track_id,
-                        ..
                     } => Some(ui::Action::PlayerPaused {
+                        play_request_id,
                         position_ms,
                         track_uri: track_uri(&track_id),
                     }),
                     // librespot emits these on underruns, seeks and periodic
                     // updates. They are authoritative position corrections.
                     PlayerEvent::PositionCorrection {
+                        play_request_id,
                         position_ms,
                         track_id,
-                        ..
                     }
                     | PlayerEvent::PositionChanged {
+                        play_request_id,
                         position_ms,
                         track_id,
-                        ..
                     }
                     | PlayerEvent::Seeked {
+                        play_request_id,
                         position_ms,
                         track_id,
-                        ..
                     } => Some(ui::Action::PlayerPosition {
+                        play_request_id,
                         position_ms,
                         track_uri: track_uri(&track_id),
                         at: std::time::Instant::now(),
                     }),
-                    PlayerEvent::Unavailable { .. } => Some(ui::Action::Error(
-                        "Track unavailable for playback".to_string(),
-                    )),
+                    PlayerEvent::Unavailable {
+                        play_request_id,
+                        track_id,
+                    } => Some(ui::Action::PlayerUnavailable {
+                        play_request_id,
+                        track_uri: track_uri(&track_id),
+                    }),
                     _ => None,
                 };
                 if let Some(action) = action {

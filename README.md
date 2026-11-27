@@ -47,8 +47,15 @@ library, play music, and read synced lyrics, all from the terminal.
   English translation (`t`), cached per track
 - Playback progress and lyric highlighting re-anchor on librespot's reported
   position, including seeks and corrections, instead of accumulating 250 ms UI
-  ticks; stale events from skipped tracks are ignored. Offline seeks report
-  failures instead of silently moving the clock
+  ticks; stale events from skipped tracks are ignored (including repeat loads of
+  the same URI). Offline seeks report failures instead of silently moving the
+  clock
+- Online playback checks the audio key (with backoff) before loading a track.
+  librespot 0.8 otherwise falls back to decoding encrypted MP3 bytes, which
+  spams "skipping junk" warnings and produces no sound. Failed or stalled loads
+  stop the optimistic playing state, retry once, and can be restarted with Space
+  instead of leaving the app stuck; streaming buffers are also tuned for high
+  latency links
 - Downloads also save cover art, lyrics and an English translation when
   available, so downloaded tracks keep their artwork and translated lyrics in
   `--offline` mode

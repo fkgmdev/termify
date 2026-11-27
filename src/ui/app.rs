@@ -13,6 +13,14 @@ use tokio::sync::mpsc::Sender;
 use crate::art::{self, ArtStatus, CoverArt};
 use crate::offline::{self, DownloadEntry, DownloadStore, OfflinePlayer};
 
+/// Give a load this long before declaring it stuck. librespot's CDN wait can be
+/// up to two minutes, but no audio after 25 seconds means the UI should stop
+/// pretending the track is playing and offer a retry.
+const LOAD_WATCHDOG: Duration = Duration::from_secs(25);
+/// Key preflight already retries four times; one extra full load covers the
+/// case where librespot's own single key request loses a race.
+const MAX_LOAD_ATTEMPTS: u8 = 2;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Search,
@@ -452,27 +460,53 @@ pub enum Action {
         members: Vec<String>,
         error: Option<String>,
     },
-    /// librespot events carry the URI and the time the position was sampled.
-    /// Both are needed to ignore stale events and avoid turning event lag into
-    /// a permanent lyric offset.
+    /// librespot events carry the URI, play request ID and the time the position
+    /// was sampled. All three are needed to ignore stale events and avoid
+    /// turning event lag into a permanent lyric offset or an extra track skip.
+    PlayerLoading {
+        play_request_id: u64,
+        track_uri: Option<String>,
+    },
     PlayerEndOfTrack {
+        play_request_id: u64,
         track_uri: Option<String>,
     },
     PlayerPlaying {
+        play_request_id: u64,
         position_ms: u32,
         track_uri: Option<String>,
         at: Instant,
     },
     PlayerPaused {
+        play_request_id: u64,
         position_ms: u32,
         track_uri: Option<String>,
     },
     /// Authoritative position from a librespot correction, periodic update, or
     /// completed seek. Re-anchors the UI clock instead of extrapolating ticks.
     PlayerPosition {
+        play_request_id: u64,
         position_ms: u32,
         track_uri: Option<String>,
         at: Instant,
+    },
+    /// A load failed inside librespot. Unlike a generic Error this carries the
+    /// track, so the optimistic "playing" state can be repaired and retried.
+    PlayerUnavailable {
+        play_request_id: u64,
+        track_uri: Option<String>,
+    },
+    /// Background audio-key preflight finished. The generation is checked so a
+    /// slow response for an old selection cannot start the wrong track.
+    StartOnlinePlayback {
+        generation: u64,
+        uri: String,
+        position_ms: u32,
+    },
+    OnlinePlaybackFailed {
+        generation: u64,
+        uri: String,
+        message: String,
     },
     LyricsLoaded {
         uri: String,
@@ -564,6 +598,17 @@ pub struct App {
     /// never from a count of 250ms ticks.
     position_anchor: Option<PositionAnchor>,
     offline_end_handled: bool,
+    /// Incremented for every online load so a late key preflight can be ignored.
+    play_generation: u64,
+    /// When the current online load started, for the stuck-load watchdog.
+    load_started: Option<Instant>,
+    /// Bounded retries before reporting a load as permanently unavailable.
+    load_attempts: u8,
+    /// Most recent librespot play request, used to discard stale events.
+    active_play_request: Option<u64>,
+    /// True when the UI is playing but librespot needs a fresh `load` before it
+    /// can make sound again (failed load, watchdog, or end of the queue).
+    needs_reload: bool,
     pub lyrics: std::collections::HashMap<String, crate::lyrics::Lyrics>,
     pub lyrics_loading: bool,
     /// Selected lyric line on the Lyrics tab; Enter seeks to its timestamp.
@@ -695,6 +740,11 @@ impl App {
             playback_mode: PlaybackMode::Online,
             position_anchor: None,
             offline_end_handled: false,
+            play_generation: 0,
+            load_started: None,
+            load_attempts: 0,
+            active_play_request: None,
+            needs_reload: false,
             lyrics: std::collections::HashMap::new(),
             no_lyrics: HashSet::new(),
             lyrics_cache_file: options.lyrics_cache_file,
@@ -1615,14 +1665,82 @@ impl App {
         })
     }
 
-    /// librespot events can arrive after the user already skipped tracks.
-    fn player_event_matches(&self, track_uri: &Option<String>) -> bool {
+    /// librespot events can arrive after the user already skipped tracks. The
+    /// play request ID distinguishes two loads of the same URI (repeat-one).
+    fn player_event_matches(&self, track_uri: &Option<String>, play_request_id: u64) -> bool {
+        if self
+            .active_play_request
+            .is_some_and(|active| active != play_request_id)
+        {
+            return false;
+        }
         match track_uri {
             None => true,
             Some(uri) => self
                 .now_playing
                 .as_ref()
                 .is_some_and(|np| np.track.uri == *uri),
+        }
+    }
+
+    /// Start an online load only after a key preflight succeeds. librespot 0.8
+    /// falls back to decoding encrypted bytes when its own 1.5-second key
+    /// request times out, which produces "skipping junk" MP3 warnings and no
+    /// sound. The whole check runs off the UI thread so the TUI stays responsive.
+    fn start_online_load(&mut self, uri: &str, position: Duration) {
+        let Some(player) = self.player.clone() else {
+            return;
+        };
+        self.play_generation = self.play_generation.wrapping_add(1);
+        let generation = self.play_generation;
+        self.needs_reload = false;
+        self.load_started = Some(Instant::now());
+        self.status = "Preparing audio…".to_string();
+        let tx = self.tx.clone();
+        let uri = uri.to_string();
+        let position_ms = position.as_millis().min(u128::from(u32::MAX)) as u32;
+        tokio::spawn(async move {
+            let action = match crate::player::preflight_audio_key(&player.session, &uri).await {
+                Ok(()) => Action::StartOnlinePlayback {
+                    generation,
+                    uri,
+                    position_ms,
+                },
+                Err(err) => Action::OnlinePlaybackFailed {
+                    generation,
+                    uri,
+                    message: format!("{err:#}"),
+                },
+            };
+            let _ = tx.send(action).await;
+        });
+    }
+
+    /// Repair the optimistic "playing" state after a failed or stuck load and
+    /// retry once. Without this, librespot sits in `Loading` with a terminated
+    /// loader while the UI keeps showing a playing track forever.
+    fn playback_failed(&mut self, message: String, retry: bool) {
+        self.load_started = None;
+        self.position_anchor = None;
+        if let Some(np) = &mut self.now_playing {
+            np.playing = false;
+        }
+        if let Some(player) = &self.player {
+            player.stop();
+        }
+        if retry && self.load_attempts < MAX_LOAD_ATTEMPTS {
+            self.load_attempts += 1;
+            if let Some(np) = &self.now_playing {
+                let uri = np.track.uri.clone();
+                self.start_online_load(&uri, Duration::ZERO);
+            }
+            self.status = format!(
+                "{message} — retrying ({}/{MAX_LOAD_ATTEMPTS})",
+                self.load_attempts
+            );
+        } else {
+            self.needs_reload = true;
+            self.set_error(message);
         }
     }
 
@@ -1677,6 +1795,21 @@ impl App {
                 }
                 if ended && !self.offline_end_handled {
                     self.handle_track_end();
+                }
+                // A librespot load that never yields audio leaves the player in
+                // `Loading` with no further events. Don't leave the UI stuck in
+                // a fake playing state until the user finds the right key.
+                if self.playback_mode == PlaybackMode::Online
+                    && !self.needs_reload
+                    && self.now_playing.as_ref().is_some_and(|np| np.playing)
+                    && self
+                        .load_started
+                        .is_some_and(|start| now.saturating_duration_since(start) > LOAD_WATCHDOG)
+                {
+                    self.playback_failed(
+                        "Audio did not start — network may be too slow".to_string(),
+                        true,
+                    );
                 }
                 self.sync_lyric_cursor();
             }
@@ -2126,21 +2259,42 @@ impl App {
                     format!("Downloaded {total} tracks from '{name}' for offline listening")
                 };
             }
-            Action::PlayerEndOfTrack { track_uri }
-                if self.playback_mode == PlaybackMode::Online
-                    && self.player_event_matches(&track_uri) =>
+            Action::PlayerLoading {
+                play_request_id,
+                track_uri,
+            } if self.playback_mode == PlaybackMode::Online
+                && self.player_event_matches(&track_uri, play_request_id) =>
+            {
+                self.active_play_request = Some(play_request_id);
+                if self.load_started.is_none() {
+                    self.load_started = Some(Instant::now());
+                }
+                self.status = "Loading audio…".to_string();
+            }
+            Action::PlayerLoading { .. } => {}
+            Action::PlayerEndOfTrack {
+                play_request_id,
+                track_uri,
+            } if self.playback_mode == PlaybackMode::Online
+                && self.player_event_matches(&track_uri, play_request_id) =>
             {
                 self.position_anchor = None;
                 self.handle_track_end();
             }
             Action::PlayerEndOfTrack { .. } => {}
             Action::PlayerPlaying {
+                play_request_id,
                 position_ms,
                 track_uri,
                 at,
             } if self.playback_mode == PlaybackMode::Online
-                && self.player_event_matches(&track_uri) =>
+                && self.player_event_matches(&track_uri, play_request_id) =>
             {
+                // Audio is really flowing: stop the watchdog and clear any
+                // pending retry from an earlier failed load.
+                self.load_started = None;
+                self.load_attempts = 0;
+                self.needs_reload = false;
                 let position = Duration::from_millis(u64::from(position_ms));
                 if let Some(np) = &mut self.now_playing {
                     np.playing = true;
@@ -2150,10 +2304,11 @@ impl App {
                 self.sync_lyric_cursor();
             }
             Action::PlayerPaused {
+                play_request_id,
                 position_ms,
                 track_uri,
             } if self.playback_mode == PlaybackMode::Online
-                && self.player_event_matches(&track_uri) =>
+                && self.player_event_matches(&track_uri, play_request_id) =>
             {
                 let position = Duration::from_millis(u64::from(position_ms));
                 if let Some(np) = &mut self.now_playing {
@@ -2164,11 +2319,12 @@ impl App {
                 self.sync_lyric_cursor();
             }
             Action::PlayerPosition {
+                play_request_id,
                 position_ms,
                 track_uri,
                 at,
             } if self.playback_mode == PlaybackMode::Online
-                && self.player_event_matches(&track_uri) =>
+                && self.player_event_matches(&track_uri, play_request_id) =>
             {
                 let position = Duration::from_millis(u64::from(position_ms));
                 if let Some(np) = &mut self.now_playing {
@@ -2181,6 +2337,54 @@ impl App {
                 }
                 self.sync_lyric_cursor();
             }
+            Action::PlayerUnavailable {
+                play_request_id,
+                track_uri,
+            } if self.playback_mode == PlaybackMode::Online
+                && self.player_event_matches(&track_uri, play_request_id) =>
+            {
+                self.playback_failed("Track unavailable for playback".to_string(), true);
+            }
+            Action::PlayerUnavailable { .. } => {}
+            Action::StartOnlinePlayback {
+                generation,
+                uri,
+                position_ms,
+            } if generation == self.play_generation => {
+                // The user may have paused while the key was being checked;
+                // don't start audio against their wishes.
+                let start_playing = self.now_playing.as_ref().is_some_and(|np| np.playing);
+                match self.player.clone() {
+                    Some(player) => {
+                        let result = if start_playing {
+                            player.play_uri_at(&uri, position_ms)
+                        } else {
+                            player.play_uri_at_paused(&uri, position_ms)
+                        };
+                        match result {
+                            Ok(()) => self.status = format!("Starting audio: {uri}"),
+                            Err(err) => {
+                                self.playback_failed(
+                                    format!("Could not start playback: {err:#}"),
+                                    false,
+                                );
+                            }
+                        }
+                    }
+                    None => {
+                        self.playback_failed("Playback is not connected".to_string(), false);
+                    }
+                }
+            }
+            Action::StartOnlinePlayback { .. } => {}
+            Action::OnlinePlaybackFailed {
+                generation,
+                uri,
+                message,
+            } if generation == self.play_generation => {
+                self.playback_failed(format!("Could not play {uri}: {message}"), false);
+            }
+            Action::OnlinePlaybackFailed { .. } => {}
             Action::PlayerPlaying { .. }
             | Action::PlayerPaused { .. }
             | Action::PlayerPosition { .. } => {}
@@ -3193,8 +3397,16 @@ impl App {
         }
         let at_last = self.play_position() + 1 >= self.play_order.len().max(1);
         if at_last && self.repeat == RepeatMode::Off {
+            if self.playback_mode == PlaybackMode::Online {
+                // `pause()` is invalid in librespot's EndOfTrack state; stop it
+                // so a later play() can be replaced by a fresh load.
+                if let Some(player) = &self.player {
+                    player.stop();
+                }
+                self.needs_reload = true;
+            }
             self.set_playing(false);
-            self.status = "End of queue — press n or enable repeat with r".to_string();
+            self.status = "End of queue — press Space or n to play again".to_string();
             return;
         }
         let was_playing = self.now_playing.as_ref().is_some_and(|np| np.playing);
@@ -3587,12 +3799,14 @@ impl App {
         self.queue_cursor = self.play_position();
 
         let was_online = self.playback_mode == PlaybackMode::Online;
+        // A deliberate track change starts a fresh retry budget.
+        self.load_attempts = 0;
         match self.play_track(&track, Duration::ZERO) {
             Ok(()) => {
                 self.status = if self.playback_mode == PlaybackMode::Offline {
                     format!("Playing offline copy: {}", track.title)
                 } else if self.player.is_some() {
-                    format!("Playing: {}", track.title)
+                    format!("Preparing: {}", track.title)
                 } else {
                     if playing {
                         self.anchor_position(Duration::ZERO, Instant::now());
@@ -3642,13 +3856,17 @@ impl App {
                 .offline_player
                 .as_ref()
                 .is_some_and(OfflinePlayer::is_finished);
-        if np.playing == playing && !restart {
+        // After a failed load, after the watchdog, or at the end of the queue,
+        // librespot cannot be unpaused into `Loading`/`EndOfTrack`; it needs a
+        // fresh `load` command with a verified audio key.
+        let reload = playing && self.playback_mode == PlaybackMode::Online && self.needs_reload;
+        if np.playing == playing && !restart && !reload {
             return;
         }
         np.playing = playing;
         np.position = current_position;
         let track = np.track.clone();
-        if self.playback_mode == PlaybackMode::Online {
+        if self.playback_mode == PlaybackMode::Online && !reload {
             if playing {
                 self.anchor_position(current_position, now);
             } else {
@@ -3663,6 +3881,9 @@ impl App {
                 self.set_error(format!("Could not restart offline track: {err:#}"));
                 return;
             }
+        } else if reload {
+            self.load_attempts = 0;
+            self.start_online_load(&track.uri, current_position);
         } else if self.playback_mode == PlaybackMode::Offline {
             if let Some(player) = &self.offline_player {
                 if playing {
@@ -3678,7 +3899,13 @@ impl App {
                 player.pause();
             }
         }
-        self.status = if playing { "Playing" } else { "Paused" }.to_string();
+        self.status = if reload {
+            format!("Preparing: {}", track.title)
+        } else if playing {
+            "Playing".to_string()
+        } else {
+            "Paused".to_string()
+        };
     }
 
     /// Position of the selected track in the current playback order.
@@ -3835,20 +4062,37 @@ impl App {
         if let Some(entry) = self.downloads.get(&track.uri).cloned() {
             let path = self.downloads.audio_path(&entry);
             if self.offline_player.is_none() {
-                self.offline_player = Some(OfflinePlayer::new()?);
+                match OfflinePlayer::new() {
+                    Ok(player) => self.offline_player = Some(player),
+                    Err(err) if self.player.is_some() => {
+                        tracing::warn!("No local audio device; streaming instead: {err:#}");
+                    }
+                    Err(err) => return Err(err),
+                }
             }
-            let player = self.offline_player.as_ref().expect("offline player");
-            player.play_file(&path, position)?;
-            player.set_volume(volume);
-            self.playback_mode = PlaybackMode::Offline;
-            self.offline_end_handled = false;
-            return Ok(());
+            if let Some(player) = self.offline_player.as_ref() {
+                match player.play_file(&path, position) {
+                    Ok(()) => {
+                        player.set_volume(volume);
+                        self.playback_mode = PlaybackMode::Offline;
+                        self.offline_end_handled = false;
+                        return Ok(());
+                    }
+                    // The index can still hold a file deleted after startup or
+                    // one that fails to decode. A signed-in session can play
+                    // the track online instead of leaving it permanently stuck.
+                    Err(err) if self.player.is_some() => {
+                        tracing::warn!(
+                            "Could not play downloaded copy {}; streaming instead: {err:#}",
+                            path.display()
+                        );
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
         }
-        if let Some(player) = &self.player {
-            player.play_uri_at(
-                &track.uri,
-                position.as_millis().min(u128::from(u32::MAX)) as u32,
-            )?;
+        if self.player.is_some() {
+            self.start_online_load(&track.uri, position);
             self.playback_mode = PlaybackMode::Online;
             self.offline_end_handled = false;
         }
@@ -4687,8 +4931,11 @@ mod tests {
     #[tokio::test]
     async fn track_end_honours_repeat_mode() {
         let mut app = playing_app_at(4);
-        app.handle_action(Action::PlayerEndOfTrack { track_uri: None })
-            .unwrap();
+        app.handle_action(Action::PlayerEndOfTrack {
+            play_request_id: 1,
+            track_uri: None,
+        })
+        .unwrap();
         assert!(!app.now_playing.as_ref().unwrap().playing);
         assert_eq!(
             app.now_playing.as_ref().unwrap().track.uri,
@@ -4698,8 +4945,11 @@ mod tests {
 
         let mut app = playing_app_at(4);
         app.set_repeat(RepeatMode::All);
-        app.handle_action(Action::PlayerEndOfTrack { track_uri: None })
-            .unwrap();
+        app.handle_action(Action::PlayerEndOfTrack {
+            play_request_id: 1,
+            track_uri: None,
+        })
+        .unwrap();
         assert_eq!(
             app.now_playing.as_ref().unwrap().track.uri,
             "spotify:track:test0"
@@ -4708,8 +4958,11 @@ mod tests {
 
         let mut app = playing_app_at(2);
         app.set_repeat(RepeatMode::One);
-        app.handle_action(Action::PlayerEndOfTrack { track_uri: None })
-            .unwrap();
+        app.handle_action(Action::PlayerEndOfTrack {
+            play_request_id: 1,
+            track_uri: None,
+        })
+        .unwrap();
         assert_eq!(
             app.now_playing.as_ref().unwrap().track.uri,
             "spotify:track:test2"
@@ -4717,6 +4970,83 @@ mod tests {
         assert_eq!(app.now_playing.as_ref().unwrap().position, Duration::ZERO);
         assert!(app.now_playing.as_ref().unwrap().playing);
         assert!(app.status.contains("Repeating"));
+    }
+
+    #[tokio::test]
+    async fn unavailable_load_clears_fake_playing_state_and_retries_bounded() {
+        let mut app = playing_app_at(0);
+        app.active_play_request = Some(7);
+        app.load_started = Some(Instant::now());
+        let uri = app.now_playing.as_ref().unwrap().track.uri.clone();
+        for attempt in 1..=2 {
+            app.handle_action(Action::PlayerUnavailable {
+                play_request_id: 7,
+                track_uri: Some(uri.clone()),
+            })
+            .unwrap();
+            assert!(!app.now_playing.as_ref().unwrap().playing);
+            assert_eq!(app.load_attempts, attempt);
+            assert!(app.status.contains("retrying"));
+        }
+        // Exhausted retries stop pretending and require a fresh load.
+        app.handle_action(Action::PlayerUnavailable {
+            play_request_id: 7,
+            track_uri: Some(uri),
+        })
+        .unwrap();
+        assert!(app.needs_reload);
+        assert!(app.error.is_some());
+        assert_eq!(app.load_attempts, MAX_LOAD_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn stale_play_request_events_cannot_change_current_playback() {
+        let mut app = playing_app_at(0);
+        app.active_play_request = Some(2);
+        let uri = app.now_playing.as_ref().unwrap().track.uri.clone();
+        app.handle_action(Action::PlayerPaused {
+            play_request_id: 1,
+            position_ms: 42_000,
+            track_uri: Some(uri.clone()),
+        })
+        .unwrap();
+        assert!(app.now_playing.as_ref().unwrap().playing);
+        app.handle_action(Action::PlayerPaused {
+            play_request_id: 2,
+            position_ms: 42_000,
+            track_uri: Some(uri),
+        })
+        .unwrap();
+        assert!(!app.now_playing.as_ref().unwrap().playing);
+    }
+
+    #[tokio::test]
+    async fn watchdog_recovers_from_a_load_that_never_starts() {
+        let mut app = playing_app_at(0);
+        app.load_started = Some(Instant::now() - LOAD_WATCHDOG - Duration::from_secs(1));
+        app.handle_action(Action::Tick).unwrap();
+        assert!(!app.now_playing.as_ref().unwrap().playing);
+        assert_eq!(app.load_attempts, 1);
+        assert!(app.status.contains("retrying"));
+    }
+
+    #[tokio::test]
+    async fn key_preflight_failure_reports_a_real_error() {
+        let mut app = playing_app_at(0);
+        let generation = app.play_generation;
+        app.handle_action(Action::OnlinePlaybackFailed {
+            generation,
+            uri: "spotify:track:test0".to_string(),
+            message: "no audio key".to_string(),
+        })
+        .unwrap();
+        assert!(!app.now_playing.as_ref().unwrap().playing);
+        assert!(app.needs_reload);
+        assert!(
+            app.error
+                .as_ref()
+                .is_some_and(|message| message.contains("no audio key"))
+        );
     }
 
     #[test]
@@ -5133,8 +5463,11 @@ mod tests {
             volume: 60,
         });
 
-        app.handle_action(Action::PlayerEndOfTrack { track_uri: None })
-            .unwrap();
+        app.handle_action(Action::PlayerEndOfTrack {
+            play_request_id: 1,
+            track_uri: None,
+        })
+        .unwrap();
         assert_eq!(app.list_state.selected(), Some(first));
         assert_eq!(app.now_playing.as_ref().unwrap().track.uri, first_uri);
         assert!(app.now_playing.as_ref().unwrap().playing);
@@ -5338,6 +5671,7 @@ mod tests {
 
         let at = Instant::now() - Duration::from_secs(2);
         app.handle_action(Action::PlayerPosition {
+            play_request_id: 1,
             position_ms: 10_000,
             track_uri: Some(uri.clone()),
             at,
@@ -5356,6 +5690,7 @@ mod tests {
         assert!(after_burst.saturating_sub(position) < Duration::from_millis(100));
 
         app.handle_action(Action::PlayerPlaying {
+            play_request_id: 1,
             position_ms: 99_000,
             track_uri: Some("spotify:track:some-other-track".to_string()),
             at: Instant::now(),
@@ -5366,6 +5701,7 @@ mod tests {
         // An authoritative correction re-anchors instead of leaving the old
         // extrapolation in place.
         app.handle_action(Action::PlayerPosition {
+            play_request_id: 1,
             position_ms: 20_000,
             track_uri: Some(uri),
             at: Instant::now(),

@@ -282,6 +282,14 @@ sink's actual position.
       work now runs in bounded background tasks (separate client timeouts, a 25 s
       cap and four concurrent requests) after `DownloadFinished` is reported, so
       audio progress advances independently and cache writes are serialized
+- [x] Fixed "nothing plays" after a failed/slow fetch: online loads now verify
+      the audio key with the download backoff before calling librespot (which
+      otherwise decodes encrypted MP3 data and floods "skipping junk" warnings),
+      ignore stale play-request events, stop/retry a load that never starts,
+      and require a fresh load when resuming after a failure or the end of the
+      queue. Streaming uses a 5 s assumed ping, 10 s read-ahead and a 6x
+      prefetch factor for high-latency links, and the noisy MP3 demuxer warning
+      is demoted below the default log level
 - [ ] Verify one real Premium download and `--offline` playback with user credentials
 
 ## Deferred (not in v1)

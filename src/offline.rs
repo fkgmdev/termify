@@ -670,7 +670,7 @@ fn audio_key_error_is_permanent(error: &str) -> bool {
 /// Request an audio key with spacing and exponential backoff. Spotify's key
 /// service can answer `AesKeyError`/`Service unavailable` when a playlist
 /// download fires many requests back-to-back; retrying avoids corrupt files.
-async fn request_audio_key(
+pub(crate) async fn request_audio_key(
     session: &Session,
     track_id: SpotifyId,
     file_id: librespot_core::FileId,
@@ -739,12 +739,20 @@ fn record_download_failure(dir: &Path, track: &Track, error: &anyhow::Error) {
 
 /// Install tuned librespot fetch parameters once, before any player or decoder
 /// can lock in the defaults with `AudioFetchParams::get()`. The default 8-second
-/// timeout is too short for bulk downloads when Spotify's CDN slows down.
+/// timeout is too short for bulk downloads when Spotify's CDN slows down, and
+/// the default 1.5-second assumed ping makes librespot under-fetch on a high
+/// latency link.
 pub fn configure_audio_fetch() {
     // `AudioFetchParams` is a process-wide OnceLock; only the first call wins.
     let _ = AudioFetchParams::set(AudioFetchParams {
         minimum_download_size: 256 * 1024,
         download_timeout: Duration::from_secs(120),
+        // librespot caps measured time-to-first-byte at this value when deciding
+        // how much audio to buffer. A slow CDN (2 seconds here) otherwise makes
+        // it request tiny blocks and stutter or stall during playback.
+        maximum_assumed_ping_time: Duration::from_secs(5),
+        read_ahead_during_playback: Duration::from_secs(10),
+        prefetch_threshold_factor: 6.0,
         ..Default::default()
     });
 }
